@@ -4,6 +4,7 @@ use tower_http::cors::CorsLayer;
 pub fn layer(origins: &[String]) -> CorsLayer {
     let origins: Vec<HeaderValue> = origins
         .iter()
+        .filter(|&o| o != "*")
         .filter_map(|o| o.parse().ok())
         .collect();
 

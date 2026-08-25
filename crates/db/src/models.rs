@@ -264,6 +264,29 @@ pub struct InvoiceLineItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Coupon {
+    pub id: Uuid,
+    pub code: String,
+    pub discount_type: CouponDiscountType,
+    pub discount_value: rust_decimal::Decimal,
+    pub usage_limit: Option<i32>,
+    pub usage_count: i32,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub status: CouponStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct TaxRate {
+    pub id: Uuid,
+    pub name: String,
+    pub country: String,
+    pub rate: rust_decimal::Decimal,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Ticket {
     pub id: Uuid,
     pub ticket_number: String,
@@ -288,6 +311,15 @@ pub struct TicketMessage {
     pub author_type: ActorType,
     pub content: String,
     pub internal: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Department {
+    pub id: Uuid,
+    pub name: String,
+    pub mailbox: String,
+    pub default_assignee_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 

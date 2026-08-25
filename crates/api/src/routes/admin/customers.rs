@@ -7,12 +7,12 @@ use uuid::Uuid;
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
 use crate::state::AppState;
-use vaultscope_db::models::Customer;
+use vaultscope_db::models::{Customer, CustomerStatus};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list))
-        .route("/{id}", get(get_one))
+        .route("/{id}", get(get_one).put(update))
 }
 
 #[derive(Deserialize)]
@@ -52,5 +52,35 @@ async fn get_one(
         .fetch_optional(&state.db)
         .await?
         .ok_or(ApiError::NotFound("customer not found".into()))?;
+    Ok(Json(customer))
+}
+
+#[derive(Deserialize)]
+struct UpdateCustomer {
+    status: Option<CustomerStatus>,
+    notes: Option<String>,
+}
+
+async fn update(
+    _auth: AuthAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<UpdateCustomer>,
+) -> Result<Json<Customer>, ApiError> {
+    let customer: Customer = sqlx::query_as(
+        r#"UPDATE customers
+           SET status = COALESCE($1::customer_status, status),
+               notes = COALESCE($2, notes),
+               updated_at = now()
+           WHERE id = $3
+           RETURNING *"#
+    )
+    .bind(payload.status)
+    .bind(payload.notes)
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(ApiError::NotFound("customer not found".into()))?;
+
     Ok(Json(customer))
 }

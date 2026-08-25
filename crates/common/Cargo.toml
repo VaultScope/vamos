@@ -9,3 +9,5 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
+aes-gcm = "0.11.1"
+rand = "0.10.2"
