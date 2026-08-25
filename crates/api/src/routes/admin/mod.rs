@@ -4,6 +4,7 @@ pub mod dashboard;
 pub mod products;
 pub mod services;
 pub mod settings;
+pub mod tickets;
 
 use axum::Router;
 
@@ -17,4 +18,5 @@ pub fn routes() -> Router<AppState> {
         .nest("/products", products::routes())
         .nest("/services", services::routes())
         .nest("/settings", settings::routes())
+        .nest("/tickets", tickets::routes())
 }
