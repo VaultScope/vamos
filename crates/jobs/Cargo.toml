@@ -1,0 +1,17 @@
+[package]
+name = "vaultscope-jobs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vaultscope-common = { path = "../common" }
+vaultscope-db = { path = "../db" }
+vaultscope-connectors = { path = "../connectors" }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }

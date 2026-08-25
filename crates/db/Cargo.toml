@@ -1,0 +1,15 @@
+[package]
+name = "vaultscope-db"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vaultscope-common = { path = "../common" }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

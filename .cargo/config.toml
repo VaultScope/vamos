@@ -1,0 +1,5 @@
+# Local development on Windows requires Visual Studio Build Tools
+# Install from: https://visualstudio.microsoft.com/visual-cpp-build-tools/
+# Select "Desktop development with C++" workload
+#
+# The Docker build (Linux) works without this.
