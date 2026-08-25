@@ -29,6 +29,8 @@ async fn admin_callback(
     let tokens = oidc::exchange_code(&state.config, &payload.code, &payload.redirect_uri, true).await?;
     let userinfo = oidc::fetch_userinfo(&state.config, &tokens.access_token).await?;
 
+    tracing::info!("admin login: sub={}, email={}", userinfo.sub, userinfo.email);
+
     let staff: Option<(Uuid, String)> = sqlx::query_as(
         "SELECT s.id, r.name FROM staff s JOIN roles r ON s.role_id = r.id WHERE s.external_id = $1"
     )
