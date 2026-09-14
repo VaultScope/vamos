@@ -9,18 +9,22 @@ pub async fn csrf_middleware(
     next: Next,
 ) -> Result<Response, StatusCode> {
     let method = req.method().clone();
-    
-    if method == Method::POST || method == Method::PUT || method == Method::DELETE || method == Method::PATCH {
+
+    if method == Method::POST
+        || method == Method::PUT
+        || method == Method::DELETE
+        || method == Method::PATCH
+    {
         let token = req
             .headers()
             .get("x-csrf-token")
             .and_then(|h| h.to_str().ok())
             .unwrap_or_default();
-            
+
         if csrf.verify(token).is_err() {
             return Err(StatusCode::FORBIDDEN);
         }
     }
-    
+
     Ok(next.run(req).await)
 }

@@ -4,6 +4,7 @@ use axum::Json;
 use serde_json::json;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum ApiError {
     NotFound(String),
     BadRequest(String),
@@ -22,7 +23,10 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_string()),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-            ApiError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "database error".to_string()),
+            ApiError::Database(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "database error".to_string(),
+            ),
             ApiError::Connector(e) => (StatusCode::BAD_GATEWAY, e.to_string()),
         };
 

@@ -1,6 +1,3 @@
-use axum::extract::State;
-use uuid::Uuid;
-
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -12,7 +9,7 @@ use vaultscope_db::models::{Role, Staff};
 /// 1. Fetch the staff member by ID from the JWT claims
 /// 2. Fetch the role assigned to the staff member
 /// 3. Check if the role has either:
-///    - Wildcard permission ("*") - superadmin
+///    - Wildcard permission ("*") - owner
 ///    - The specific required permission
 ///
 /// Returns Ok(()) if authorized, Err(ApiError::Forbidden) otherwise.
@@ -38,7 +35,7 @@ pub async fn check_permission(
         .await?
         .ok_or_else(|| ApiError::Forbidden)?;
 
-    // Check for wildcard permission (superadmin)
+    // Check for wildcard permission (owner)
     if role.permissions.contains(&"*".to_string()) {
         return Ok(());
     }
@@ -55,7 +52,7 @@ pub async fn check_permission(
 /// Convenience macro for permission checking in handlers.
 ///
 /// Usage:
-/// ```
+/// ```ignore
 /// require_permission!(auth, state, "users.delete");
 /// ```
 #[macro_export]
@@ -64,3 +61,4 @@ macro_rules! require_permission {
         $crate::middleware::rbac::check_permission(&$auth, &$state, $perm).await?
     };
 }
+

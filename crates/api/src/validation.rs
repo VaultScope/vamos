@@ -36,14 +36,17 @@ pub fn validate_positive(value: f64, field: &str) -> Result<(), ApiError> {
 /// Validate numeric is greater than zero
 pub fn validate_greater_than_zero(value: i32, field: &str) -> Result<(), ApiError> {
     if value <= 0 {
-        return Err(ApiError::BadRequest(format!("{} must be greater than zero", field)));
+        return Err(ApiError::BadRequest(format!(
+            "{} must be greater than zero",
+            field
+        )));
     }
     Ok(())
 }
 
 /// Validate percentage (0-100)
 pub fn validate_percentage(value: f64, field: &str) -> Result<(), ApiError> {
-    if value < 0.0 || value > 100.0 {
+    if !(0.0..=100.0).contains(&value) {
         return Err(ApiError::BadRequest(format!(
             "{} must be between 0 and 100",
             field
@@ -64,6 +67,7 @@ pub fn validate_email(email: &str) -> Result<(), ApiError> {
 }
 
 /// Validate discount value based on type
+#[allow(dead_code)]
 pub fn validate_discount(discount_type: &str, value: f64) -> Result<(), ApiError> {
     validate_positive(value, "Discount value")?;
 

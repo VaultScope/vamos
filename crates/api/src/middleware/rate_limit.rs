@@ -1,9 +1,4 @@
-use axum::{
-    extract::Request,
-    http::StatusCode,
-    middleware::Next,
-    response::Response,
-};
+use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -51,21 +46,19 @@ impl RateLimiter {
 }
 
 pub async fn rate_limit_middleware(
-    // We can't easily extract State here without specifying the exact type,
-    // but we can pass the limiter via Extension, or we can use a global static.
-    // Given axum 0.8, we can just extract Extension.
     axum::extract::Extension(limiter): axum::extract::Extension<RateLimiter>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // Basic IP extraction
     let ip = req
         .headers()
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown_ip");
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim())
+        .unwrap_or("unknown");
 
-    if ip != "unknown_ip" && !limiter.check(ip) {
+    if !limiter.check(ip) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 

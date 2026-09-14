@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::error::ApiError;
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct OidcTokenResponse {
     pub access_token: String,
     pub id_token: String,
@@ -13,6 +14,7 @@ pub struct OidcTokenResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct OidcUserInfo {
     pub sub: String,
     pub email: String,
@@ -30,9 +32,15 @@ pub async fn exchange_code(
     is_admin: bool,
 ) -> Result<OidcTokenResponse, ApiError> {
     let (client_id, client_secret) = if is_admin {
-        (&config.authentik_client_id_admin, &config.authentik_client_secret_admin)
+        (
+            &config.authentik_client_id_admin,
+            &config.authentik_client_secret_admin,
+        )
     } else {
-        (&config.authentik_client_id_storefront, &config.authentik_client_secret_storefront)
+        (
+            &config.authentik_client_id_storefront,
+            &config.authentik_client_secret_storefront,
+        )
     };
 
     let token_url = format!(
@@ -63,10 +71,7 @@ pub async fn exchange_code(
         .map_err(|e| ApiError::Internal(format!("oidc parse: {}", e)))
 }
 
-pub async fn fetch_userinfo(
-    config: &Config,
-    access_token: &str,
-) -> Result<OidcUserInfo, ApiError> {
+pub async fn fetch_userinfo(config: &Config, access_token: &str) -> Result<OidcUserInfo, ApiError> {
     let userinfo_url = format!(
         "{}/application/o/userinfo/",
         config.authentik_issuer.trim_end_matches('/')

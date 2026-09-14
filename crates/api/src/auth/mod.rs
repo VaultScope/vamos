@@ -2,8 +2,8 @@ pub mod jwt;
 pub mod oidc;
 
 use axum::extract::{FromRef, FromRequestParts};
-use axum::http::request::Parts;
 use axum::http::header::AUTHORIZATION;
+use axum::http::request::Parts;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -39,7 +39,9 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let app_state = AppState::from_ref(state);
-        let claims = extract_claims(parts, &app_state)?;
+        // SEC-003: Pass expected audience to JWT verification
+        let claims = extract_claims(parts, &app_state, Audience::Admin)?;
+        // Double-check audience (defense in depth)
         if claims.audience != Audience::Admin {
             return Err(ApiError::Forbidden);
         }
@@ -56,7 +58,9 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let app_state = AppState::from_ref(state);
-        let claims = extract_claims(parts, &app_state)?;
+        // SEC-003: Pass expected audience to JWT verification
+        let claims = extract_claims(parts, &app_state, Audience::Storefront)?;
+        // Double-check audience (defense in depth)
         if claims.audience != Audience::Storefront {
             return Err(ApiError::Forbidden);
         }
@@ -64,7 +68,11 @@ where
     }
 }
 
-fn extract_claims(parts: &Parts, state: &AppState) -> Result<Claims, ApiError> {
+fn extract_claims(
+    parts: &Parts,
+    state: &AppState,
+    expected_audience: Audience,
+) -> Result<Claims, ApiError> {
     let header = parts
         .headers
         .get(AUTHORIZATION)
@@ -75,5 +83,6 @@ fn extract_claims(parts: &Parts, state: &AppState) -> Result<Claims, ApiError> {
         .strip_prefix("Bearer ")
         .ok_or(ApiError::Unauthorized)?;
 
-    jwt::verify(token, &state.config.jwt_secret)
+    // SEC-003: Verify JWT with audience validation
+    jwt::verify(token, &state.config.jwt_secret, expected_audience)
 }

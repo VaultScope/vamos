@@ -9,6 +9,7 @@ pub struct AppState {
     pub db: PgPool,
     pub config: Arc<Config>,
     pub csrf_config: axum_csrf::CsrfConfig,
+    pub redis: redis::aio::ConnectionManager,
 }
 
 impl axum::extract::FromRef<AppState> for axum_csrf::CsrfConfig {

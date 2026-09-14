@@ -1,4 +1,4 @@
-use axum::http::{header, HeaderValue, Method};
+use axum::http::{header, HeaderName, HeaderValue, Method};
 use tower_http::cors::CorsLayer;
 
 pub fn layer(origins: &[String]) -> CorsLayer {
@@ -21,6 +21,7 @@ pub fn layer(origins: &[String]) -> CorsLayer {
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
             header::ACCEPT,
+            HeaderName::from_static("x-csrf-token"),
         ])
         .allow_credentials(true)
 }
