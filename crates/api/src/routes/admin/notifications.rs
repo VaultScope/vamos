@@ -17,9 +17,10 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn list(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Notification>>, ApiError> {
+    crate::require_permission!(auth, state, "notifications.view");
     let notifications: Vec<Notification> =
         sqlx::query_as("SELECT * FROM notifications ORDER BY created_at DESC LIMIT 100")
             .fetch_all(&state.db)
@@ -28,10 +29,11 @@ async fn list(
 }
 
 async fn mark_read(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::require_permission!(auth, state, "notifications.manage");
     sqlx::query("UPDATE notifications SET read = true WHERE id = $1")
         .bind(id)
         .execute(&state.db)
@@ -40,10 +42,11 @@ async fn mark_read(
 }
 
 async fn resolve(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::require_permission!(auth, state, "notifications.manage");
     sqlx::query("UPDATE notifications SET resolved = true, read = true WHERE id = $1")
         .bind(id)
         .execute(&state.db)

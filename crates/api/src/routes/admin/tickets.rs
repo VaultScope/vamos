@@ -10,7 +10,9 @@ use crate::state::AppState;
 use crate::validation::{
     validate_required_string, validate_string_length, MAX_SHORT_STRING_LENGTH, MAX_STRING_LENGTH,
 };
-use vaultscope_db::models::{ActorType, Ticket, TicketCategory, TicketMessage, TicketPriority, TicketStatus};
+use vaultscope_db::models::{
+    ActorType, Ticket, TicketCategory, TicketMessage, TicketPriority, TicketStatus,
+};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -28,40 +30,58 @@ struct ListParams {
 }
 
 async fn list(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<Ticket>>, ApiError> {
+    crate::require_permission!(auth, state, "tickets.view");
     let limit = params.limit.unwrap_or(50).min(200);
     let offset = params.offset.unwrap_or(0);
 
-    let tickets: Vec<Ticket> = if let Some(cid) = params.customer_id {
-        sqlx::query_as(
+    let tickets: Vec<Ticket> = match (params.customer_id, &params.status) {
+        (Some(cid), Some(status)) => sqlx::query_as(
+            "SELECT * FROM tickets WHERE customer_id = $1 AND status = $2::ticket_status ORDER BY created_at DESC LIMIT $3 OFFSET $4"
+        )
+        .bind(cid)
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.db)
+        .await?,
+        (Some(cid), None) => sqlx::query_as(
             "SELECT * FROM tickets WHERE customer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"
         )
         .bind(cid)
         .bind(limit)
         .bind(offset)
         .fetch_all(&state.db)
-        .await?
-    } else {
-        sqlx::query_as(
+        .await?,
+        (None, Some(status)) => sqlx::query_as(
+            "SELECT * FROM tickets WHERE status = $1::ticket_status ORDER BY created_at DESC LIMIT $2 OFFSET $3"
+        )
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.db)
+        .await?,
+        (None, None) => sqlx::query_as(
             "SELECT * FROM tickets ORDER BY created_at DESC LIMIT $1 OFFSET $2"
         )
         .bind(limit)
         .bind(offset)
         .fetch_all(&state.db)
-        .await?
+        .await?,
     };
 
     Ok(Json(tickets))
 }
 
 async fn get_one(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Ticket>, ApiError> {
+    crate::require_permission!(auth, state, "tickets.view");
     let ticket: Ticket = sqlx::query_as("SELECT * FROM tickets WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
@@ -83,16 +103,17 @@ struct CreateTicket {
 }
 
 async fn create(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateTicket>,
 ) -> Result<Json<Ticket>, ApiError> {
+    crate::require_permission!(auth, state, "tickets.reply");
     // Validate inputs
     validate_required_string(&payload.subject, "Subject")?;
     validate_string_length(&payload.subject, "Subject", MAX_SHORT_STRING_LENGTH)?;
 
     let random_id = Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext));
-    let ticket_number = format!("TKT-{}", &random_id.to_string()[..8].to_uppercase());
+    let ticket_number = format!("TKT-{}", random_id.to_string()[..8].to_uppercase());
 
     let ticket: Ticket = sqlx::query_as(
         r#"INSERT INTO tickets (ticket_number, customer_id, category, subject, priority, assignee_id, mailbox, related_service_id, ip)
@@ -123,11 +144,12 @@ struct UpdateTicket {
 }
 
 async fn update(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateTicket>,
 ) -> Result<Json<Ticket>, ApiError> {
+    crate::require_permission!(auth, state, "tickets.reply");
     let ticket: Ticket = sqlx::query_as(
         r#"UPDATE tickets
            SET subject = COALESCE($1, subject),
@@ -136,7 +158,7 @@ async fn update(
                assignee_id = COALESCE($4, assignee_id),
                updated_at = now()
            WHERE id = $5
-           RETURNING *"#
+           RETURNING *"#,
     )
     .bind(payload.subject)
     .bind(payload.status)
@@ -151,12 +173,13 @@ async fn update(
 }
 
 async fn list_messages(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(ticket_id): Path<Uuid>,
 ) -> Result<Json<Vec<TicketMessage>>, ApiError> {
+    crate::require_permission!(auth, state, "tickets.view");
     let messages: Vec<TicketMessage> = sqlx::query_as(
-        "SELECT * FROM ticket_messages WHERE ticket_id = $1 ORDER BY created_at ASC"
+        "SELECT * FROM ticket_messages WHERE ticket_id = $1 ORDER BY created_at ASC",
     )
     .bind(ticket_id)
     .fetch_all(&state.db)
@@ -174,11 +197,12 @@ struct CreateTicketMessage {
 }
 
 async fn create_message(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(ticket_id): Path<Uuid>,
     Json(payload): Json<CreateTicketMessage>,
 ) -> Result<Json<TicketMessage>, ApiError> {
+    crate::require_permission!(auth, state, "tickets.reply");
     // Validate inputs
     validate_required_string(&payload.content, "Content")?;
     validate_string_length(&payload.content, "Content", MAX_STRING_LENGTH)?;
@@ -186,7 +210,7 @@ async fn create_message(
     let message: TicketMessage = sqlx::query_as(
         r#"INSERT INTO ticket_messages (ticket_id, author_id, author_type, content, internal)
            VALUES ($1, $2, $3::actor_type, $4, $5)
-           RETURNING *"#
+           RETURNING *"#,
     )
     .bind(ticket_id)
     .bind(payload.author_id)

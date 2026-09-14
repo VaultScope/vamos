@@ -18,9 +18,10 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn list(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<EmailTemplate>>, ApiError> {
+    crate::require_permission!(auth, state, "templates.manage");
     let templates: Vec<EmailTemplate> =
         sqlx::query_as("SELECT * FROM email_templates ORDER BY category, name")
             .fetch_all(&state.db)
@@ -29,10 +30,11 @@ async fn list(
 }
 
 async fn get_one(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<EmailTemplate>, ApiError> {
+    crate::require_permission!(auth, state, "templates.manage");
     let template: EmailTemplate = sqlx::query_as("SELECT * FROM email_templates WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
@@ -46,14 +48,16 @@ struct UpdateTemplate {
     subject: Option<String>,
     body: Option<String>,
     enabled: Option<bool>,
+    mailbox_id: Option<Uuid>,
 }
 
 async fn update(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateTemplate>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::require_permission!(auth, state, "templates.manage");
     if let Some(subject) = &payload.subject {
         sqlx::query("UPDATE email_templates SET subject = $1, updated_at = now() WHERE id = $2")
             .bind(subject)
@@ -71,6 +75,13 @@ async fn update(
     if let Some(enabled) = payload.enabled {
         sqlx::query("UPDATE email_templates SET enabled = $1, updated_at = now() WHERE id = $2")
             .bind(enabled)
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+    }
+    if let Some(mailbox_id) = payload.mailbox_id {
+        sqlx::query("UPDATE email_templates SET mailbox_id = $1, updated_at = now() WHERE id = $2")
+            .bind(mailbox_id)
             .bind(id)
             .execute(&state.db)
             .await?;

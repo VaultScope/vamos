@@ -19,22 +19,22 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn list(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<TaxRate>>, ApiError> {
-    let rates: Vec<TaxRate> = sqlx::query_as(
-        "SELECT * FROM tax_rates ORDER BY name"
-    )
-    .fetch_all(&state.db)
-    .await?;
+    crate::require_permission!(auth, state, "tax.manage");
+    let rates: Vec<TaxRate> = sqlx::query_as("SELECT * FROM tax_rates ORDER BY name")
+        .fetch_all(&state.db)
+        .await?;
     Ok(Json(rates))
 }
 
 async fn get_one(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<TaxRate>, ApiError> {
+    crate::require_permission!(auth, state, "tax.manage");
     let rate: TaxRate = sqlx::query_as("SELECT * FROM tax_rates WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
@@ -51,10 +51,11 @@ struct CreateTaxRate {
 }
 
 async fn create(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateTaxRate>,
 ) -> Result<Json<TaxRate>, ApiError> {
+    crate::require_permission!(auth, state, "tax.manage");
     // Validate inputs
     validate_required_string(&payload.name, "Name")?;
     validate_string_length(&payload.name, "Name", MAX_SHORT_STRING_LENGTH)?;
@@ -67,7 +68,7 @@ async fn create(
     let tax_rate: TaxRate = sqlx::query_as(
         r#"INSERT INTO tax_rates (name, country, rate)
            VALUES ($1, $2, $3)
-           RETURNING *"#
+           RETURNING *"#,
     )
     .bind(&payload.name)
     .bind(&payload.country)
@@ -86,22 +87,27 @@ struct UpdateTaxRate {
 }
 
 async fn update(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateTaxRate>,
 ) -> Result<Json<TaxRate>, ApiError> {
+    crate::require_permission!(auth, state, "tax.manage");
     let tax_rate: TaxRate = sqlx::query_as(
         r#"UPDATE tax_rates
            SET name = COALESCE($1, name),
                country = COALESCE($2, country),
                rate = COALESCE($3, rate)
            WHERE id = $4
-           RETURNING *"#
+           RETURNING *"#,
     )
     .bind(payload.name)
     .bind(payload.country)
-    .bind(payload.rate.map(|v| rust_decimal::Decimal::from_f64_retain(v).unwrap_or_default()))
+    .bind(
+        payload
+            .rate
+            .map(|v| rust_decimal::Decimal::from_f64_retain(v).unwrap_or_default()),
+    )
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -111,10 +117,11 @@ async fn update(
 }
 
 async fn delete(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<()>, ApiError> {
+    crate::require_permission!(auth, state, "tax.manage");
     let result = sqlx::query("DELETE FROM tax_rates WHERE id = $1")
         .bind(id)
         .execute(&state.db)

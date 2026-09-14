@@ -1,7 +1,7 @@
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -9,13 +9,15 @@ use crate::auth::AuthAdmin;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::validation::{
-    validate_greater_than_zero, validate_percentage, validate_positive,
-    validate_required_string, validate_string_length, MAX_SHORT_STRING_LENGTH, MAX_STRING_LENGTH,
+    validate_greater_than_zero, validate_percentage, validate_positive, validate_required_string,
+    validate_string_length, MAX_SHORT_STRING_LENGTH, MAX_STRING_LENGTH,
 };
 use vaultscope_db::models::{Invoice, InvoiceLineItem, InvoiceStatus};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/stats/comprehensive", get(get_comprehensive_stats))
+        .route("/stats", get(get_stats))
         .route("/", get(list).post(create))
         .route("/{id}", get(get_one).put(update).delete(delete))
         .route("/{id}/send", axum::routing::post(send))
@@ -32,10 +34,11 @@ struct ListParams {
 }
 
 async fn list(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<Invoice>>, ApiError> {
+    crate::require_permission!(auth, state, "invoices.view");
     let limit = params.limit.unwrap_or(50).min(200);
     let offset = params.offset.unwrap_or(0);
 
@@ -86,10 +89,11 @@ async fn list(
 }
 
 async fn get_one(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Invoice>, ApiError> {
+    crate::require_permission!(auth, state, "invoices.view");
     let invoice: Invoice = sqlx::query_as("SELECT * FROM invoices WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
@@ -116,13 +120,16 @@ struct CreateInvoice {
 }
 
 async fn create(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateInvoice>,
 ) -> Result<Json<Invoice>, ApiError> {
+    crate::require_permission!(auth, state, "invoices.create");
     // Validate inputs
     if payload.line_items.is_empty() {
-        return Err(ApiError::BadRequest("At least one line item is required".into()));
+        return Err(ApiError::BadRequest(
+            "At least one line item is required".into(),
+        ));
     }
 
     for item in &payload.line_items {
@@ -138,9 +145,14 @@ async fn create(
         validate_string_length(notes, "Notes", MAX_STRING_LENGTH)?;
     }
 
-    let invoice_number = format!("INV-{}", Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext)).to_string()[..8].to_uppercase());
+    let invoice_number = format!(
+        "INV-{}",
+        Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext)).to_string()[..8].to_uppercase()
+    );
 
-    let subtotal: f64 = payload.line_items.iter()
+    let subtotal: f64 = payload
+        .line_items
+        .iter()
         .map(|item| item.quantity as f64 * item.unit_price)
         .sum();
 
@@ -192,11 +204,12 @@ struct UpdateInvoice {
 }
 
 async fn update(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateInvoice>,
 ) -> Result<Json<Invoice>, ApiError> {
+    crate::require_permission!(auth, state, "invoices.edit");
     let invoice: Invoice = sqlx::query_as(
         r#"UPDATE invoices
            SET status = COALESCE($1::invoice_status, status),
@@ -204,7 +217,7 @@ async fn update(
                notes = COALESCE($3, notes),
                updated_at = now()
            WHERE id = $4
-           RETURNING *"#
+           RETURNING *"#,
     )
     .bind(payload.status)
     .bind(payload.due_date)
@@ -218,14 +231,16 @@ async fn update(
 }
 
 async fn delete(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<()>, ApiError> {
-    let result = sqlx::query("DELETE FROM invoices WHERE id = $1 AND status = 'draft'::invoice_status")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
+    crate::require_permission!(auth, state, "invoices.delete");
+    let result =
+        sqlx::query("DELETE FROM invoices WHERE id = $1 AND status = 'draft'::invoice_status")
+            .bind(id)
+            .execute(&state.db)
+            .await?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("draft invoice not found".into()));
@@ -235,16 +250,17 @@ async fn delete(
 }
 
 async fn send(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Invoice>, ApiError> {
+    crate::require_permission!(auth, state, "invoices.edit");
     let invoice: Invoice = sqlx::query_as(
         r#"UPDATE invoices
            SET status = 'pending'::invoice_status,
                updated_at = now()
            WHERE id = $1 AND status = 'draft'::invoice_status
-           RETURNING *"#
+           RETURNING *"#,
     )
     .bind(id)
     .fetch_optional(&state.db)
@@ -255,17 +271,18 @@ async fn send(
 }
 
 async fn mark_paid(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Invoice>, ApiError> {
+    crate::require_permission!(auth, state, "invoices.edit");
     let invoice: Invoice = sqlx::query_as(
         r#"UPDATE invoices
            SET status = 'paid'::invoice_status,
                paid_at = now(),
                updated_at = now()
            WHERE id = $1
-           RETURNING *"#
+           RETURNING *"#,
     )
     .bind(id)
     .fetch_one(&state.db)
@@ -275,16 +292,227 @@ async fn mark_paid(
 }
 
 async fn list_line_items(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(invoice_id): Path<Uuid>,
 ) -> Result<Json<Vec<InvoiceLineItem>>, ApiError> {
+    crate::require_permission!(auth, state, "invoices.view");
     let items: Vec<InvoiceLineItem> = sqlx::query_as(
-        "SELECT * FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order"
+        "SELECT * FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order",
     )
     .bind(invoice_id)
     .fetch_all(&state.db)
     .await?;
 
     Ok(Json(items))
+}
+
+#[derive(serde::Serialize)]
+pub struct InvoiceStats {
+    pub unpaid_total: rust_decimal::Decimal,
+    pub unpaid_count: i64,
+}
+
+async fn get_stats(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+) -> Result<Json<InvoiceStats>, ApiError> {
+    crate::require_permission!(auth, state, "invoices.view");
+    let row: (Option<rust_decimal::Decimal>, Option<i64>) = sqlx::query_as(
+        "SELECT SUM(total), COUNT(*) FROM invoices WHERE status = 'pending'::invoice_status OR status = 'overdue'::invoice_status"
+    )
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(Json(InvoiceStats {
+        unpaid_total: row.0.unwrap_or_default(),
+        unpaid_count: row.1.unwrap_or(0),
+    }))
+}
+
+#[derive(serde::Serialize)]
+pub struct ComprehensiveStats {
+    pub unpaid_invoices: i64,
+    pub paid_invoices: i64,
+    pub revenue: rust_decimal::Decimal,
+    pub profit: rust_decimal::Decimal,
+    pub stripe_balance: rust_decimal::Decimal,
+    pub revenue_per_month: Vec<MonthlyRevenue>,
+    pub infrastructure_cost: rust_decimal::Decimal,
+    pub top_clients: Vec<ClientSpent>,
+    pub coupons_loss: rust_decimal::Decimal,
+    pub top_products: Vec<ProductSales>,
+}
+
+#[derive(serde::Serialize)]
+pub struct MonthlyRevenue {
+    pub month: String,
+    pub revenue: rust_decimal::Decimal,
+}
+
+#[derive(serde::Serialize)]
+pub struct ClientSpent {
+    pub customer_id: uuid::Uuid,
+    pub name: String,
+    pub total_spent: rust_decimal::Decimal,
+}
+
+#[derive(serde::Serialize)]
+pub struct ProductSales {
+    pub name: String,
+    pub count: i64,
+}
+
+async fn get_comprehensive_stats(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+) -> Result<Json<ComprehensiveStats>, ApiError> {
+    crate::require_permission!(auth, state, "invoices.view");
+    // 1. Unpaid vs Paid Invoices
+    let unpaid: (Option<i64>,) =
+        sqlx::query_as("SELECT count(*) FROM invoices WHERE status IN ('pending', 'overdue')")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or((Some(0),));
+    let paid: (Option<i64>,) =
+        sqlx::query_as("SELECT count(*) FROM invoices WHERE status = 'paid'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or((Some(0),));
+
+    // 2. Revenue vs Profit & 5. Infrastructure Cost
+    // Infrastructure cost = sum of products.cost for active services
+    let cost_row: (Option<rust_decimal::Decimal>,) = sqlx::query_as(
+        "SELECT SUM(p.cost) FROM services s JOIN products p ON s.product_id = p.id WHERE s.status = 'running'"
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or((None,));
+    let infrastructure_cost = cost_row.0.unwrap_or_default();
+
+    let revenue_row: (Option<rust_decimal::Decimal>,) =
+        sqlx::query_as("SELECT SUM(total) FROM invoices WHERE status = 'paid'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or((None,));
+    let revenue = revenue_row.0.unwrap_or_default();
+    let profit = revenue - infrastructure_cost;
+
+    // 3. Stripe Balance
+    let mut stripe_balance = rust_decimal::Decimal::from(0);
+    if let Ok(Some((key_val,))) = sqlx::query_as::<_, (serde_json::Value,)>(
+        "SELECT value FROM settings WHERE key = 'stripe_secret_key'",
+    )
+    .fetch_optional(&state.db)
+    .await
+    {
+        if let Some(key) = key_val.as_str() {
+            let client = reqwest::Client::new();
+            if let Ok(resp) = client
+                .get("https://api.stripe.com/v1/balance")
+                .bearer_auth(key)
+                .send()
+                .await
+            {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(available) = json.get("available").and_then(|a| a.as_array()) {
+                        if let Some(first) = available.first() {
+                            if let Some(amount) = first.get("amount").and_then(|a| a.as_i64()) {
+                                stripe_balance = rust_decimal::Decimal::new(amount, 2);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Revenue per month (aggregated over the last 6-12 months)
+    let rev_months_query = sqlx::query_as::<_, (Option<String>, Option<rust_decimal::Decimal>)>(
+        "SELECT to_char(date_trunc('month', paid_at), 'YYYY-MM') as month, SUM(total) as revenue 
+         FROM invoices 
+         WHERE status = 'paid' AND paid_at >= now() - interval '6 months' 
+         GROUP BY month 
+         ORDER BY month ASC",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let mut revenue_per_month = Vec::new();
+    for row in rev_months_query {
+        if let (Some(m), Some(r)) = row {
+            revenue_per_month.push(MonthlyRevenue {
+                month: m,
+                revenue: r,
+            });
+        }
+    }
+
+    // 6. Spent per Client (top clients by total paid)
+    let top_clients_query =
+        sqlx::query_as::<_, (uuid::Uuid, String, Option<rust_decimal::Decimal>)>(
+            "SELECT c.id, c.name, SUM(i.total) as total_spent 
+         FROM customers c 
+         JOIN invoices i ON c.id = i.customer_id 
+         WHERE i.status = 'paid' 
+         GROUP BY c.id, c.name 
+         ORDER BY total_spent DESC 
+         LIMIT 5",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+    let top_clients = top_clients_query
+        .into_iter()
+        .map(|c| ClientSpent {
+            customer_id: c.0,
+            name: c.1,
+            total_spent: c.2.unwrap_or_default(),
+        })
+        .collect();
+
+    // 7. Coupons used and loss
+    let coupons_loss_row: (Option<rust_decimal::Decimal>,) =
+        sqlx::query_as("SELECT SUM(usage_count * discount_value) FROM coupons")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or((None,));
+    let coupons_loss = coupons_loss_row.0.unwrap_or_default();
+
+    // 8. Top products with sales (count of active services per product)
+    let top_products_query = sqlx::query_as::<_, (String, Option<i64>)>(
+        "SELECT p.name, COUNT(s.id) as cnt 
+         FROM products p 
+         JOIN services s ON p.id = s.product_id 
+         WHERE s.status = 'running' 
+         GROUP BY p.id, p.name 
+         ORDER BY cnt DESC 
+         LIMIT 5",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let top_products = top_products_query
+        .into_iter()
+        .map(|p| ProductSales {
+            name: p.0,
+            count: p.1.unwrap_or(0),
+        })
+        .collect();
+
+    Ok(Json(ComprehensiveStats {
+        unpaid_invoices: unpaid.0.unwrap_or(0),
+        paid_invoices: paid.0.unwrap_or(0),
+        revenue,
+        profit,
+        stripe_balance,
+        revenue_per_month,
+        infrastructure_cost,
+        top_clients,
+        coupons_loss,
+        top_products,
+    }))
 }

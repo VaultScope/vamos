@@ -4,10 +4,15 @@ pub mod coupons;
 pub mod customers;
 pub mod dashboard;
 pub mod departments;
+pub mod email_logs;
 pub mod email_templates;
+pub mod internal_tools;
 pub mod invoices;
+pub mod jobs;
+pub mod mailboxes;
 pub mod notifications;
 pub mod products;
+pub mod service_forms;
 pub mod services;
 pub mod settings;
 pub mod staff;
@@ -26,13 +31,18 @@ pub fn routes() -> Router<AppState> {
         .nest("/customers", customers::routes())
         .nest("/dashboard", dashboard::routes())
         .nest("/departments", departments::routes())
+        .nest("/email-logs", email_logs::routes())
         .nest("/email-templates", email_templates::routes())
+        .nest("/internal-tools", internal_tools::routes())
         .nest("/invoices", invoices::routes())
+        .nest("/jobs", jobs::routes())
         .nest("/notifications", notifications::routes())
         .nest("/products", products::routes())
         .nest("/services", services::routes())
+        .nest("/service-forms", service_forms::routes())
         .nest("/settings", settings::routes())
         .nest("/staff", staff::routes())
         .nest("/tax-rates", tax_rates::routes())
         .nest("/tickets", tickets::routes())
+        .nest("/mailboxes", mailboxes::routes())
 }

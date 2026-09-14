@@ -21,10 +21,11 @@ struct ListParams {
 }
 
 async fn list(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<ActivityLog>>, ApiError> {
+    crate::require_permission!(auth, state, "staff.view");
     let limit = params.limit.unwrap_or(100).min(500);
 
     let logs = match (params.customer_id, params.category) {

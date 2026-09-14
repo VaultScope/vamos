@@ -16,22 +16,22 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn list(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Department>>, ApiError> {
-    let departments: Vec<Department> = sqlx::query_as(
-        "SELECT * FROM departments ORDER BY name"
-    )
-    .fetch_all(&state.db)
-    .await?;
+    crate::require_permission!(auth, state, "tickets.manage");
+    let departments: Vec<Department> = sqlx::query_as("SELECT * FROM departments ORDER BY name")
+        .fetch_all(&state.db)
+        .await?;
     Ok(Json(departments))
 }
 
 async fn get_one(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Department>, ApiError> {
+    crate::require_permission!(auth, state, "tickets.manage");
     let department: Department = sqlx::query_as("SELECT * FROM departments WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
@@ -48,14 +48,15 @@ struct CreateDepartment {
 }
 
 async fn create(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateDepartment>,
 ) -> Result<Json<Department>, ApiError> {
+    crate::require_permission!(auth, state, "tickets.manage");
     let department: Department = sqlx::query_as(
         r#"INSERT INTO departments (name, mailbox, default_assignee_id)
            VALUES ($1, $2, $3)
-           RETURNING *"#
+           RETURNING *"#,
     )
     .bind(&payload.name)
     .bind(&payload.mailbox)
@@ -74,18 +75,19 @@ struct UpdateDepartment {
 }
 
 async fn update(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateDepartment>,
 ) -> Result<Json<Department>, ApiError> {
+    crate::require_permission!(auth, state, "tickets.manage");
     let department: Department = sqlx::query_as(
         r#"UPDATE departments
            SET name = COALESCE($1, name),
                mailbox = COALESCE($2, mailbox),
                default_assignee_id = COALESCE($3, default_assignee_id)
            WHERE id = $4
-           RETURNING *"#
+           RETURNING *"#,
     )
     .bind(payload.name)
     .bind(payload.mailbox)
@@ -99,10 +101,11 @@ async fn update(
 }
 
 async fn delete(
-    _auth: AuthAdmin,
+    auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<()>, ApiError> {
+    crate::require_permission!(auth, state, "tickets.manage");
     let result = sqlx::query("DELETE FROM departments WHERE id = $1")
         .bind(id)
         .execute(&state.db)
