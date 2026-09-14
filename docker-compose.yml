@@ -5,6 +5,8 @@ services:
       - "3000:3000"
     env_file:
       - .env
+    environment:
+      - DATABASE_URL=postgres://vaultscope:vaultscope_dev@postgres:5432/vaultscope
     depends_on:
       postgres:
         condition: service_healthy
