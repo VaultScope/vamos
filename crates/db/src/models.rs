@@ -198,6 +198,7 @@ pub struct Product {
     pub billing_cycle: BillingCycle,
     pub hidden: bool,
     pub service_form_id: Option<Uuid>,
+    pub connector_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -370,6 +371,18 @@ pub struct Notification {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Mailbox {
+    pub id: Uuid,
+    pub name: String,
+    pub host: String,
+    pub port: i32,
+    pub user_name: String,
+    pub password: String,
+    pub is_default: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct EmailTemplate {
     pub id: Uuid,
     pub name: String,
@@ -378,6 +391,7 @@ pub struct EmailTemplate {
     pub body: String,
     pub enabled: bool,
     pub variables: serde_json::Value,
+    pub mailbox_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -398,4 +412,23 @@ pub struct Setting {
     pub key: String,
     pub value: serde_json::Value,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ServiceForm {
+    pub id: Uuid,
+    pub name: String,
+    pub description: String,
+    pub fields: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct InternalTool {
+    pub id: Uuid,
+    pub name: String,
+    pub url: String,
+    pub required_permission: String,
+    pub created_at: DateTime<Utc>,
 }
