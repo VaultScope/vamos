@@ -2,7 +2,9 @@ pub mod hetzner_cloud;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use vaultscope_common::types::{PowerAction, ProvisionParams, ProvisionResult, ReinstallParams, ResourceStatus};
+use vaultscope_common::types::{
+    PowerAction, ProvisionParams, ProvisionResult, ReinstallParams, ResourceStatus,
+};
 
 #[derive(Debug, Error)]
 pub enum ConnectorError {

@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use vaultscope_common::types::{PowerAction, ProvisionParams, ProvisionResult, ReinstallParams, ResourceStatus};
+use vaultscope_common::types::{
+    PowerAction, ProvisionParams, ProvisionResult, ReinstallParams, ResourceStatus,
+};
 
 use crate::{ConnectorError, ConnectorResult, ProvisioningProvider};
 
@@ -31,7 +33,9 @@ impl HetznerCloud {
         body: Option<&impl Serialize>,
     ) -> ConnectorResult<T> {
         let url = format!("{}{}", BASE_URL, path);
-        let mut req = self.client.request(method, &url)
+        let mut req = self
+            .client
+            .request(method, &url)
             .header("Authorization", self.auth_header());
 
         if let Some(b) = body {
@@ -55,11 +59,14 @@ impl HetznerCloud {
             return Err(ConnectorError::Api(format!("{}: {}", status, text)));
         }
 
-        resp.json().await.map_err(|e| ConnectorError::Api(e.to_string()))
+        resp.json()
+            .await
+            .map_err(|e| ConnectorError::Api(e.to_string()))
     }
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct ServersResponse {
     servers: Vec<ServerResponse>,
 }
@@ -70,6 +77,7 @@ struct CreateServerResponse {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct ServerResponse {
     id: u64,
     name: String,
@@ -97,12 +105,6 @@ struct CreateServerRequest {
 }
 
 #[derive(Serialize)]
-struct PowerActionRequest {
-    #[serde(rename = "type")]
-    action_type: String,
-}
-
-#[derive(Serialize)]
 struct RebuildRequest {
     image: String,
 }
@@ -114,11 +116,9 @@ impl ProvisioningProvider for HetznerCloud {
     }
 
     async fn test_connection(&self) -> ConnectorResult<()> {
-        let _: ServersResponse = self.request(
-            reqwest::Method::GET,
-            "/servers?per_page=1",
-            None::<&()>,
-        ).await?;
+        let _: ServersResponse = self
+            .request(reqwest::Method::GET, "/servers?per_page=1", None::<&()>)
+            .await?;
         Ok(())
     }
 
@@ -131,17 +131,15 @@ impl ProvisioningProvider for HetznerCloud {
             ssh_keys: params.ssh_keys.clone(),
         };
 
-        let resp: CreateServerResponse = self.request(
-            reqwest::Method::POST,
-            "/servers",
-            Some(&body),
-        ).await?;
+        let resp: CreateServerResponse = self
+            .request(reqwest::Method::POST, "/servers", Some(&body))
+            .await?;
 
         Ok(ProvisionResult {
             resource_id: resp.server.id.to_string(),
             ip: resp.server.public_net.ipv4.ip,
             hostname: resp.server.name,
-            raw_response: serde_json::to_value(&resp.server.id).unwrap_or_default(),
+            raw_response: serde_json::to_value(resp.server.id).unwrap_or_default(),
         })
     }
 
@@ -153,20 +151,24 @@ impl ProvisioningProvider for HetznerCloud {
             PowerAction::Reset => "reset",
         };
 
-        let _: serde_json::Value = self.request(
-            reqwest::Method::POST,
-            &format!("/servers/{}/actions/{}", resource_id, action_name),
-            None::<&()>,
-        ).await?;
+        let _: serde_json::Value = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/servers/{}/actions/{}", resource_id, action_name),
+                None::<&()>,
+            )
+            .await?;
         Ok(())
     }
 
     async fn status(&self, resource_id: &str) -> ConnectorResult<ResourceStatus> {
-        let resp: serde_json::Value = self.request(
-            reqwest::Method::GET,
-            &format!("/servers/{}", resource_id),
-            None::<&()>,
-        ).await?;
+        let resp: serde_json::Value = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/servers/{}", resource_id),
+                None::<&()>,
+            )
+            .await?;
 
         let status_str = resp["server"]["status"].as_str().unwrap_or("unknown");
         Ok(match status_str {
@@ -179,11 +181,13 @@ impl ProvisioningProvider for HetznerCloud {
     }
 
     async fn delete(&self, resource_id: &str) -> ConnectorResult<()> {
-        let _: serde_json::Value = self.request(
-            reqwest::Method::DELETE,
-            &format!("/servers/{}", resource_id),
-            None::<&()>,
-        ).await?;
+        let _: serde_json::Value = self
+            .request(
+                reqwest::Method::DELETE,
+                &format!("/servers/{}", resource_id),
+                None::<&()>,
+            )
+            .await?;
         Ok(())
     }
 
@@ -192,11 +196,13 @@ impl ProvisioningProvider for HetznerCloud {
             image: params.image.clone(),
         };
 
-        let _: serde_json::Value = self.request(
-            reqwest::Method::POST,
-            &format!("/servers/{}/actions/rebuild", resource_id),
-            Some(&body),
-        ).await?;
+        let _: serde_json::Value = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/servers/{}/actions/rebuild", resource_id),
+                Some(&body),
+            )
+            .await?;
         Ok(())
     }
 }
