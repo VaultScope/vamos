@@ -27,7 +27,11 @@ async fn get_connector(
     let connector_id = job.connector_id.ok_or(ConnectorError::BadConfig)?;
     connectors
         .get(&connector_id)
-        .ok_or(ConnectorError::NotFound(format!("connector {}", connector_id)))
+        .await
+        .ok_or(ConnectorError::NotFound(format!(
+            "connector {}",
+            connector_id
+        )))
 }
 
 async fn provision(
@@ -35,9 +39,12 @@ async fn provision(
     connectors: &Arc<dyn ConnectorRegistry>,
 ) -> Result<serde_json::Value, ConnectorError> {
     let connector = get_connector(job, connectors).await?;
-    let payload = job.request_payload.as_ref().ok_or(ConnectorError::BadConfig)?;
-    let params: ProvisionParams = serde_json::from_value(payload.clone())
-        .map_err(|e| ConnectorError::Api(e.to_string()))?;
+    let payload = job
+        .request_payload
+        .as_ref()
+        .ok_or(ConnectorError::BadConfig)?;
+    let params: ProvisionParams =
+        serde_json::from_value(payload.clone()).map_err(|e| ConnectorError::Api(e.to_string()))?;
 
     info!(connector = connector.name(), server = %params.name, "provisioning server");
     let result = connector.provision(&params).await?;
@@ -49,8 +56,13 @@ async fn power_action(
     connectors: &Arc<dyn ConnectorRegistry>,
 ) -> Result<serde_json::Value, ConnectorError> {
     let connector = get_connector(job, connectors).await?;
-    let payload = job.request_payload.as_ref().ok_or(ConnectorError::BadConfig)?;
-    let resource_id = payload["resource_id"].as_str().ok_or(ConnectorError::BadConfig)?;
+    let payload = job
+        .request_payload
+        .as_ref()
+        .ok_or(ConnectorError::BadConfig)?;
+    let resource_id = payload["resource_id"]
+        .as_str()
+        .ok_or(ConnectorError::BadConfig)?;
     let action: PowerAction = serde_json::from_value(payload["action"].clone())
         .map_err(|e| ConnectorError::Api(e.to_string()))?;
 
@@ -63,8 +75,13 @@ async fn delete_resource(
     connectors: &Arc<dyn ConnectorRegistry>,
 ) -> Result<serde_json::Value, ConnectorError> {
     let connector = get_connector(job, connectors).await?;
-    let payload = job.request_payload.as_ref().ok_or(ConnectorError::BadConfig)?;
-    let resource_id = payload["resource_id"].as_str().ok_or(ConnectorError::BadConfig)?;
+    let payload = job
+        .request_payload
+        .as_ref()
+        .ok_or(ConnectorError::BadConfig)?;
+    let resource_id = payload["resource_id"]
+        .as_str()
+        .ok_or(ConnectorError::BadConfig)?;
 
     connector.delete(resource_id).await?;
     Ok(serde_json::json!({"ok": true}))
@@ -75,8 +92,13 @@ async fn reinstall(
     connectors: &Arc<dyn ConnectorRegistry>,
 ) -> Result<serde_json::Value, ConnectorError> {
     let connector = get_connector(job, connectors).await?;
-    let payload = job.request_payload.as_ref().ok_or(ConnectorError::BadConfig)?;
-    let resource_id = payload["resource_id"].as_str().ok_or(ConnectorError::BadConfig)?;
+    let payload = job
+        .request_payload
+        .as_ref()
+        .ok_or(ConnectorError::BadConfig)?;
+    let resource_id = payload["resource_id"]
+        .as_str()
+        .ok_or(ConnectorError::BadConfig)?;
     let params: ReinstallParams = serde_json::from_value(payload["params"].clone())
         .map_err(|e| ConnectorError::Api(e.to_string()))?;
 

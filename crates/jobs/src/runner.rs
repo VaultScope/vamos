@@ -18,13 +18,22 @@ pub struct JobRunner {
     poll_interval: Duration,
 }
 
+#[async_trait::async_trait]
 pub trait ConnectorRegistry: Send + Sync {
-    fn get(&self, connector_id: &Uuid) -> Option<Arc<dyn ProvisioningProvider>>;
+    async fn get(&self, connector_id: &Uuid) -> Option<Arc<dyn ProvisioningProvider>>;
 }
 
 impl JobRunner {
-    pub fn new(pool: PgPool, connectors: Arc<dyn ConnectorRegistry>, poll_interval: Duration) -> Self {
-        Self { pool, connectors, poll_interval }
+    pub fn new(
+        pool: PgPool,
+        connectors: Arc<dyn ConnectorRegistry>,
+        poll_interval: Duration,
+    ) -> Self {
+        Self {
+            pool,
+            connectors,
+            poll_interval,
+        }
     }
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
