@@ -3,6 +3,10 @@ name = "vaultscope-api"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "vaultscope_api"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vaultscope-api"
 path = "src/main.rs"
@@ -24,9 +28,14 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
 jsonwebtoken = { workspace = true }
+async-trait = { workspace = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 dotenvy = { workspace = true }
 axum_csrf = "0.11.0"
+lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls"] }
+redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
+hex = "0.4"
+rand = "0.8"
