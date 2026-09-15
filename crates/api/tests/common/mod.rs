@@ -34,6 +34,7 @@ pub fn test_config() -> Config {
         port: 3001,
         jwt_secret: "test_secret_key_for_testing_only".to_string(),
         encryption_key: "test_encryption_key_32_bytes_!!".to_string(),
+        authentik_enabled: true,
         authentik_issuer: "https://auth.test.local".to_string(),
         authentik_client_id_admin: "test_admin".to_string(),
         authentik_client_id_storefront: "test_storefront".to_string(),
@@ -43,6 +44,7 @@ pub fn test_config() -> Config {
         stripe_secret_key: None,
         cors_origins: vec!["http://localhost:5173".to_string()],
         job_poll_interval_secs: 5,
+        redis_url: "redis://127.0.0.1:6379".to_string(),
     }
 }
 
@@ -54,5 +56,6 @@ pub async fn test_app_state() -> AppState {
         db: pool,
         config: Arc::new(config),
         csrf_config: axum_csrf::CsrfConfig::default(),
+        redis: None,
     }
 }

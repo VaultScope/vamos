@@ -75,6 +75,7 @@ fn test_connector_config_encryption_with_real_key_derivation() {
         port: 3001,
         jwt_secret: "test".to_string(),
         encryption_key: "my_production_encryption_key_!!".to_string(),
+        authentik_enabled: true,
         authentik_issuer: "test".to_string(),
         authentik_client_id_admin: "test".to_string(),
         authentik_client_id_storefront: "test".to_string(),
@@ -84,6 +85,7 @@ fn test_connector_config_encryption_with_real_key_derivation() {
         stripe_secret_key: None,
         cors_origins: vec![],
         job_poll_interval_secs: 5,
+        redis_url: "redis://127.0.0.1:6379".to_string(),
     };
 
     let key = config.encryption_key_bytes();

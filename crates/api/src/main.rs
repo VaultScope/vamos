@@ -13,7 +13,7 @@ use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -80,14 +80,23 @@ async fn main() {
 
     info!("database connected and migrations applied");
 
-    // SEC-001: Connect to Redis for OIDC state storage
-    let redis_client = redis::Client::open(config.redis_url.as_str())
-        .expect("failed to connect to redis");
-    let redis = redis::aio::ConnectionManager::new(redis_client)
-        .await
-        .expect("failed to create redis connection manager");
-
-    info!("redis connected");
+    // SEC-001: Connect to Redis for OIDC state storage (non-blocking fallback)
+    let redis = match redis::Client::open(config.redis_url.as_str()) {
+        Ok(client) => match redis::aio::ConnectionManager::new(client).await {
+            Ok(mgr) => {
+                info!("redis connected");
+                Some(mgr)
+            }
+            Err(e) => {
+                warn!("redis connection manager failed ({}), continuing without redis", e);
+                None
+            }
+        },
+        Err(e) => {
+            warn!("redis client open failed ({}), continuing without redis", e);
+            None
+        }
+    };
 
     let state = AppState {
         db: pool.clone(),

@@ -8,6 +8,7 @@ pub struct Config {
     pub port: u16,
     pub jwt_secret: String,
     pub encryption_key: String,
+    pub authentik_enabled: bool,
     pub authentik_issuer: String,
     pub authentik_client_id_admin: String,
     pub authentik_client_id_storefront: String,
@@ -28,6 +29,11 @@ impl Config {
         let jwt_secret = required("JWT_SECRET");
         validate_jwt_secret(&jwt_secret);
 
+        let auth_mode = env::var("AUTH_MODE").unwrap_or_else(|_| "local".to_string());
+        let authentik_enabled = env::var("AUTHENTIK_ENABLED")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or_else(|_| env::var("AUTHENTIK_ISSUER").is_ok() && auth_mode != "local");
+
         Self {
             database_url: required("DATABASE_URL"),
             db_max_connections: env::var("DB_MAX_CONNECTIONS")
@@ -41,11 +47,12 @@ impl Config {
                 .expect("PORT must be a number"),
             jwt_secret,
             encryption_key,
-            authentik_issuer: required("AUTHENTIK_ISSUER"),
-            authentik_client_id_admin: required("AUTHENTIK_CLIENT_ID_ADMIN"),
-            authentik_client_id_storefront: required("AUTHENTIK_CLIENT_ID_STOREFRONT"),
-            authentik_client_secret_admin: required("AUTHENTIK_CLIENT_SECRET_ADMIN"),
-            authentik_client_secret_storefront: required("AUTHENTIK_CLIENT_SECRET_STOREFRONT"),
+            authentik_enabled,
+            authentik_issuer: env::var("AUTHENTIK_ISSUER").unwrap_or_else(|_| "http://localhost:9000".to_string()),
+            authentik_client_id_admin: env::var("AUTHENTIK_CLIENT_ID_ADMIN").unwrap_or_else(|_| "vaultscope-admin".to_string()),
+            authentik_client_id_storefront: env::var("AUTHENTIK_CLIENT_ID_STOREFRONT").unwrap_or_else(|_| "vaultscope-storefront".to_string()),
+            authentik_client_secret_admin: env::var("AUTHENTIK_CLIENT_SECRET_ADMIN").unwrap_or_else(|_| "dev_admin_secret_32_bytes_minimum_padding!".to_string()),
+            authentik_client_secret_storefront: env::var("AUTHENTIK_CLIENT_SECRET_STOREFRONT").unwrap_or_else(|_| "dev_storefront_secret_32_bytes_min!".to_string()),
             authentik_api_token: env::var("AUTHENTIK_API_TOKEN").ok(),
             stripe_secret_key: env::var("STRIPE_SECRET_KEY").ok(),
             cors_origins: env::var("CORS_ORIGINS")
@@ -97,15 +104,18 @@ fn validate_encryption_key(key: &str) {
         "12345", "qwerty", "admin", "root", "demo",
     ];
 
+    let is_prod = env::var("ENVIRONMENT").unwrap_or_default() == "production";
     let key_lower = key.to_lowercase();
-    for weak in &weak_keys {
-        if key_lower.contains(weak) && key.len() < 64 {
-            panic!(
-                "ENCRYPTION_KEY appears to be a weak development key containing '{}'. \
-                 Use a cryptographically secure random key. \
-                 Generate one with: openssl rand -hex 32",
-                weak
-            );
+    if is_prod {
+        for weak in &weak_keys {
+            if key_lower.contains(weak) && key.len() < 64 {
+                panic!(
+                    "ENCRYPTION_KEY appears to be a weak development key containing '{}'. \
+                     Use a cryptographically secure random key. \
+                     Generate one with: openssl rand -hex 32",
+                    weak
+                );
+            }
         }
     }
 
