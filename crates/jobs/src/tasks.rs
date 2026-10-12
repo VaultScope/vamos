@@ -16,6 +16,7 @@ pub async fn execute(
         "power_action" => power_action(job, connectors).await,
         "delete" => delete_resource(job, connectors).await,
         "reinstall" => reinstall(job, connectors).await,
+        "modify" => modify_task(job, connectors).await,
         other => Err(ConnectorError::Api(format!("unknown task: {}", other))),
     }
 }
@@ -24,13 +25,12 @@ async fn get_connector(
     job: &Job,
     connectors: &Arc<dyn ConnectorRegistry>,
 ) -> Result<Arc<dyn ProvisioningProvider>, ConnectorError> {
-    let connector_id = job.connector_id.ok_or(ConnectorError::BadConfig)?;
     connectors
-        .get(&connector_id)
+        .get(&job.target_api)
         .await
         .ok_or(ConnectorError::NotFound(format!(
-            "connector {}",
-            connector_id
+            "provider {}",
+            job.target_api
         )))
 }
 
@@ -103,5 +103,22 @@ async fn reinstall(
         .map_err(|e| ConnectorError::Api(e.to_string()))?;
 
     connector.reinstall(resource_id, &params).await?;
+    Ok(serde_json::json!({"ok": true}))
+}
+
+async fn modify_task(
+    job: &Job,
+    connectors: &Arc<dyn ConnectorRegistry>,
+) -> Result<serde_json::Value, ConnectorError> {
+    let connector = get_connector(job, connectors).await?;
+    let payload = job
+        .request_payload
+        .as_ref()
+        .ok_or(ConnectorError::BadConfig)?;
+    let resource_id = payload["resource_id"]
+        .as_str()
+        .ok_or(ConnectorError::BadConfig)?;
+
+    connector.modify(resource_id, payload).await?;
     Ok(serde_json::json!({"ok": true}))
 }

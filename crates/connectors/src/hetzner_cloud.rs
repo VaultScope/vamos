@@ -74,6 +74,7 @@ struct ServersResponse {
 #[derive(Deserialize)]
 struct CreateServerResponse {
     server: ServerResponse,
+    root_password: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -109,6 +110,12 @@ struct RebuildRequest {
     image: String,
 }
 
+#[derive(Deserialize)]
+struct RequestConsoleResponse {
+    wss_url: String,
+    password: String,
+}
+
 #[async_trait]
 impl ProvisioningProvider for HetznerCloud {
     fn name(&self) -> &'static str {
@@ -139,7 +146,10 @@ impl ProvisioningProvider for HetznerCloud {
             resource_id: resp.server.id.to_string(),
             ip: resp.server.public_net.ipv4.ip,
             hostname: resp.server.name,
-            raw_response: serde_json::to_value(resp.server.id).unwrap_or_default(),
+            raw_response: serde_json::json!({
+                "server_id": resp.server.id,
+                "root_password": resp.root_password,
+            }),
         })
     }
 
@@ -204,5 +214,24 @@ impl ProvisioningProvider for HetznerCloud {
             )
             .await?;
         Ok(())
+    }
+
+    async fn modify(&self, _resource_id: &str, _params: &serde_json::Value) -> ConnectorResult<()> {
+        Ok(())
+    }
+
+    async fn console(&self, resource_id: &str) -> ConnectorResult<serde_json::Value> {
+        let resp: RequestConsoleResponse = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/servers/{}/actions/request_console", resource_id),
+                None::<&()>,
+            )
+            .await?;
+
+        Ok(serde_json::json!({
+            "wss_url": resp.wss_url,
+            "password": resp.password,
+        }))
     }
 }

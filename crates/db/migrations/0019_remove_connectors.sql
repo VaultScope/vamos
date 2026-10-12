@@ -1,0 +1,4 @@
+ALTER TABLE products DROP COLUMN IF EXISTS connector_id;
+ALTER TABLE services DROP COLUMN IF EXISTS connector_id;
+ALTER TABLE jobs DROP COLUMN IF EXISTS connector_id;
+DROP TABLE IF EXISTS connectors;

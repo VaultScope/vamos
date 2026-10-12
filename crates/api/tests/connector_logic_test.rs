@@ -86,6 +86,18 @@ fn test_connector_config_encryption_with_real_key_derivation() {
         cors_origins: vec![],
         job_poll_interval_secs: 5,
         redis_url: "redis://127.0.0.1:6379".to_string(),
+        hetzner_api_token: None,
+        reliablesite_api_key: None,
+        reliablesite_api_url: None,
+        sftpgo_url: None,
+        sftpgo_user: None,
+        sftpgo_pass: None,
+        stripe_webhook_secret: None,
+        smtp_host: None,
+        smtp_username: None,
+        smtp_password: None,
+        smtp_from: None,
+        dev_mode: true,
     };
 
     let key = config.encryption_key_bytes();

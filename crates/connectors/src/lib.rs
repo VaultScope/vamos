@@ -1,4 +1,7 @@
 pub mod hetzner_cloud;
+pub mod reliablesite;
+pub mod sftpgo;
+
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -39,4 +42,10 @@ pub trait ProvisioningProvider: Send + Sync {
     async fn delete(&self, resource_id: &str) -> ConnectorResult<()>;
 
     async fn reinstall(&self, resource_id: &str, params: &ReinstallParams) -> ConnectorResult<()>;
+    
+    async fn modify(&self, resource_id: &str, params: &serde_json::Value) -> ConnectorResult<()>;
+
+    async fn console(&self, _resource_id: &str) -> ConnectorResult<serde_json::Value> {
+        Err(ConnectorError::Api("Console not supported by this provider".into()))
+    }
 }
