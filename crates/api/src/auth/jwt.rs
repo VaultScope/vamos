@@ -33,19 +33,7 @@ pub fn verify(token: &str, secret: &str, expected_audience: Audience) -> Result<
     Ok(data.claims)
 }
 
-/// Deprecated: Use verify() with explicit audience instead
-#[deprecated(note = "Use verify() with explicit audience parameter")]
-pub fn verify_legacy(token: &str, secret: &str) -> Result<Claims, ApiError> {
-    // For backwards compatibility during migration only
-    let data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &Validation::default(),
-    )
-    .map_err(|_| ApiError::Unauthorized)?;
 
-    Ok(data.claims)
-}
 
 pub fn new_expiry() -> i64 {
     (Utc::now() + chrono::Duration::hours(TOKEN_EXPIRY_HOURS)).timestamp()

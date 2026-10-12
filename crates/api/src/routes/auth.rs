@@ -1,251 +1,153 @@
-use axum::extract::{Query, State};
-use axum::response::Redirect;
-use axum::routing::{get, post};
+use axum::extract::State;
+use axum::routing::post;
 use axum::{Json, Router};
 use chrono::Utc;
-use rand::Rng;
-use redis::AsyncCommands;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::auth::{jwt, oidc, Audience, Claims};
+use crate::auth::{jwt, Audience, Claims};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::validation::{validate_email, validate_required_string, validate_string_length};
+use bcrypt::{hash, verify, DEFAULT_COST};
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/init-login", post(init_login))
-        .route("/callback/admin", post(admin_callback))
-        .route("/callback/storefront", post(storefront_callback))
+pub fn routes(state: &AppState) -> Router<AppState> {
+    let mut router = Router::new()
+        .route("/login", post(login))
         .route("/register", post(register))
-        .route("/dev-login", post(dev_login))
-        .route("/mock/application/o/authorize/", get(mock_authorize))
-}
+        .route("/verify-email", post(verify_email))
+        .route("/resend-verification", post(resend_verification));
 
-// SEC-001: OIDC state generation response
-#[derive(Serialize)]
-struct InitLoginResponse {
-    state: String,
+    if state.config.dev_mode {
+        router = router.route("/dev-login", post(dev_login));
+    }
+
+    router
 }
 
 #[derive(Deserialize)]
-struct MockAuthorizeQuery {
-    client_id: Option<String>,
-    redirect_uri: Option<String>,
-    state: Option<String>,
+struct LoginPayload {
+    email: String,
+    password: String,
+    audience: String,
+    totp_code: Option<String>,
 }
 
-async fn mock_authorize(
-    Query(query): Query<MockAuthorizeQuery>,
-) -> Result<Redirect, ApiError> {
-    let redirect_uri = query.redirect_uri.unwrap_or_else(|| "/auth/callback".to_string());
-    let state = query.state.unwrap_or_default();
-    let client_id = query.client_id.unwrap_or_else(|| "default".to_string());
-
-    let sep = if redirect_uri.contains('?') { "&" } else { "?" };
-    let target = format!(
-        "{}{}code=dev_code_{}&state={}",
-        redirect_uri, sep, client_id, state
-    );
-
-    tracing::info!("Mock OIDC redirecting to {}", target);
-    Ok(Redirect::temporary(&target))
-}
-
-#[derive(Deserialize)]
-struct CallbackPayload {
-    code: String,
-    redirect_uri: String,
-    state: String,
-}
-
-// SEC-001: Generate and store OIDC state in Redis
-async fn init_login(State(state): State<AppState>) -> Result<Json<InitLoginResponse>, ApiError> {
-    // Generate 32-byte random state
-    let state_bytes: [u8; 32] = rand::thread_rng().gen();
-    let state_value = hex::encode(state_bytes);
-
-    // Store in Redis with 10-minute TTL if available
-    let key = format!("oidc:state:{}", state_value);
-    if let Some(mut redis) = state.redis.clone() {
-        let _ = redis.set_ex::<_, _, ()>(&key, "1", 600).await;
-    }
-
-    tracing::info!("OIDC state generated: {}", state_value);
-
-    Ok(Json(InitLoginResponse {
-        state: state_value,
-    }))
-}
-
-// SEC-001: Validate and consume OIDC state from Redis
-async fn validate_and_consume_state(
-    redis: Option<&mut redis::aio::ConnectionManager>,
-    state: &str,
-) -> Result<(), ApiError> {
-    // Validate state format (64 hex characters from 32-byte random generation)
-    if state.len() != 64 || !state.chars().all(|c| c.is_ascii_hexdigit()) {
-        tracing::warn!("OIDC state validation failed: invalid format (expected 64 hex chars)");
-        return Err(ApiError::Unauthorized);
-    }
-
-    let Some(redis) = redis else {
-        tracing::info!("Redis not available; skipping OIDC state check in fallback mode");
-        return Ok(());
-    };
-
-    let key = format!("oidc:state:{}", state);
-
-    // Atomically get and delete state (prevents TOCTOU race condition)
-    let value: Result<Option<String>, _> = redis.get_del(&key).await;
-    match value {
-        Ok(Some(_)) => {
-            tracing::info!("OIDC state validated and consumed: {}", state);
-            Ok(())
-        }
-        Ok(None) => {
-            tracing::warn!("OIDC state validation failed: state not found or expired");
-            Err(ApiError::Unauthorized)
-        }
-        Err(e) => {
-            tracing::warn!("Redis state check fallback: {}", e);
-            Ok(())
-        }
-    }
-}
-
-async fn admin_callback(
+async fn login(
     State(state): State<AppState>,
-    Json(payload): Json<CallbackPayload>,
+    Json(payload): Json<LoginPayload>,
 ) -> Result<Json<Value>, ApiError> {
-    // SEC-001: Validate and consume OIDC state
-    let mut redis_opt = state.redis.clone();
-    validate_and_consume_state(redis_opt.as_mut(), &payload.state).await?;
+    validate_required_string(&payload.email, "Email")?;
+    validate_required_string(&payload.password, "Password")?;
+    validate_email(&payload.email)?;
 
-    let (staff_id, email, role_name) = if !state.config.authentik_enabled || payload.code.starts_with("dev_code") {
-        tracing::info!("Using dev/local admin authentication bypass for code: {}", payload.code);
-        let staff: Option<(Uuid, String, String)> = sqlx::query_as(
-            "SELECT s.id, s.email, r.name FROM staff s JOIN roles r ON s.role_id = r.id WHERE s.username = 'admin1' OR r.name = 'Owner' LIMIT 1"
+    let is_admin = payload.audience == "admin";
+
+    if is_admin {
+        let staff: Option<(Uuid, String, String, Option<String>, bool)> = sqlx::query_as(
+            "SELECT s.id, s.email, r.name, s.password_hash, s.email_verified FROM staff s JOIN roles r ON s.role_id = r.id WHERE s.email = $1 LIMIT 1"
         )
+        .bind(&payload.email)
         .fetch_optional(&state.db)
-        .await
-        .map_err(ApiError::from)?;
+        .await?;
 
-        staff.ok_or_else(|| {
-            tracing::warn!("admin login denied: no default staff record in DB");
-            ApiError::Internal("Default staff record missing. Please run database seeding.".into())
-        })?
-    } else {
-        let tokens = oidc::exchange_code(&state.config, &payload.code, &payload.redirect_uri, true).await?;
-        let userinfo = oidc::fetch_userinfo(&state.config, &tokens.access_token).await?;
-
-        tracing::info!("admin login: sub={}, email={}", userinfo.sub, userinfo.email);
-
-        let staff: Option<(Uuid, String)> = sqlx::query_as(
-            "SELECT s.id, r.name FROM staff s JOIN roles r ON s.role_id = r.id WHERE s.external_id = $1"
-        )
-        .bind(&userinfo.sub)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(ApiError::from)?;
-
-        let (staff_id, role_name) = staff.ok_or_else(|| {
-            tracing::warn!("admin login denied: no staff record for sub={}", userinfo.sub);
-            ApiError::Forbidden
+        let (staff_id, email, role_name, password_hash, email_verified) = staff.ok_or_else(|| {
+            ApiError::Unauthorized
         })?;
 
-        (staff_id, userinfo.email, role_name)
-    };
+        let hash_str = password_hash.ok_or_else(|| {
+            tracing::warn!("Staff {} has no password hash", email);
+            ApiError::Unauthorized
+        })?;
 
-    sqlx::query("UPDATE staff SET last_login = now() WHERE id = $1")
-        .bind(staff_id)
-        .execute(&state.db)
-        .await?;
+        if !verify(&payload.password, &hash_str).unwrap_or(false) {
+            return Err(ApiError::Unauthorized);
+        }
 
-    let claims = Claims {
-        sub: staff_id,
-        email,
-        role: role_name,
-        audience: Audience::Admin,
-        iat: Utc::now().timestamp(),
-        exp: jwt::new_expiry(),
-    };
+        sqlx::query("UPDATE staff SET last_login = now() WHERE id = $1")
+            .bind(staff_id)
+            .execute(&state.db)
+            .await?;
 
-    let token = jwt::sign(&claims, &state.config.jwt_secret)?;
-    Ok(Json(json!({ "token": token, "claims": claims })))
-}
-
-async fn storefront_callback(
-    State(state): State<AppState>,
-    Json(payload): Json<CallbackPayload>,
-) -> Result<Json<Value>, ApiError> {
-    // SEC-001: Validate and consume OIDC state
-    let mut redis_opt = state.redis.clone();
-    validate_and_consume_state(redis_opt.as_mut(), &payload.state).await?;
-
-    let (customer_id, email) = if !state.config.authentik_enabled || payload.code.starts_with("dev_code") {
-        tracing::info!("Using dev/local storefront authentication bypass for code: {}", payload.code);
-        let customer: Option<(Uuid, String)> = sqlx::query_as(
-            "SELECT id, email FROM customers WHERE email = 'customer1@test.local' OR status = 'active' ORDER BY created_at ASC LIMIT 1"
-        )
-        .fetch_optional(&state.db)
-        .await?;
-
-        customer.ok_or_else(|| {
-            ApiError::Internal("Default customer record missing. Please run database seeding.".into())
-        })?
-    } else {
-        let tokens = oidc::exchange_code(&state.config, &payload.code, &payload.redirect_uri, false).await?;
-        let userinfo = oidc::fetch_userinfo(&state.config, &tokens.access_token).await?;
-
-        let customer_id: Option<(Uuid,)> = sqlx::query_as(
-            "SELECT id FROM customers WHERE external_id = $1"
-        )
-        .bind(&userinfo.sub)
-        .fetch_optional(&state.db)
-        .await?;
-
-        let customer_id = match customer_id {
-            Some((id,)) => id,
-            None => {
-                let id = Uuid::now_v7();
-                sqlx::query(
-                    "INSERT INTO customers (id, external_id, name, email) VALUES ($1, $2, $3, $4)"
-                )
-                .bind(id)
-                .bind(&userinfo.sub)
-                .bind(userinfo.preferred_username.as_deref().unwrap_or(&userinfo.email))
-                .bind(&userinfo.email)
-                .execute(&state.db)
-                .await?;
-                id
-            }
+        let claims = Claims {
+            sub: staff_id,
+            email,
+            role: role_name,
+            audience: Audience::Admin,
+            iat: Utc::now().timestamp(),
+            exp: jwt::new_expiry(),
         };
 
-        (customer_id, userinfo.email)
-    };
-
-    sqlx::query("UPDATE customers SET last_login = now() WHERE id = $1")
-        .bind(customer_id)
-        .execute(&state.db)
+        let token = jwt::sign(&claims, &state.config.jwt_secret)?;
+        Ok(Json(json!({ "token": token, "claims": claims, "email_verified": email_verified })))
+    } else {
+        let customer: Option<(Uuid, String, Option<String>, bool, bool, Option<String>)> = sqlx::query_as(
+            "SELECT id, email, password_hash, email_verified, two_factor_enabled, totp_secret FROM customers WHERE email = $1 AND status = 'active' LIMIT 1"
+        )
+        .bind(&payload.email)
+        .fetch_optional(&state.db)
         .await?;
 
-    let claims = Claims {
-        sub: customer_id,
-        email,
-        role: "customer".to_string(),
-        audience: Audience::Storefront,
-        iat: Utc::now().timestamp(),
-        exp: jwt::new_expiry(),
-    };
+        let (customer_id, email, password_hash, email_verified, two_factor_enabled, totp_secret) = customer.ok_or_else(|| {
+            ApiError::Unauthorized
+        })?;
 
-    let token = jwt::sign(&claims, &state.config.jwt_secret)?;
-    Ok(Json(json!({ "token": token, "claims": claims })))
+        let hash_str = password_hash.ok_or_else(|| {
+            tracing::warn!("Customer {} has no password hash", email);
+            ApiError::Unauthorized
+        })?;
+
+        if !verify(&payload.password, &hash_str).unwrap_or(false) {
+            return Err(ApiError::Unauthorized);
+        }
+
+        if two_factor_enabled {
+            if let Some(ref code) = payload.totp_code {
+                let secret_str = totp_secret.ok_or(ApiError::Unauthorized)?;
+                let secret = totp_rs::Secret::Encoded(secret_str);
+                let bytes = secret.to_bytes().map_err(|_| ApiError::Unauthorized)?;
+                let totp = totp_rs::TOTP::new(
+                    totp_rs::Algorithm::SHA1,
+                    6,
+                    1,
+                    30,
+                    bytes,
+                    Some("VaultScope".to_string()),
+                    email.clone(),
+                ).map_err(|_| ApiError::Unauthorized)?;
+
+                let clean_code = code.trim().replace(' ', "");
+                if !totp.check_current(&clean_code).unwrap_or(false) {
+                    return Err(ApiError::BadRequest("Invalid two-factor authentication code".into()));
+                }
+            } else {
+                return Ok(Json(json!({
+                    "mfa_required": true,
+                    "email": email,
+                    "message": "Two-factor authentication code required"
+                })));
+            }
+        }
+
+        sqlx::query("UPDATE customers SET last_login = now() WHERE id = $1")
+            .bind(customer_id)
+            .execute(&state.db)
+            .await?;
+
+        let claims = Claims {
+            sub: customer_id,
+            email,
+            role: "customer".to_string(),
+            audience: Audience::Storefront,
+            iat: Utc::now().timestamp(),
+            exp: jwt::new_expiry(),
+        };
+
+        let token = jwt::sign(&claims, &state.config.jwt_secret)?;
+        Ok(Json(json!({ "token": token, "claims": claims, "email_verified": email_verified })))
+    }
 }
-
-// ─── Registration ────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct RegisterPayload {
@@ -255,6 +157,7 @@ struct RegisterPayload {
     name: String,
     company: Option<String>,
     address: String,
+    postal_code: Option<String>,
     city: String,
     country: String,
     phone: Option<String>,
@@ -276,6 +179,17 @@ async fn register(
     validate_string_length(&payload.username, "Username", 150)?;
     validate_string_length(&payload.name, "Name", 255)?;
 
+    // Abuse prevention: block known disposable email domains
+    let email_lower = payload.email.to_lowercase();
+    let disposable_domains = [
+        "@mailinator.com", "@tempmail.com", "@10minutemail.com", "@guerrillamail.com",
+        "@trashmail.com", "@throwawaymail.com", "@yopmail.com", "@sharklasers.com",
+        "@getairmail.com", "@temp-mail.org", "@dispostable.com"
+    ];
+    if disposable_domains.iter().any(|d| email_lower.ends_with(d)) {
+        return Err(ApiError::BadRequest("Temporary or disposable email domains are not allowed".into()));
+    }
+
     if payload.password.len() < 8 {
         return Err(ApiError::BadRequest("Password must be at least 8 characters".into()));
     }
@@ -291,117 +205,302 @@ async fn register(
         return Err(ApiError::BadRequest("An account with this email already exists".into()));
     }
 
-    // If Authentik is disabled or not configured with an API token, register locally
-    if !state.config.authentik_enabled || state.config.authentik_api_token.is_none() {
-        tracing::info!("Registering customer directly without Authentik: {}", payload.email);
-        let customer_id = Uuid::now_v7();
-        let external_id = format!("local_{}", customer_id);
-
-        sqlx::query(
-            r#"INSERT INTO customers (id, external_id, name, email, phone, company, address, city, country, vat_id, status, email_verified)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active', true)"#
-        )
-        .bind(customer_id)
-        .bind(external_id)
-        .bind(payload.name.trim())
-        .bind(payload.email.trim())
-        .bind(payload.phone.as_deref().unwrap_or(""))
-        .bind(payload.company.as_deref().unwrap_or(""))
-        .bind(payload.address.trim())
-        .bind(payload.city.trim())
-        .bind(payload.country.trim())
-        .bind(payload.vat_id.as_deref().unwrap_or(""))
-        .execute(&state.db)
-        .await?;
-
-        return Ok(Json(json!({
-            "ok": true,
-            "message": "Account created successfully. You can now log in."
-        })));
-    }
-
-    let api_token = state.config.authentik_api_token.as_deref()
-        .ok_or(ApiError::Internal("Registration not configured (missing AUTHENTIK_API_TOKEN)".into()))?;
-
-    let authentik_url = state.config.authentik_issuer.trim_end_matches('/');
-    let client = reqwest::Client::new();
-
-    // Create user in Authentik, assigned to the vs-customer group
-    let customer_group_id = "670f1bae-4b4c-4a4e-93ae-17318869c028";
-    let create_resp = client
-        .post(format!("{}/api/v3/core/users/", authentik_url))
-        .bearer_auth(api_token)
-        .json(&json!({
-            "username": payload.username.trim(),
-            "email": payload.email.trim(),
-            "name": payload.name.trim(),
-            "is_active": true,
-            "groups": [customer_group_id],
-        }))
-        .send()
-        .await
-        .map_err(|e| ApiError::Internal(format!("Authentik API error: {}", e)))?;
-
-    if !create_resp.status().is_success() {
-        let status = create_resp.status().as_u16();
-        let body = create_resp.text().await.unwrap_or_default();
-        tracing::error!("Authentik user creation failed ({}): {}", status, body);
-        if body.contains("already exists") || body.contains("unique") {
-            return Err(ApiError::BadRequest("This username or email is already taken".into()));
-        }
-        return Err(ApiError::Internal(format!("Failed to create account ({})", status)));
-    }
-
-    let user_data: Value = create_resp.json().await
-        .map_err(|e| ApiError::Internal(format!("Authentik response parse error: {}", e)))?;
-
-    let authentik_user_id = user_data["pk"].as_i64()
-        .ok_or(ApiError::Internal("Missing user ID from Authentik".into()))?;
-    let fallback_uid = format!("{}", authentik_user_id);
-    let authentik_uid = user_data["uid"].as_str()
-        .unwrap_or(&fallback_uid);
-
-    // Set password in Authentik
-    let pw_resp = client
-        .post(format!("{}/api/v3/core/users/{}/set_password/", authentik_url, authentik_user_id))
-        .bearer_auth(api_token)
-        .json(&json!({ "password": payload.password }))
-        .send()
-        .await
-        .map_err(|e| ApiError::Internal(format!("Authentik password set error: {}", e)))?;
-
-    if !pw_resp.status().is_success() {
-        tracing::error!("Failed to set password for Authentik user {}", authentik_user_id);
-    }
-
-    // Create customer in VaultScope DB
+    tracing::info!("Registering customer directly: {}", payload.email);
     let customer_id = Uuid::now_v7();
+    let external_id = format!("local_{}", customer_id);
+    let password_hash = hash(&payload.password, DEFAULT_COST).map_err(|_| ApiError::Internal("Failed to hash password".into()))?;
+
+    let postal_code = payload.postal_code.as_deref().unwrap_or("").trim();
+    let token_bytes: [u8; 32] = rand::random();
+    let verification_token = hex::encode(token_bytes);
+
     sqlx::query(
-        r#"INSERT INTO customers (id, external_id, name, email, phone, company, address, city, country, vat_id, email_verified)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false)"#
+        r#"INSERT INTO customers (id, external_id, name, email, phone, company, address, postal_code, city, country, vat_id, status, email_verified, password_hash, verification_token)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'active', false, $12, $13)"#
     )
     .bind(customer_id)
-    .bind(authentik_uid)
+    .bind(external_id)
     .bind(payload.name.trim())
     .bind(payload.email.trim())
     .bind(payload.phone.as_deref().unwrap_or(""))
     .bind(payload.company.as_deref().unwrap_or(""))
     .bind(payload.address.trim())
+    .bind(postal_code)
     .bind(payload.city.trim())
     .bind(payload.country.trim())
     .bind(payload.vat_id.as_deref().unwrap_or(""))
+    .bind(password_hash)
+    .bind(&verification_token)
     .execute(&state.db)
     .await?;
 
-    tracing::info!("registered customer: {} ({})", payload.username, payload.email);
+    send_verification_email(&state.config, payload.email.trim(), payload.name.trim(), &verification_token);
 
     Ok(Json(json!({
         "ok": true,
-        "message": "Account created successfully. You can now log in."
+        "message": "Account created successfully. Please check your email and spam folder to verify your account."
     })))
 }
 
-// ─── Dev Login ───────────────────────────────────────────────────────────────
+pub fn send_verification_email(
+    config: &crate::config::Config,
+    to_email: &str,
+    to_name: &str,
+    token: &str,
+) {
+    let smtp_host = config.smtp_host.clone().unwrap_or_else(|| "mail.vaultscope.de".to_string());
+    let smtp_user = config.smtp_username.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
+    let smtp_pass = config.smtp_password.clone().unwrap_or_else(|| "".to_string());
+    let smtp_from = config.smtp_from.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
+
+    let verify_link = format!("http://localhost:5173/verify-email?token={}", token);
+    tracing::info!("Verification link for {}: {}", to_email, verify_link);
+
+    let body = format!(
+"Hello {},
+
+Welcome to VaultScope!
+
+Please confirm and verify your email address by clicking the link below:
+{}
+
+Important: If you don't see our emails in your inbox, please make sure to check your Spam or Junk folder.
+
+If you did not sign up for a VaultScope account, please safely ignore this email.
+
+Best regards,
+The VaultScope Team",
+        to_name, verify_link
+    );
+
+    let from_mailbox = match smtp_from.parse() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("Invalid smtp_from address: {:?}", e);
+            return;
+        }
+    };
+    let to_mailbox = match to_email.parse() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("Invalid to_email address: {:?}", e);
+            return;
+        }
+    };
+
+    let email = match lettre::Message::builder()
+        .from(from_mailbox)
+        .to(to_mailbox)
+        .subject("Verify your VaultScope email address")
+        .body(body)
+    {
+        Ok(msg) => msg,
+        Err(e) => {
+            tracing::error!("Failed to build verification email: {:?}", e);
+            return;
+        }
+    };
+
+    let creds = lettre::transport::smtp::authentication::Credentials::new(smtp_user, smtp_pass);
+    let mailer = match lettre::SmtpTransport::relay(&smtp_host) {
+        Ok(b) => b.credentials(creds).build(),
+        Err(e) => {
+            tracing::error!("Failed to create SMTP relay transport: {:?}", e);
+            return;
+        }
+    };
+
+    if let Err(e) = lettre::Transport::send(&mailer, &email) {
+        tracing::error!("Could not send verification email to {}: {:?}", to_email, e);
+    } else {
+        tracing::info!("Verification email sent successfully to {}", to_email);
+    }
+}
+
+pub fn send_billing_email_verification(
+    config: &crate::config::Config,
+    to_email: &str,
+    company_name: &str,
+    token: &str,
+) {
+    let smtp_host = config.smtp_host.clone().unwrap_or_else(|| "mail.vaultscope.de".to_string());
+    let smtp_user = config.smtp_username.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
+    let smtp_pass = config.smtp_password.clone().unwrap_or_else(|| "".to_string());
+    let smtp_from = config.smtp_from.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
+
+    let verify_link = format!("http://localhost:5173/verify-email?token={}&type=billing", token);
+    tracing::info!("Billing email verification link for {}: {}", to_email, verify_link);
+
+    let body = format!(
+"Hello,
+
+This email address has been added as a secondary Billing & Invoice CC recipient for {} on VaultScope.
+
+To confirm this email address and begin receiving invoice copies and billing notices, please verify by clicking:
+{}
+
+Please check your Spam or Junk folder if this message was filtered.
+
+If you did not authorize this, you can safely ignore this email.
+
+Best regards,
+The VaultScope Team",
+        company_name, verify_link
+    );
+
+    let from_mailbox = match smtp_from.parse() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("Invalid smtp_from address: {:?}", e);
+            return;
+        }
+    };
+    let to_mailbox = match to_email.parse() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("Invalid to_email address: {:?}", e);
+            return;
+        }
+    };
+
+    let email = match lettre::Message::builder()
+        .from(from_mailbox)
+        .to(to_mailbox)
+        .subject(format!("Confirm Billing CC Email for {} - VaultScope", company_name))
+        .body(body)
+    {
+        Ok(msg) => msg,
+        Err(e) => {
+            tracing::error!("Failed to build billing verification email: {:?}", e);
+            return;
+        }
+    };
+
+    let creds = lettre::transport::smtp::authentication::Credentials::new(smtp_user, smtp_pass);
+    let mailer = match lettre::SmtpTransport::relay(&smtp_host) {
+        Ok(b) => b.credentials(creds).build(),
+        Err(e) => {
+            tracing::error!("Failed to create SMTP relay transport: {:?}", e);
+            return;
+        }
+    };
+
+    if let Err(e) = lettre::Transport::send(&mailer, &email) {
+        tracing::error!("Could not send billing verification email to {}: {:?}", to_email, e);
+    } else {
+        tracing::info!("Billing verification email sent successfully to {}", to_email);
+    }
+}
+
+#[derive(Deserialize)]
+struct VerifyEmailPayload {
+    token: String,
+}
+
+async fn verify_email(
+    State(state): State<AppState>,
+    Json(payload): Json<VerifyEmailPayload>,
+) -> Result<Json<Value>, ApiError> {
+    validate_required_string(&payload.token, "Token")?;
+    let token = payload.token.trim();
+
+    // 1. Check primary customer verification token
+    let customer: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, email FROM customers WHERE verification_token = $1 LIMIT 1"
+    )
+    .bind(token)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if let Some((customer_id, email)) = customer {
+        sqlx::query(
+            "UPDATE customers SET email_verified = true, verification_token = NULL, updated_at = now() WHERE id = $1"
+        )
+        .bind(customer_id)
+        .execute(&state.db)
+        .await?;
+
+        tracing::info!("Customer primary email verified successfully: {}", email);
+
+        return Ok(Json(json!({
+            "ok": true,
+            "message": "Account email address verified successfully."
+        })));
+    }
+
+    // 2. Check billing CC verification token
+    let billing_email: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, email FROM customer_billing_emails WHERE verification_token = $1 LIMIT 1"
+    )
+    .bind(token)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if let Some((id, email)) = billing_email {
+        sqlx::query(
+            "UPDATE customer_billing_emails SET verified = true, verification_token = NULL, verified_at = now() WHERE id = $1"
+        )
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+
+        tracing::info!("Customer billing CC email verified successfully: {}", email);
+
+        return Ok(Json(json!({
+            "ok": true,
+            "message": "Billing CC email verified successfully. Invoices will now be sent to this address."
+        })));
+    }
+
+    Err(ApiError::BadRequest("Invalid or expired verification token.".into()))
+}
+
+#[derive(Deserialize)]
+struct ResendVerificationPayload {
+    email: String,
+}
+
+async fn resend_verification(
+    State(state): State<AppState>,
+    Json(payload): Json<ResendVerificationPayload>,
+) -> Result<Json<Value>, ApiError> {
+    validate_required_string(&payload.email, "Email")?;
+    validate_email(&payload.email)?;
+
+    let customer: Option<(Uuid, String, String, bool)> = sqlx::query_as(
+        "SELECT id, name, email, email_verified FROM customers WHERE email = $1 LIMIT 1"
+    )
+    .bind(payload.email.trim())
+    .fetch_optional(&state.db)
+    .await?;
+
+    if let Some((customer_id, name, email, email_verified)) = customer {
+        if email_verified {
+            return Ok(Json(json!({
+                "ok": true,
+                "message": "Your email is already verified. You can log in directly."
+            })));
+        }
+
+        let token_bytes: [u8; 32] = rand::random();
+        let verification_token = hex::encode(token_bytes);
+
+        sqlx::query(
+            "UPDATE customers SET verification_token = $1, updated_at = now() WHERE id = $2"
+        )
+        .bind(&verification_token)
+        .bind(customer_id)
+        .execute(&state.db)
+        .await?;
+
+        send_verification_email(&state.config, &email, &name, &verification_token);
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": "If your account exists and is unverified, a verification link has been sent. Please check your inbox and spam folder."
+    })))
+}
 
 #[derive(Deserialize)]
 struct DevLoginPayload {
@@ -413,16 +512,20 @@ async fn dev_login(
     State(state): State<AppState>,
     Json(payload): Json<DevLoginPayload>,
 ) -> Result<Json<Value>, ApiError> {
+    if !state.config.dev_mode {
+        return Err(ApiError::NotFound("Not found".into()));
+    }
+
     let persona = payload.persona.as_deref().or(payload.role.as_deref()).unwrap_or("Owner");
 
     if persona.eq_ignore_ascii_case("customer") || persona.eq_ignore_ascii_case("customer1") {
-        let customer: Option<(Uuid, String)> = sqlx::query_as(
-            "SELECT id, email FROM customers WHERE email = 'customer1@test.local' OR status = 'active' ORDER BY created_at ASC LIMIT 1"
+        let customer: Option<(Uuid, String, bool)> = sqlx::query_as(
+            "SELECT id, email, email_verified FROM customers WHERE email = 'customer1@test.local' OR status = 'active' ORDER BY created_at ASC LIMIT 1"
         )
         .fetch_optional(&state.db)
         .await?;
 
-        let (customer_id, email) = customer.ok_or_else(|| {
+        let (customer_id, email, email_verified) = customer.ok_or_else(|| {
             ApiError::Internal("No customer found in database. Run database seeding.".into())
         })?;
 
@@ -436,7 +539,7 @@ async fn dev_login(
         };
 
         let token = jwt::sign(&claims, &state.config.jwt_secret)?;
-        return Ok(Json(json!({ "token": token, "claims": claims })));
+        return Ok(Json(json!({ "token": token, "claims": claims, "email_verified": email_verified })));
     }
 
     let persona_lower = persona.to_lowercase();
@@ -476,5 +579,5 @@ async fn dev_login(
     };
 
     let token = jwt::sign(&claims, &state.config.jwt_secret)?;
-    Ok(Json(json!({ "token": token, "claims": claims })))
+    Ok(Json(json!({ "token": token, "claims": claims, "email_verified": true })))
 }

@@ -1,5 +1,4 @@
 pub mod jwt;
-pub mod oidc;
 
 use axum::extract::{FromRef, FromRequestParts};
 use axum::http::header::AUTHORIZATION;
@@ -73,15 +72,29 @@ fn extract_claims(
     state: &AppState,
     expected_audience: Audience,
 ) -> Result<Claims, ApiError> {
-    let header = parts
+    let token = if let Some(header) = parts
         .headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or(ApiError::Unauthorized)?;
-
-    let token = header
-        .strip_prefix("Bearer ")
-        .ok_or(ApiError::Unauthorized)?;
+    {
+        header
+            .strip_prefix("Bearer ")
+            .ok_or(ApiError::Unauthorized)?
+    } else if let Some(query) = parts.uri.query() {
+        query
+            .split('&')
+            .find_map(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                if parts.next()? == "token" {
+                    parts.next()
+                } else {
+                    None
+                }
+            })
+            .ok_or(ApiError::Unauthorized)?
+    } else {
+        return Err(ApiError::Unauthorized);
+    };
 
     // SEC-003: Verify JWT with audience validation
     jwt::verify(token, &state.config.jwt_secret, expected_audience)

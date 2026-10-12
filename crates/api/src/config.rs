@@ -19,6 +19,18 @@ pub struct Config {
     pub cors_origins: Vec<String>,
     pub job_poll_interval_secs: u64,
     pub redis_url: String,
+    pub hetzner_api_token: Option<String>,
+    pub reliablesite_api_key: Option<String>,
+    pub reliablesite_api_url: Option<String>,
+    pub sftpgo_url: Option<String>,
+    pub sftpgo_user: Option<String>,
+    pub sftpgo_pass: Option<String>,
+    pub stripe_webhook_secret: Option<String>,
+    pub smtp_host: Option<String>,
+    pub smtp_username: Option<String>,
+    pub smtp_password: Option<String>,
+    pub smtp_from: Option<String>,
+    pub dev_mode: bool,
 }
 
 impl Config {
@@ -66,6 +78,20 @@ impl Config {
                 .expect("JOB_POLL_INTERVAL_SECS must be a number"),
             redis_url: env::var("REDIS_URL")
                 .unwrap_or_else(|_| "redis://redis:6379".to_string()),
+            hetzner_api_token: env::var("HETZNER_API_TOKEN").ok(),
+            reliablesite_api_key: env::var("RELIABLESITE_API_KEY").ok(),
+            reliablesite_api_url: env::var("RELIABLESITE_API_URL").ok(),
+            sftpgo_url: env::var("SFTPGO_URL").ok(),
+            sftpgo_user: env::var("SFTPGO_USER").ok(),
+            sftpgo_pass: env::var("SFTPGO_PASS").ok(),
+            stripe_webhook_secret: env::var("STRIPE_WEBHOOK_SECRET").ok(),
+            smtp_host: env::var("SMTP_HOST").ok(),
+            smtp_username: env::var("SMTP_USERNAME").ok(),
+            smtp_password: env::var("SMTP_PASSWORD").ok(),
+            smtp_from: env::var("SMTP_FROM").ok(),
+            dev_mode: env::var("DEV_MODE")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
         }
     }
 
