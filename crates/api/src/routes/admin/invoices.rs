@@ -1,4 +1,7 @@
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
+use axum::http::header;
+use axum::response::Response;
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::NaiveDate;
@@ -12,7 +15,7 @@ use crate::validation::{
     validate_greater_than_zero, validate_percentage, validate_positive, validate_required_string,
     validate_string_length, MAX_SHORT_STRING_LENGTH, MAX_STRING_LENGTH,
 };
-use vaultscope_db::models::{Invoice, InvoiceLineItem, InvoiceStatus};
+use vaultscope_db::models::{Customer, Invoice, InvoiceLineItem, InvoiceStatus};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -20,6 +23,7 @@ pub fn routes() -> Router<AppState> {
         .route("/stats", get(get_stats))
         .route("/", get(list).post(create))
         .route("/{id}", get(get_one).put(update).delete(delete))
+        .route("/{id}/pdf", get(download_pdf))
         .route("/{id}/send", axum::routing::post(send))
         .route("/{id}/mark-paid", axum::routing::post(mark_paid))
         .route("/{id}/line-items", get(list_line_items))
@@ -267,7 +271,103 @@ async fn send(
     .await?
     .ok_or(ApiError::NotFound("draft invoice not found".into()))?;
 
+    let _ = dispatch_invoice_email(&state, &invoice).await;
+
     Ok(Json(invoice))
+}
+
+async fn dispatch_invoice_email(
+    state: &AppState,
+    invoice: &Invoice,
+) -> Result<(), ApiError> {
+    let customer: Option<(String, String)> = sqlx::query_as(
+        "SELECT name, email FROM customers WHERE id = $1"
+    )
+    .bind(invoice.customer_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (customer_name, customer_email) = match customer {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+
+    // Security: Only include verified billing emails in CC
+    let cc_emails: Vec<String> = sqlx::query_scalar(
+        "SELECT email FROM customer_billing_emails WHERE customer_id = $1 AND verified = true"
+    )
+    .bind(invoice.customer_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let smtp_host = state.config.smtp_host.clone().unwrap_or_else(|| "mail.vaultscope.de".to_string());
+    let smtp_user = state.config.smtp_username.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
+    let smtp_pass = state.config.smtp_password.clone().unwrap_or_else(|| "".to_string());
+    let smtp_from = state.config.smtp_from.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
+
+    let subject = format!("Invoice {} from VaultScope", invoice.invoice_number);
+    let body = format!(
+"Hello {},
+
+A new invoice has been generated for your account.
+
+Invoice Number: {}
+Total Amount: €{}
+Due Date: {}
+
+You can view and manage your invoice directly in the VaultScope customer dashboard:
+http://localhost:5173/dashboard/billing
+
+Best regards,
+The VaultScope Billing Team",
+        customer_name, invoice.invoice_number, invoice.total, invoice.due_date
+    );
+
+    let from_m = match smtp_from.parse() {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    let to_m = match customer_email.parse() {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+
+    let mut builder = lettre::Message::builder()
+        .from(from_m)
+        .to(to_m)
+        .subject(subject);
+
+    for cc_addr in &cc_emails {
+        if let Ok(mailbox) = cc_addr.parse() {
+            builder = builder.cc(mailbox);
+        }
+    }
+
+    let email = match builder.body(body) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("Failed to build invoice email: {:?}", e);
+            return Ok(());
+        }
+    };
+
+    let creds = lettre::transport::smtp::authentication::Credentials::new(smtp_user, smtp_pass);
+    let mailer = match lettre::SmtpTransport::relay(&smtp_host) {
+        Ok(b) => b.credentials(creds).build(),
+        Err(e) => {
+            tracing::error!("Failed to build SMTP relay: {:?}", e);
+            return Ok(());
+        }
+    };
+
+    if let Err(e) = lettre::Transport::send(&mailer, &email) {
+        tracing::error!("Could not send invoice email (primary: {}, CCs: {:?}): {:?}", customer_email, cc_emails, e);
+    } else {
+        tracing::info!("Invoice email sent successfully to {} with CCs: {:?}", customer_email, cc_emails);
+    }
+
+    Ok(())
 }
 
 async fn mark_paid(
@@ -515,4 +615,44 @@ async fn get_comprehensive_stats(
         coupons_loss,
         top_products,
     }))
+}
+
+async fn download_pdf(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    crate::require_permission!(auth, state, "invoices.view");
+    let invoice: Invoice = sqlx::query_as("SELECT * FROM invoices WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::NotFound("invoice not found".into()))?;
+
+    let customer: Customer = sqlx::query_as("SELECT * FROM customers WHERE id = $1")
+        .bind(invoice.customer_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::NotFound("customer not found".into()))?;
+
+    let line_items: Vec<InvoiceLineItem> = sqlx::query_as(
+        "SELECT * FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order ASC, id ASC"
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let pdf_bytes = crate::pdf::generate_invoice_pdf(&invoice, &customer, &line_items);
+    let filename = format!("invoice-{}.pdf", invoice.invoice_number);
+
+    let response = Response::builder()
+        .header(header::CONTENT_TYPE, "application/pdf")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("inline; filename=\"{}\"", filename),
+        )
+        .body(Body::from(pdf_bytes))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(response)
 }

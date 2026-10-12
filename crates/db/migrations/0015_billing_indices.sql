@@ -1,0 +1,1 @@
+CREATE INDEX IF NOT EXISTS idx_services_next_due ON services(status, next_due);

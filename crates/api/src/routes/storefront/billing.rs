@@ -38,6 +38,7 @@ struct Subscription {
     description: String,
     price: String,
     next_date: String,
+    cancel_at_period_end: bool,
 }
 
 async fn billing_info(
@@ -65,8 +66,8 @@ async fn billing_info(
         .map(|(v,)| format!("€{:.2}", v))
         .unwrap_or_else(|| "€0.00".to_string());
 
-    let services: Vec<(String, String, rust_decimal::Decimal, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
-        "SELECT s.id::text, p.name, s.price, s.next_due FROM services s JOIN products p ON s.product_id = p.id WHERE s.customer_id = $1 AND s.status = 'running'"
+    let services: Vec<(String, String, rust_decimal::Decimal, Option<chrono::DateTime<chrono::Utc>>, bool)> = sqlx::query_as(
+        "SELECT s.id::text, p.name, s.price, s.next_due, s.cancel_at_period_end FROM services s JOIN products p ON s.product_id = p.id WHERE s.customer_id = $1 AND s.status = 'running'"
     )
     .bind(auth.0.sub)
     .fetch_all(&state.db)
@@ -74,14 +75,19 @@ async fn billing_info(
 
     let subscriptions = services
         .iter()
-        .map(|(id, pname, price, next_due)| Subscription {
+        .map(|(id, pname, price, next_due, cancel_at_period_end)| Subscription {
             id: id.clone(),
             name: pname.clone(),
-            description: "Active service".to_string(),
+            description: if *cancel_at_period_end {
+                "Cancelling at period end".to_string()
+            } else {
+                "Active service".to_string()
+            },
             price: format!("€{:.2}/mo", price),
             next_date: next_due
                 .map(|d| d.format("%Y-%m-%d").to_string())
                 .unwrap_or_else(|| "—".to_string()),
+            cancel_at_period_end: *cancel_at_period_end,
         })
         .collect();
 
