@@ -82,14 +82,14 @@ async fn login(
         let token = jwt::sign(&claims, &state.config.jwt_secret)?;
         Ok(Json(json!({ "token": token, "claims": claims, "email_verified": email_verified })))
     } else {
-        let customer: Option<(Uuid, String, Option<String>, bool, bool, Option<String>)> = sqlx::query_as(
-            "SELECT id, email, password_hash, email_verified, two_factor_enabled, totp_secret FROM customers WHERE email = $1 AND status = 'active' LIMIT 1"
+        let customer: Option<(Uuid, String, String, Option<String>, bool, bool, Option<String>)> = sqlx::query_as(
+            "SELECT id, name, email, password_hash, email_verified, two_factor_enabled, totp_secret FROM customers WHERE email = $1 AND status = 'active' LIMIT 1"
         )
         .bind(&payload.email)
         .fetch_optional(&state.db)
         .await?;
 
-        let (customer_id, email, password_hash, email_verified, two_factor_enabled, totp_secret) = customer.ok_or_else(|| {
+        let (customer_id, name, email, password_hash, email_verified, two_factor_enabled, totp_secret) = customer.ok_or_else(|| {
             ApiError::Unauthorized
         })?;
 
@@ -145,7 +145,7 @@ async fn login(
         };
 
         let token = jwt::sign(&claims, &state.config.jwt_secret)?;
-        Ok(Json(json!({ "token": token, "claims": claims, "email_verified": email_verified })))
+        Ok(Json(json!({ "token": token, "claims": claims, "name": name, "email_verified": email_verified })))
     }
 }
 
