@@ -45,17 +45,31 @@ pub fn test_config() -> Config {
         cors_origins: vec!["http://localhost:5173".to_string()],
         job_poll_interval_secs: 5,
         redis_url: "redis://127.0.0.1:6379".to_string(),
+        hetzner_api_token: None,
+        reliablesite_api_key: None,
+        reliablesite_api_url: None,
+        sftpgo_url: None,
+        sftpgo_user: None,
+        sftpgo_pass: None,
+        stripe_webhook_secret: None,
+        smtp_host: None,
+        smtp_username: None,
+        smtp_password: None,
+        smtp_from: None,
+        dev_mode: true,
     }
 }
 
 pub async fn test_app_state() -> AppState {
     let pool = setup_test_db().await;
     let config = test_config();
+    let (ticket_bus, _) = tokio::sync::broadcast::channel(1024);
 
     AppState {
         db: pool,
         config: Arc::new(config),
         csrf_config: axum_csrf::CsrfConfig::default(),
         redis: None,
+        ticket_bus,
     }
 }

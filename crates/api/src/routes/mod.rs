@@ -2,6 +2,7 @@ pub mod admin;
 pub mod auth;
 pub mod health;
 pub mod storefront;
+pub mod webhooks;
 
 use axum::{Json, Router};
 use axum_csrf::CsrfToken;
@@ -20,6 +21,7 @@ async fn csrf_token(token: CsrfToken) -> (CsrfToken, Json<Value>) {
 
 pub fn build_router(state: AppState) -> Router {
     let admin_rate_limiter = RateLimiter::new(100, 60); // 100 requests per 60 seconds
+    let auth_rate_limiter = RateLimiter::new(15, 60); // 15 requests per 60 seconds for login/register protection
 
     let protected = Router::new()
         .nest(
@@ -38,7 +40,13 @@ pub fn build_router(state: AppState) -> Router {
         .nest_service("/uploads", tower_http::services::ServeDir::new("uploads"))
         .route("/api/csrf", axum::routing::get(csrf_token))
         .nest("/api/health", health::routes())
-        .nest("/api/auth", auth::routes())
+        .nest(
+            "/api/auth",
+            auth::routes(&state)
+                .layer(axum::middleware::from_fn(rate_limit_middleware))
+                .layer(axum::extract::Extension(auth_rate_limiter)),
+        )
+        .nest("/api/webhooks", webhooks::routes())
         .nest("/api", protected)
         .with_state(state)
 }

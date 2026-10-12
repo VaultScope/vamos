@@ -47,7 +47,6 @@ struct CreateProduct {
     name: String,
     category: String,
     provider: String,
-    connector_id: Option<Uuid>,
     target: String,
     specs: Value,
     cost: f64,
@@ -64,15 +63,14 @@ async fn create(
     crate::require_permission!(auth, state, "products.create");
     let id = Uuid::now_v7();
     let product: Product = sqlx::query_as(
-        r#"INSERT INTO products (id, name, category, provider, connector_id, target, specs, cost, price, setup_fee, billing_cycle)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::billing_cycle)
+        r#"INSERT INTO products (id, name, category, provider, target, specs, cost, price, setup_fee, billing_cycle)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::billing_cycle)
         RETURNING *"#
     )
     .bind(id)
     .bind(&payload.name)
     .bind(&payload.category)
     .bind(&payload.provider)
-    .bind(payload.connector_id)
     .bind(&payload.target)
     .bind(&payload.specs)
     .bind(rust_decimal::Decimal::from_f64_retain(payload.cost).unwrap_or_default())
@@ -93,14 +91,13 @@ async fn update(
 ) -> Result<Json<Product>, ApiError> {
     crate::require_permission!(auth, state, "products.edit");
     let product: Product = sqlx::query_as(
-        r#"UPDATE products SET name=$1, category=$2, provider=$3, connector_id=$4, target=$5, specs=$6,
-        cost=$7, price=$8, setup_fee=$9, billing_cycle=$10::billing_cycle, updated_at=now()
-        WHERE id=$11 RETURNING *"#
+        r#"UPDATE products SET name=$1, category=$2, provider=$3, target=$4, specs=$5,
+        cost=$6, price=$7, setup_fee=$8, billing_cycle=$9::billing_cycle, updated_at=now()
+        WHERE id=$10 RETURNING *"#
     )
     .bind(&payload.name)
     .bind(&payload.category)
     .bind(&payload.provider)
-    .bind(payload.connector_id)
     .bind(&payload.target)
     .bind(&payload.specs)
     .bind(rust_decimal::Decimal::from_f64_retain(payload.cost).unwrap_or_default())
@@ -129,8 +126,8 @@ async fn sync_stock(
         .ok_or(ApiError::NotFound("product not found".into()))?;
 
     // Cloud-provisioned products have unlimited stock (on-demand);
-    // products without a connector keep their manually-set stock.
-    let new_stock = if product.connector_id.is_some() { -1 } else { product.stock };
+    // products without a provider keep their manually-set stock.
+    let new_stock = if !product.provider.is_empty() && product.provider != "manual" { -1 } else { product.stock };
 
     let updated_product: Product = sqlx::query_as(
         "UPDATE products SET stock=$1, updated_at=now() WHERE id=$2 RETURNING *",

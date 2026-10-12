@@ -1,7 +1,11 @@
-use axum::extract::{Path, Query, State};
+use std::convert::Infallible;
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
@@ -19,6 +23,11 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(list).post(create))
         .route("/{id}", get(get_one).put(update))
         .route("/{id}/messages", get(list_messages).post(create_message))
+        .route(
+            "/{id}/attachments",
+            axum::routing::post(upload_attachment).layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
+        )
+        .route("/{id}/events", get(ticket_events))
 }
 
 #[derive(Deserialize)]
@@ -141,6 +150,7 @@ struct UpdateTicket {
     status: Option<TicketStatus>,
     priority: Option<TicketPriority>,
     assignee_id: Option<Uuid>,
+    related_service_id: Option<Uuid>,
 }
 
 async fn update(
@@ -156,14 +166,16 @@ async fn update(
                status = COALESCE($2::ticket_status, status),
                priority = COALESCE($3::ticket_priority, priority),
                assignee_id = COALESCE($4, assignee_id),
+               related_service_id = COALESCE($5, related_service_id),
                updated_at = now()
-           WHERE id = $5
+           WHERE id = $6
            RETURNING *"#,
     )
     .bind(payload.subject)
     .bind(payload.status)
     .bind(payload.priority)
     .bind(payload.assignee_id)
+    .bind(payload.related_service_id)
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -194,6 +206,128 @@ struct CreateTicketMessage {
     author_type: ActorType,
     content: String,
     internal: Option<bool>,
+    attachments: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub struct AttachmentResponse {
+    pub id: Uuid,
+    pub filename: String,
+    pub url: String,
+    pub size: usize,
+    pub content_type: String,
+}
+
+const MAX_ATTACHMENT_SIZE: usize = 10 * 1024 * 1024; // 10MB limit
+
+async fn upload_attachment(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    mut multipart: Multipart,
+) -> Result<Json<AttachmentResponse>, ApiError> {
+    crate::require_permission!(auth, state, "tickets.reply");
+
+    let ticket_exists: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM tickets WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+
+    if ticket_exists.is_none() {
+        return Err(ApiError::NotFound("ticket not found".into()));
+    }
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+    {
+        let raw_filename = field.file_name().unwrap_or("image.png").to_string();
+        let ext = raw_filename
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+
+        // 1. Only images accepted
+        if !["png", "jpg", "jpeg", "webp", "gif"].contains(&ext.as_str()) {
+            return Err(ApiError::BadRequest(
+                "Only image files (PNG, JPEG, WebP, GIF) are accepted.".into(),
+            ));
+        }
+
+        let content_type = field.content_type().unwrap_or("image/png").to_string();
+        if !content_type.starts_with("image/") {
+            return Err(ApiError::BadRequest("Only image files are accepted.".into()));
+        }
+
+        let data = field
+            .bytes()
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+        // 2. Limit attachment size to 10MB
+        if data.len() > MAX_ATTACHMENT_SIZE {
+            return Err(ApiError::BadRequest(
+                "Image file exceeds the 10MB size limit.".into(),
+            ));
+        }
+
+        if data.is_empty() {
+            return Err(ApiError::BadRequest("File is empty.".into()));
+        }
+
+        // 3. Verify magic bytes for real image integrity
+        let is_valid_image = match ext.as_str() {
+            "png" => data.starts_with(&[0x89, 0x50, 0x4E, 0x47]),
+            "jpg" | "jpeg" => data.starts_with(&[0xFF, 0xD8, 0xFF]),
+            "gif" => data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a"),
+            "webp" => data.starts_with(b"RIFF") && data.len() > 12 && &data[8..12] == b"WEBP",
+            _ => false,
+        };
+
+        if !is_valid_image {
+            return Err(ApiError::BadRequest(
+                "File content does not match a valid image format.".into(),
+            ));
+        }
+
+        let dir = std::path::Path::new("uploads/tickets");
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        let attach_id = Uuid::now_v7();
+        let clean_filename = format!(
+            "{}_{}.{}",
+            attach_id,
+            raw_filename
+                .rsplit('.')
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join(".")
+                .replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_"),
+            ext
+        );
+        let path = dir.join(&clean_filename);
+
+        tokio::fs::write(&path, &data)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        let url = format!("/uploads/tickets/{}", clean_filename);
+
+        return Ok(Json(AttachmentResponse {
+            id: attach_id,
+            filename: raw_filename,
+            url,
+            size: data.len(),
+            content_type,
+        }));
+    }
+
+    Err(ApiError::BadRequest("No file uploaded.".into()))
 }
 
 async fn create_message(
@@ -207,9 +341,11 @@ async fn create_message(
     validate_required_string(&payload.content, "Content")?;
     validate_string_length(&payload.content, "Content", MAX_STRING_LENGTH)?;
 
+    let attachments = payload.attachments.unwrap_or_else(|| serde_json::json!([]));
+
     let message: TicketMessage = sqlx::query_as(
-        r#"INSERT INTO ticket_messages (ticket_id, author_id, author_type, content, internal)
-           VALUES ($1, $2, $3::actor_type, $4, $5)
+        r#"INSERT INTO ticket_messages (ticket_id, author_id, author_type, content, internal, attachments)
+           VALUES ($1, $2, $3::actor_type, $4, $5, $6)
            RETURNING *"#,
     )
     .bind(ticket_id)
@@ -217,6 +353,7 @@ async fn create_message(
     .bind(payload.author_type)
     .bind(&payload.content)
     .bind(payload.internal.unwrap_or(false))
+    .bind(attachments)
     .fetch_one(&state.db)
     .await?;
 
@@ -225,5 +362,52 @@ async fn create_message(
         .execute(&state.db)
         .await?;
 
+    // Broadcast message in real-time
+    let _ = state.ticket_bus.send(crate::state::TicketEvent {
+        ticket_id,
+        message: message.clone(),
+    });
+
+    // If message is not internal, notify customer via email
+    if !payload.internal.unwrap_or(false) {
+        crate::mailer::spawn_staff_reply_notification(state.clone(), ticket_id, payload.content);
+    }
+
     Ok(Json(message))
+}
+
+async fn ticket_events(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    crate::require_permission!(auth, state, "tickets.view");
+
+    let ticket_exists: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM tickets WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+
+    if ticket_exists.is_none() {
+        return Err(ApiError::NotFound("ticket not found".into()));
+    }
+
+    let rx = state.ticket_bus.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(move |item| match item {
+        Ok(event) => {
+            // Admin can see all messages for this ticket (including internal notes)
+            if event.ticket_id == id {
+                match serde_json::to_string(&event.message) {
+                    Ok(data) => Some(Ok(Event::default().event("message").data(data))),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }

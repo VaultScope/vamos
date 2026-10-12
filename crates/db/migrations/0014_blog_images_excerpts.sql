@@ -1,0 +1,3 @@
+ALTER TABLE blog_posts
+ADD COLUMN excerpt TEXT NOT NULL DEFAULT '',
+ADD COLUMN image_url VARCHAR(255);

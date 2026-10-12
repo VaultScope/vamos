@@ -1,5 +1,5 @@
 pub mod activity;
-pub mod connectors;
+pub mod blog;
 pub mod coupons;
 pub mod customers;
 pub mod dashboard;
@@ -26,7 +26,7 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .nest("/activity", activity::routes())
-        .nest("/connectors", connectors::routes())
+        .nest("/blog", blog::routes())
         .nest("/coupons", coupons::routes())
         .nest("/customers", customers::routes())
         .nest("/dashboard", dashboard::routes())

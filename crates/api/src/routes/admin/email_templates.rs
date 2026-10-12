@@ -1,7 +1,7 @@
 use axum::extract::{Path, State};
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -15,6 +15,7 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(list))
         .route("/{id}", get(get_one))
         .route("/{id}", put(update))
+        .route("/{id}/test", post(test_send))
 }
 
 async fn list(
@@ -87,4 +88,72 @@ async fn update(
             .await?;
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct TestSendPayload {
+    recipient: String,
+}
+
+#[derive(Serialize)]
+struct TestSendResponse {
+    ok: bool,
+    recipient: String,
+    rendered_subject: String,
+    rendered_body: String,
+}
+
+async fn test_send(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<TestSendPayload>,
+) -> Result<Json<TestSendResponse>, ApiError> {
+    crate::require_permission!(auth, state, "templates.manage");
+    let template: EmailTemplate = sqlx::query_as("SELECT * FROM email_templates WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::NotFound("template not found".into()))?;
+
+    let mut rendered_subject = template.subject.clone();
+    let mut rendered_body = template.body.clone();
+
+    let replacements = [
+        ("{{company_name}}", "VaultScope"),
+        ("{{company_address}}", "Technologiepark 1, 10115 Berlin"),
+        ("{{company_email}}", "support@vaultscope.de"),
+        ("{{company_phone}}", "+49 30 12345678"),
+        ("{{tos_url}}", "https://vaultscope.de/terms"),
+        ("{{privacy_url}}", "https://vaultscope.de/privacy"),
+        ("{{current_year}}", "2026"),
+        ("{{customer_name}}", "Test Customer"),
+        ("{{customer_email}}", &payload.recipient),
+        ("{{invoice_number}}", "INV-2026-TEST"),
+        ("{{total}}", "49.99"),
+        ("{{due_date}}", "2026-11-01"),
+        ("{{ticket_number}}", "TKT-TEST-1234"),
+        ("{{ticket_subject}}", "Test ticket issue"),
+        ("{{service_name}}", "Hetzner Dedicated CX41"),
+        ("{{verification_url}}", "http://localhost:5173/verify?token=demo_token"),
+    ];
+
+    for (var, val) in replacements {
+        rendered_subject = rendered_subject.replace(var, val);
+        rendered_body = rendered_body.replace(var, val);
+    }
+
+    tracing::info!(
+        "[EMAIL TEMPLATE TEST] Dispatch to: {}, Subject: {}\nBody:\n{}",
+        payload.recipient,
+        rendered_subject,
+        rendered_body
+    );
+
+    Ok(Json(TestSendResponse {
+        ok: true,
+        recipient: payload.recipient,
+        rendered_subject,
+        rendered_body,
+    }))
 }

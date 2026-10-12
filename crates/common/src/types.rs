@@ -11,9 +11,13 @@ pub enum PowerAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvisionParams {
+    #[serde(default)]
     pub server_type: String,
+    #[serde(default)]
     pub location: String,
+    #[serde(default)]
     pub image: String,
+    #[serde(default)]
     pub ssh_keys: Vec<String>,
     pub name: String,
     pub extra: serde_json::Value,

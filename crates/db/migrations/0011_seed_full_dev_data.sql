@@ -2,6 +2,8 @@
 -- Comprehensive seed data for VaultScope Full Stack development and test environments
 
 -- 1. Ensure Roles Exist
+UPDATE roles SET id = '66f01fc4-79c7-4456-986b-117a762389f2' WHERE name = 'Owner' OR name = 'Super Admin';
+
 INSERT INTO roles (id, name, permissions, mapped_group) VALUES
     ('66f01fc4-79c7-4456-986b-117a762389f2', 'Owner', ARRAY['*'], 'vs-admin'),
     ('0ca7a95e-5bf1-4519-b3f6-0e207ff76a3c', 'Support', ARRAY['customers.view','tickets.view','tickets.reply','tickets.manage','services.view'], 'vs-support'),
@@ -38,8 +40,7 @@ INSERT INTO products (id, name, category, provider, target, specs, cost, price, 
     ('00000000-0000-0000-0000-000000000002', 'CX22', 'vps', 'hetzner_cloud', 'vps', '{"server_type": "cx22", "location": "fsn1", "image": "ubuntu-24.04", "cpu": 2, "ram": "4 GB", "disk": "40 GB NVMe"}', 2.50, 4.00, 0, -1, 0, 'monthly', false, '00000000-0000-0000-0000-000000000001'),
     ('00000000-0000-0000-0000-000000000003', 'CX32', 'vps', 'hetzner_cloud', 'vps', '{"server_type": "cx32", "location": "fsn1", "image": "ubuntu-24.04", "cpu": 4, "ram": "8 GB", "disk": "80 GB NVMe"}', 5.50, 8.50, 0, -1, 0, 'monthly', false, '00000000-0000-0000-0000-000000000001'),
     ('00000000-0000-0000-0000-000000000004', 'CX42', 'vps', 'hetzner_cloud', 'vps', '{"server_type": "cx42", "location": "fsn1", "image": "ubuntu-24.04", "cpu": 8, "ram": "16 GB", "disk": "160 GB NVMe"}', 10.00, 16.00, 0, -1, 0, 'monthly', false, '00000000-0000-0000-0000-000000000001'),
-    ('00000000-0000-0000-0000-000000000005', 'AX41-NVMe', 'dedicated', 'hetzner_cloud', 'dedicated', '{"server_type": "ax41", "location": "fsn1", "cpu": "AMD Ryzen 5 3600", "ram": "64 GB DDR4", "disk": "2x 512 GB NVMe"}', 34.00, 44.00, 39.00, 5, 0, 'monthly', false, '00000000-0000-0000-0000-000000000001'),
-    ('00000000-0000-0000-0000-000000000006', 'BX11 Storage Box', 'storage', 'hetzner_cloud', 'storage', '{"server_type": "bx11", "disk": "1 TB"}', 2.50, 3.80, 0, -1, 0, 'monthly', false, '00000000-0000-0000-0000-000000000001')
+    ('00000000-0000-0000-0000-000000000005', 'AX41-NVMe', 'dedicated', 'hetzner_cloud', 'dedicated', '{"server_type": "ax41", "location": "fsn1", "cpu": "AMD Ryzen 5 3600", "ram": "64 GB DDR4", "disk": "2x 512 GB NVMe"}', 34.00, 44.00, 39.00, 5, 0, 'monthly', false, '00000000-0000-0000-0000-000000000001')
 ON CONFLICT (id) DO UPDATE SET 
     category = EXCLUDED.category,
     price = EXCLUDED.price,

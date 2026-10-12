@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod billing;
+pub mod blog;
 pub mod catalog;
 pub mod config;
 pub mod invoices;
@@ -17,6 +18,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .nest("/activity", activity::routes())
         .nest("/billing", billing::routes())
+        .nest("/blog", blog::routes())
         .nest("/catalog", catalog::routes())
         .nest("/config", config::routes())
         .nest("/invoices", invoices::routes())

@@ -1,7 +1,9 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod mailer;
 pub mod middleware;
+pub mod pdf;
 pub mod routes;
 pub mod state;
 pub mod validation;

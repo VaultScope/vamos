@@ -16,6 +16,7 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/suspend", axum::routing::post(suspend))
         .route("/{id}/reactivate", axum::routing::post(reactivate))
         .route("/{id}/terminate", axum::routing::post(terminate))
+        .route("/{id}/ipmi", axum::routing::post(admin_ipmi).get(admin_ipmi))
 }
 
 #[derive(Deserialize)]
@@ -165,3 +166,34 @@ pub async fn terminate(
     .ok_or_else(|| ApiError::NotFound("Service not found".into()))?;
     Ok(axum::Json(service))
 }
+
+pub async fn admin_ipmi(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    crate::require_permission!(auth, state, "services.view");
+    let service: Service = sqlx::query_as(
+        "SELECT * FROM services WHERE id = $1"
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Service not found".into()))?;
+
+    let resource_id = if service.provider_resource_id.is_empty() {
+        format!("rs-ds-{}", &service.id.to_string()[..8])
+    } else {
+        service.provider_resource_id.clone()
+    };
+
+    let api_key = state.config.reliablesite_api_key.as_deref().unwrap_or("").trim().to_string();
+    let base_url = state.config.reliablesite_api_url.as_deref().unwrap_or("https://api.reliablesite.net").trim().to_string();
+    let rs = vaultscope_connectors::reliablesite::ReliableSite::new(api_key, base_url);
+
+    let session = rs.request_ipmi_session(&resource_id, Some("Admin Staff Session")).await
+        .map_err(|e| ApiError::Internal(format!("Failed to generate IPMI session: {e}")))?;
+
+    Ok(axum::Json(session))
+}
+

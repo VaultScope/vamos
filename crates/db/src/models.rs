@@ -84,14 +84,6 @@ pub enum BillingCycle {
     OneTime,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
-#[sqlx(type_name = "connector_status", rename_all = "snake_case")]
-#[serde(rename_all = "snake_case")]
-pub enum ConnectorStatus {
-    Connected,
-    Error,
-    NotConfigured,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
 #[sqlx(type_name = "actor_type", rename_all = "snake_case")]
@@ -158,6 +150,7 @@ pub struct Staff {
     pub last_login_ip: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub password_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -169,6 +162,7 @@ pub struct Customer {
     pub phone: String,
     pub company: String,
     pub address: String,
+    pub postal_code: String,
     pub city: String,
     pub country: String,
     pub vat_id: String,
@@ -180,6 +174,12 @@ pub struct Customer {
     pub created_at: DateTime<Utc>,
     pub last_login: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    pub password_hash: Option<String>,
+    pub verification_token: Option<String>,
+    #[serde(default)]
+    pub totp_secret: Option<String>,
+    #[serde(default)]
+    pub vat_verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -198,19 +198,6 @@ pub struct Product {
     pub billing_cycle: BillingCycle,
     pub hidden: bool,
     pub service_form_id: Option<Uuid>,
-    pub connector_id: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct Connector {
-    pub id: Uuid,
-    pub name: String,
-    pub provider: String,
-    pub status: ConnectorStatus,
-    pub config_encrypted: Option<Vec<u8>>,
-    pub last_tested_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -220,7 +207,6 @@ pub struct Service {
     pub id: Uuid,
     pub customer_id: Uuid,
     pub product_id: Uuid,
-    pub connector_id: Option<Uuid>,
     pub name: String,
     pub status: ServiceStatus,
     pub provider_resource_id: String,
@@ -231,6 +217,11 @@ pub struct Service {
     pub next_due: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub cancel_at_period_end: bool,
+    pub cancellation_reason: Option<String>,
+    pub cancellation_feedback: Option<String>,
+    pub stripe_payment_intent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -312,6 +303,8 @@ pub struct TicketMessage {
     pub author_type: ActorType,
     pub content: String,
     pub internal: bool,
+    #[serde(default)]
+    pub attachments: serde_json::Value,
     pub created_at: DateTime<Utc>,
 }
 
@@ -329,7 +322,6 @@ pub struct Job {
     pub id: Uuid,
     pub task: String,
     pub target_api: String,
-    pub connector_id: Option<Uuid>,
     pub customer_id: Option<Uuid>,
     pub service_id: Option<Uuid>,
     pub status: JobStatus,
@@ -431,4 +423,30 @@ pub struct InternalTool {
     pub url: String,
     pub required_permission: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct BlogPost {
+    pub id: uuid::Uuid,
+    pub title: String,
+    pub slug: String,
+    pub content: String,
+    pub author_id: uuid::Uuid,
+    pub status: String,
+    pub published_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub excerpt: String,
+    pub image_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct CustomerBillingEmail {
+    pub id: Uuid,
+    pub customer_id: Uuid,
+    pub email: String,
+    pub verified: bool,
+    pub verification_token: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub verified_at: Option<DateTime<Utc>>,
 }

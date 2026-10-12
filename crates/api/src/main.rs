@@ -1,7 +1,9 @@
 mod auth;
 mod config;
 mod error;
+mod mailer;
 mod middleware;
+mod pdf;
 mod routes;
 mod state;
 mod validation;
@@ -9,50 +11,43 @@ mod validation;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
-use uuid::Uuid;
 
 use vaultscope_connectors::hetzner_cloud::HetznerCloud;
+use vaultscope_connectors::reliablesite::ReliableSite;
+use vaultscope_connectors::sftpgo::SftpGo;
 use vaultscope_connectors::ProvisioningProvider;
 use vaultscope_jobs::runner::{ConnectorRegistry, JobRunner};
 
 use config::Config;
 use state::AppState;
 
-struct DbConnectorRegistry {
-    pool: PgPool,
-    encryption_key: [u8; 32],
+struct EnvConnectorRegistry {
+    config: Arc<Config>,
 }
 
 #[async_trait::async_trait]
-impl ConnectorRegistry for DbConnectorRegistry {
-    async fn get(&self, connector_id: &Uuid) -> Option<Arc<dyn ProvisioningProvider>> {
-        let pool = self.pool.clone();
-        let id = *connector_id;
-        let key = self.encryption_key;
-
-        let row: Option<(String, Option<Vec<u8>>)> =
-            sqlx::query_as("SELECT provider, config_encrypted FROM connectors WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&pool)
-                .await
-                .ok()
-                .flatten();
-
-        let (provider, config_encrypted) = row?;
-        let config_bytes = config_encrypted?;
-        let decrypted = vaultscope_common::crypto::decrypt(&key, &config_bytes).ok()?;
-        let config: serde_json::Value = serde_json::from_slice(&decrypted).ok()?;
-
-        match provider.as_str() {
+impl ConnectorRegistry for EnvConnectorRegistry {
+    async fn get(&self, provider: &str) -> Option<Arc<dyn ProvisioningProvider>> {
+        match provider {
             "hetzner_cloud" => {
-                let token = config.get("token")?.as_str()?.trim().to_string();
+                let token = self.config.hetzner_api_token.as_ref()?.trim().to_string();
                 Some(Arc::new(HetznerCloud::new(token)))
+            }
+            "sftpgo" => {
+                let base_url = self.config.sftpgo_url.as_ref()?.trim().to_string();
+                let admin_user = self.config.sftpgo_user.as_ref()?.trim().to_string();
+                let admin_pass = self.config.sftpgo_pass.as_ref()?.trim().to_string();
+                Some(Arc::new(SftpGo::new(base_url, admin_user, admin_pass)))
+            }
+            "reliablesite" => {
+                let api_key = self.config.reliablesite_api_key.as_ref().map(|s| s.trim().to_string()).unwrap_or_default();
+                let base_url = self.config.reliablesite_api_url.as_ref().map(|s| s.trim().to_string()).unwrap_or_else(|| "https://api.reliablesite.net".to_string());
+                Some(Arc::new(ReliableSite::new(api_key, base_url)))
             }
             _ => None,
         }
@@ -80,29 +75,43 @@ async fn main() {
 
     info!("database connected and migrations applied");
 
-    // SEC-001: Connect to Redis for OIDC state storage (non-blocking fallback)
+    // SEC-001: Connect to Redis for OIDC state storage (non-blocking fallback with fast 500ms timeout)
     let redis = match redis::Client::open(config.redis_url.as_str()) {
-        Ok(client) => match redis::aio::ConnectionManager::new(client).await {
-            Ok(mgr) => {
-                info!("redis connected");
-                Some(mgr)
+        Ok(client) => {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                redis::aio::ConnectionManager::new(client),
+            )
+            .await
+            {
+                Ok(Ok(mgr)) => {
+                    info!("redis connected");
+                    Some(mgr)
+                }
+                Ok(Err(e)) => {
+                    warn!("redis connection manager failed ({}), continuing without redis", e);
+                    None
+                }
+                Err(_) => {
+                    warn!("redis connection timed out after 500ms, continuing without redis");
+                    None
+                }
             }
-            Err(e) => {
-                warn!("redis connection manager failed ({}), continuing without redis", e);
-                None
-            }
-        },
+        }
         Err(e) => {
             warn!("redis client open failed ({}), continuing without redis", e);
             None
         }
     };
 
+    let (ticket_bus, _) = tokio::sync::broadcast::channel(1024);
+
     let state = AppState {
         db: pool.clone(),
         config: Arc::new(config.clone()),
         csrf_config: axum_csrf::CsrfConfig::default(),
         redis,
+        ticket_bus,
     };
 
     let app = routes::build_router(state)
@@ -118,16 +127,21 @@ async fn main() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let registry = DbConnectorRegistry {
-        pool: pool.clone(),
-        encryption_key: config.encryption_key_bytes(),
+    let registry = EnvConnectorRegistry {
+        config: Arc::new(config.clone()),
     };
     let runner = JobRunner::new(
         pool.clone(),
         Arc::new(registry),
         std::time::Duration::from_secs(config.job_poll_interval_secs),
     );
-    tokio::spawn(runner.run(shutdown_rx));
+    tokio::spawn(runner.run(shutdown_rx.clone()));
+
+    let billing_runner = vaultscope_jobs::BillingRunner::new(
+        pool.clone(),
+        std::time::Duration::from_secs(3600), // Check every hour
+    );
+    tokio::spawn(billing_runner.run(shutdown_rx.clone()));
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
