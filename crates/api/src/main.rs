@@ -116,6 +116,7 @@ async fn main() {
 
     let app = routes::build_router(state)
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(middleware::security_headers::security_headers_middleware))
         .layer(middleware::cors::layer(&config.cors_origins));
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
