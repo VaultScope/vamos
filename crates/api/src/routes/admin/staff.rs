@@ -210,12 +210,13 @@ async fn delete_role(
 
 #[derive(Deserialize)]
 struct CreateStaff {
-    external_id: String,
+    external_id: Option<String>,
     first_name: String,
     last_name: String,
     username: String,
     email: String,
     role_id: Uuid,
+    password: Option<String>,
 }
 
 async fn create_staff(
@@ -224,24 +225,33 @@ async fn create_staff(
     Json(payload): Json<CreateStaff>,
 ) -> Result<Json<Staff>, ApiError> {
     crate::require_permission!(auth, state, "staff.manage");
-    if payload.external_id.trim().is_empty() {
-        return Err(ApiError::BadRequest("external_id is required".into()));
-    }
+    let ext_id = payload
+        .external_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("local_{}", Uuid::now_v7()));
     validate_required_string(&payload.username, "Username")?;
     validate_email(&payload.email)?;
 
+    let password_hash = match payload.password {
+        Some(pw) if !pw.trim().is_empty() => {
+            Some(bcrypt::hash(pw, bcrypt::DEFAULT_COST).map_err(|e| ApiError::Internal(e.to_string()))?)
+        }
+        _ => None,
+    };
+
     let staff: Staff = sqlx::query_as(
-        r#"INSERT INTO staff (id, external_id, first_name, last_name, username, email, role_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
+        r#"INSERT INTO staff (id, external_id, first_name, last_name, username, email, role_id, password_hash)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
            RETURNING *"#,
     )
     .bind(Uuid::now_v7())
-    .bind(&payload.external_id)
+    .bind(&ext_id)
     .bind(&payload.first_name)
     .bind(&payload.last_name)
     .bind(&payload.username)
     .bind(&payload.email)
     .bind(payload.role_id)
+    .bind(password_hash)
     .fetch_one(&state.db)
     .await?;
 
@@ -255,6 +265,7 @@ struct UpdateStaff {
     username: Option<String>,
     email: Option<String>,
     role_id: Option<Uuid>,
+    password: Option<String>,
 }
 
 async fn update_staff(
@@ -264,6 +275,13 @@ async fn update_staff(
     Json(payload): Json<UpdateStaff>,
 ) -> Result<Json<Staff>, ApiError> {
     crate::require_permission!(auth, state, "staff.manage");
+    let password_hash = match payload.password {
+        Some(pw) if !pw.trim().is_empty() => {
+            Some(bcrypt::hash(pw, bcrypt::DEFAULT_COST).map_err(|e| ApiError::Internal(e.to_string()))?)
+        }
+        _ => None,
+    };
+
     let staff: Staff = sqlx::query_as(
         r#"UPDATE staff
            SET first_name = COALESCE($1, first_name),
@@ -271,8 +289,9 @@ async fn update_staff(
                username = COALESCE($3, username),
                email = COALESCE($4, email),
                role_id = COALESCE($5, role_id),
+               password_hash = COALESCE($6, password_hash),
                updated_at = now()
-           WHERE id = $6
+           WHERE id = $7
            RETURNING *"#,
     )
     .bind(payload.first_name)
@@ -280,6 +299,7 @@ async fn update_staff(
     .bind(payload.username)
     .bind(payload.email)
     .bind(payload.role_id)
+    .bind(password_hash)
     .bind(id)
     .fetch_optional(&state.db)
     .await?
