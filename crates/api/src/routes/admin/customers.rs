@@ -1,5 +1,5 @@
 use axum::extract::{Path, Query, State};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use uuid::Uuid;
@@ -7,12 +7,13 @@ use uuid::Uuid;
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
 use crate::state::AppState;
-use vaultscope_db::models::{Customer, CustomerStatus};
+use vaultscope_db::models::{Customer, CustomerStatus, Staff};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list))
         .route("/{id}", get(get_one).put(update))
+        .route("/{id}/promote", post(promote_to_staff))
 }
 
 #[derive(Deserialize)]
@@ -139,4 +140,101 @@ pub struct CustomerWithStats {
     #[serde(flatten)]
     pub customer: Customer,
     pub active_services: i64,
+}
+
+#[derive(Deserialize)]
+pub struct PromoteCustomerPayload {
+    pub role_id: Uuid,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+async fn promote_to_staff(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<PromoteCustomerPayload>,
+) -> Result<Json<Staff>, ApiError> {
+    crate::require_permission!(auth, state, "staff.manage");
+
+    // 1. Fetch customer
+    let customer: Customer = sqlx::query_as("SELECT * FROM customers WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
+
+    // 2. Validate role
+    let role_exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM roles WHERE id = $1")
+        .bind(payload.role_id)
+        .fetch_optional(&state.db)
+        .await?;
+    if role_exists.is_none() {
+        return Err(ApiError::BadRequest("Invalid role_id".into()));
+    }
+
+    // 3. Check if staff already exists with this email
+    let existing_staff: Option<Staff> = sqlx::query_as("SELECT * FROM staff WHERE email = $1")
+        .bind(&customer.email)
+        .fetch_optional(&state.db)
+        .await?;
+
+    if let Some(existing) = existing_staff {
+        let updated: Staff = sqlx::query_as(
+            "UPDATE staff SET role_id = $1, updated_at = now() WHERE id = $2 RETURNING *"
+        )
+        .bind(payload.role_id)
+        .bind(existing.id)
+        .fetch_one(&state.db)
+        .await?;
+        return Ok(Json(updated));
+    }
+
+    // 4. Generate clean username
+    let raw_username = payload.username.unwrap_or_else(|| {
+        customer.email.split('@').next().unwrap_or("staff").to_string()
+    });
+    let sanitized: String = raw_username
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    let username = if sanitized.is_empty() {
+        format!("staff_{}", &id.to_string()[..8])
+    } else {
+        sanitized
+    };
+
+    // 5. Split customer full name into first and last name
+    let mut parts = customer.name.split_whitespace();
+    let first_name = parts.next().unwrap_or("").to_string();
+    let last_name = parts.collect::<Vec<_>>().join(" ");
+
+    // 6. Handle password hash
+    let password_hash = match payload.password {
+        Some(pw) if !pw.trim().is_empty() => {
+            Some(bcrypt::hash(pw, bcrypt::DEFAULT_COST).map_err(|e| ApiError::Internal(e.to_string()))?)
+        }
+        _ => customer.password_hash,
+    };
+
+    // 7. Insert new staff row
+    let staff: Staff = sqlx::query_as(
+        r#"INSERT INTO staff (
+            id, external_id, first_name, last_name, username, email, email_verified, role_id, password_hash
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING *"#
+    )
+    .bind(Uuid::now_v7())
+    .bind(format!("customer_{}", customer.id))
+    .bind(first_name)
+    .bind(last_name)
+    .bind(username)
+    .bind(customer.email)
+    .bind(customer.email_verified)
+    .bind(payload.role_id)
+    .bind(password_hash)
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(Json(staff))
 }
