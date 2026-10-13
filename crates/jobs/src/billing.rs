@@ -6,6 +6,18 @@ use tokio::sync::watch;
 use tracing::{error, info};
 use uuid::Uuid;
 
+#[derive(sqlx::FromRow)]
+struct RenewalRow {
+    id: Uuid,
+    customer_id: Uuid,
+    price: rust_decimal::Decimal,
+    name: String,
+    provider_resource_id: String,
+    cancel_at_period_end: bool,
+    product_category: String,
+    provider: String,
+}
+
 pub struct BillingRunner {
     pool: PgPool,
     poll_interval: Duration,
@@ -38,11 +50,11 @@ impl BillingRunner {
     }
 
     async fn process_renewals(&self) -> Result<(), sqlx::Error> {
-        let rows = sqlx::query!(
+        let rows: Vec<RenewalRow> = sqlx::query_as(
             r#"
             SELECT 
-                s.id, s.customer_id, s.product_id, s.price, s.next_due, s.config, s.name, s.provider_resource_id, s.cancel_at_period_end,
-                p.billing_cycle as "billing_cycle: vaultscope_db::models::BillingCycle", p.category as product_category, p.provider
+                s.id, s.customer_id, s.price, s.name, s.provider_resource_id, s.cancel_at_period_end,
+                p.category as product_category, p.provider
             FROM services s
             JOIN products p ON s.product_id = p.id
             WHERE s.status = 'running' AND s.next_due <= now()
@@ -58,12 +70,10 @@ impl BillingRunner {
 
             if row.cancel_at_period_end {
                 info!("service {} is marked for cancellation at period end; terminating", row.id);
-                sqlx::query!(
-                    "UPDATE services SET status = 'terminated' WHERE id = $1",
-                    row.id
-                )
-                .execute(&mut *tx)
-                .await?;
+                sqlx::query("UPDATE services SET status = 'terminated' WHERE id = $1")
+                    .bind(row.id)
+                    .execute(&mut *tx)
+                    .await?;
 
                 if !row.provider_resource_id.is_empty() {
                     let job_id = Uuid::now_v7();
@@ -71,17 +81,17 @@ impl BillingRunner {
                         "resource_id": row.provider_resource_id,
                     });
 
-                    sqlx::query!(
+                    sqlx::query(
                         r#"
                         INSERT INTO jobs (id, task, target_api, customer_id, service_id, request_payload, scheduled_at)
                         VALUES ($1, 'delete', $2, $3, $4, $5, now())
-                        "#,
-                        job_id,
-                        row.provider,
-                        row.customer_id,
-                        row.id,
-                        payload,
+                        "#
                     )
+                    .bind(job_id)
+                    .bind(&row.provider)
+                    .bind(row.customer_id)
+                    .bind(row.id)
+                    .bind(payload)
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -101,7 +111,7 @@ impl BillingRunner {
                 info!("service {} (sftp trial) upgrading to paid plan", row.id);
             }
 
-            let quantity = 1;
+            let quantity: i32 = 1;
             let subtotal = price * rust_decimal::Decimal::from(quantity);
             // 19% VAT
             let tax_rate = rust_decimal::Decimal::new(19, 2); 
@@ -113,55 +123,55 @@ impl BillingRunner {
             let issue_date = Utc::now().naive_utc().date();
             let due_date = issue_date + chrono::Days::new(14); // 14 days due
 
-            sqlx::query!(
+            sqlx::query(
                 r#"
                 INSERT INTO invoices (id, invoice_number, customer_id, status, subtotal, tax_rate, tax_amount, total, issue_date, due_date)
                 VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9)
-                "#,
-                invoice_id,
-                invoice_number,
-                row.customer_id,
-                subtotal,
-                tax_rate,
-                tax_amount,
-                total,
-                issue_date,
-                due_date,
+                "#
             )
+            .bind(invoice_id)
+            .bind(&invoice_number)
+            .bind(row.customer_id)
+            .bind(subtotal)
+            .bind(tax_rate)
+            .bind(tax_amount)
+            .bind(total)
+            .bind(issue_date)
+            .bind(due_date)
             .execute(&mut *tx)
             .await?;
 
             let line_item_id = Uuid::now_v7();
             let desc = format!("Renewal for {}", row.name);
-            sqlx::query!(
+            sqlx::query(
                 r#"
                 INSERT INTO invoice_line_items (id, invoice_id, description, quantity, unit_price, total, service_id, sort_order)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, 1)
-                "#,
-                line_item_id,
-                invoice_id,
-                desc,
-                quantity,
-                price,
-                subtotal,
-                row.id,
+                "#
             )
+            .bind(line_item_id)
+            .bind(invoice_id)
+            .bind(&desc)
+            .bind(quantity)
+            .bind(price)
+            .bind(subtotal)
+            .bind(row.id)
             .execute(&mut *tx)
             .await?;
 
             // Add 30 days to next_due (monthly renewal)
             let next_due = Utc::now() + chrono::Duration::days(30);
 
-            sqlx::query!(
+            sqlx::query(
                 r#"
                 UPDATE services
                 SET next_due = $1, price = $2
                 WHERE id = $3
-                "#,
-                next_due,
-                price,
-                row.id,
+                "#
             )
+            .bind(next_due)
+            .bind(price)
+            .bind(row.id)
             .execute(&mut *tx)
             .await?;
 
@@ -175,17 +185,17 @@ impl BillingRunner {
                     "provider_resource_id": row.provider_resource_id,
                 });
 
-                sqlx::query!(
+                sqlx::query(
                     r#"
                     INSERT INTO jobs (id, task, target_api, customer_id, service_id, request_payload, scheduled_at)
                     VALUES ($1, 'modify', $2, $3, $4, $5, now())
-                    "#,
-                    job_id,
-                    row.provider,
-                    row.customer_id,
-                    row.id,
-                    payload,
+                    "#
                 )
+                .bind(job_id)
+                .bind(&row.provider)
+                .bind(row.customer_id)
+                .bind(row.id)
+                .bind(payload)
                 .execute(&mut *tx)
                 .await?;
             }
