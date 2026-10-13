@@ -14,6 +14,8 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(list))
         .route("/{id}", get(get_one).put(update))
         .route("/{id}/promote", post(promote_to_staff))
+        .route("/{id}/resend-verification", post(resend_verification_email))
+        .route("/{id}/verify", post(mark_email_verified))
 }
 
 #[derive(Deserialize)]
@@ -108,6 +110,7 @@ async fn get_one(
 struct UpdateCustomer {
     status: Option<CustomerStatus>,
     notes: Option<String>,
+    email_verified: Option<bool>,
 }
 
 async fn update(
@@ -121,16 +124,76 @@ async fn update(
         r#"UPDATE customers
            SET status = COALESCE($1::customer_status, status),
                notes = COALESCE($2, notes),
+               email_verified = COALESCE($3, email_verified),
                updated_at = now()
-           WHERE id = $3
+           WHERE id = $4
            RETURNING *"#,
     )
     .bind(payload.status)
     .bind(payload.notes)
+    .bind(payload.email_verified)
     .bind(id)
     .fetch_optional(&state.db)
     .await?
     .ok_or(ApiError::NotFound("customer not found".into()))?;
+
+    Ok(Json(customer))
+}
+
+async fn resend_verification_email(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::require_permission!(auth, state, "customers.edit");
+
+    let customer: Customer = sqlx::query_as("SELECT * FROM customers WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
+
+    let token_bytes: [u8; 32] = rand::random();
+    let verification_token = hex::encode(token_bytes);
+
+    sqlx::query("UPDATE customers SET verification_token = $1, updated_at = now() WHERE id = $2")
+        .bind(&verification_token)
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+
+    let base = state.config.storefront_url.trim_end_matches('/');
+    let verification_link = format!("{}/verify-email?token={}", base, verification_token);
+
+    crate::routes::auth::send_verification_email(&state.config, &customer.email, &customer.name, &verification_token);
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": format!("Verification email sent to {}", customer.email),
+        "verification_token": verification_token,
+        "verification_link": verification_link
+    })))
+}
+
+async fn mark_email_verified(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Customer>, ApiError> {
+    crate::require_permission!(auth, state, "customers.edit");
+
+    let customer: Customer = sqlx::query_as(
+        r#"UPDATE customers
+           SET email_verified = true,
+               verification_token = NULL,
+               updated_at = now()
+           WHERE id = $1
+           RETURNING *"#
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
 
     Ok(Json(customer))
 }

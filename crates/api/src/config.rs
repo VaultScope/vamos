@@ -31,6 +31,7 @@ pub struct Config {
     pub smtp_password: Option<String>,
     pub smtp_from: Option<String>,
     pub dev_mode: bool,
+    pub storefront_url: String,
 }
 
 impl Config {
@@ -92,6 +93,14 @@ impl Config {
             dev_mode: env::var("DEV_MODE")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
+            storefront_url: env::var("STOREFRONT_URL")
+                .unwrap_or_else(|_| {
+                    if env::var("DEV_MODE").map(|v| v == "true" || v == "1").unwrap_or(false) {
+                        "http://localhost:5173".to_string()
+                    } else {
+                        "https://vaultscope.de".to_string()
+                    }
+                }),
         }
     }
 

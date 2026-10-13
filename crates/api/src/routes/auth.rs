@@ -253,7 +253,8 @@ pub fn send_verification_email(
     let smtp_pass = config.smtp_password.clone().unwrap_or_else(|| "".to_string());
     let smtp_from = config.smtp_from.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
 
-    let verify_link = format!("http://localhost:5173/verify-email?token={}", token);
+    let base = config.storefront_url.trim_end_matches('/');
+    let verify_link = format!("{}/verify-email?token={}", base, token);
     tracing::info!("Verification link for {}: {}", to_email, verify_link);
 
     let body = format!(
@@ -328,7 +329,8 @@ pub fn send_billing_email_verification(
     let smtp_pass = config.smtp_password.clone().unwrap_or_else(|| "".to_string());
     let smtp_from = config.smtp_from.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
 
-    let verify_link = format!("http://localhost:5173/verify-email?token={}&type=billing", token);
+    let base = config.storefront_url.trim_end_matches('/');
+    let verify_link = format!("{}/verify-email?token={}&type=billing", base, token);
     tracing::info!("Billing email verification link for {}: {}", to_email, verify_link);
 
     let body = format!(
