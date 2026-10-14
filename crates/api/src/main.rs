@@ -1,7 +1,9 @@
+mod activity;
 mod auth;
 mod config;
 mod error;
 mod mailer;
+mod media;
 mod middleware;
 mod pdf;
 mod routes;
@@ -21,7 +23,7 @@ use vaultscope_connectors::hetzner_cloud::HetznerCloud;
 use vaultscope_connectors::reliablesite::ReliableSite;
 use vaultscope_connectors::sftpgo::SftpGo;
 use vaultscope_connectors::ProvisioningProvider;
-use vaultscope_jobs::runner::{ConnectorRegistry, JobRunner};
+use vaultscope_jobs::runner::{ConnectorRegistry, JobNotifier, JobRunner};
 
 use config::Config;
 use state::AppState;
@@ -51,6 +53,17 @@ impl ConnectorRegistry for EnvConnectorRegistry {
             }
             _ => None,
         }
+    }
+}
+
+struct ApiJobNotifier {
+    state: AppState,
+}
+
+#[async_trait::async_trait]
+impl JobNotifier for ApiJobNotifier {
+    async fn on_service_provisioned(&self, service_id: uuid::Uuid, response: &serde_json::Value) {
+        mailer::spawn_service_welcome_notification(self.state.clone(), service_id, response.clone());
     }
 }
 
@@ -114,7 +127,7 @@ async fn main() {
         ticket_bus,
     };
 
-    let app = routes::build_router(state)
+    let app = routes::build_router(state.clone())
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn(middleware::security_headers::security_headers_middleware))
         .layer(middleware::cors::layer(&config.cors_origins));
@@ -135,7 +148,9 @@ async fn main() {
         pool.clone(),
         Arc::new(registry),
         std::time::Duration::from_secs(config.job_poll_interval_secs),
-    );
+    ).with_notifier(Arc::new(ApiJobNotifier {
+        state: state.clone(),
+    }));
     tokio::spawn(runner.run(shutdown_rx.clone()));
 
     let billing_runner = vaultscope_jobs::BillingRunner::new(

@@ -95,6 +95,8 @@ pub struct CreateService {
     pub name: Option<String>,
     pub hostname: Option<String>,
     pub price: rust_decimal::Decimal,
+    pub trial_days: Option<i32>,
+    pub is_trial: Option<bool>,
 }
 
 pub async fn create(
@@ -103,9 +105,27 @@ pub async fn create(
     axum::Json(payload): axum::Json<CreateService>,
 ) -> Result<axum::Json<Service>, ApiError> {
     crate::require_permission!(auth, state, "services.power");
+
+    let product_trial_days: Option<i32> = sqlx::query_scalar("SELECT trial_days FROM products WHERE id = $1")
+        .bind(payload.product_id)
+        .fetch_optional(&state.db)
+        .await?
+        .flatten();
+
+    let trial_days = payload.trial_days.or(product_trial_days);
+    let is_trial = payload.is_trial.unwrap_or_else(|| trial_days.unwrap_or(0) > 0);
+
+    let (next_due, trial_ends_at) = if is_trial {
+        let days = trial_days.unwrap_or(14).max(1) as i64;
+        let expiry = chrono::Utc::now() + chrono::Duration::days(days);
+        (Some(expiry), Some(expiry))
+    } else {
+        (Some(chrono::Utc::now() + chrono::Duration::days(30)), None)
+    };
+
     let service: Service = sqlx::query_as(
-        r#"INSERT INTO services (customer_id, product_id, name, hostname, price, status)
-           VALUES ($1, $2, $3, $4, $5, 'running'::service_status)
+        r#"INSERT INTO services (customer_id, product_id, name, hostname, price, status, next_due, is_trial, trial_ends_at)
+           VALUES ($1, $2, $3, $4, $5, 'running'::service_status, $6, $7, $8)
            RETURNING *"#,
     )
     .bind(payload.customer_id)
@@ -113,6 +133,9 @@ pub async fn create(
     .bind(payload.name.unwrap_or_else(|| "Manual Service".to_string()))
     .bind(payload.hostname)
     .bind(payload.price)
+    .bind(next_due)
+    .bind(is_trial)
+    .bind(trial_ends_at)
     .fetch_one(&state.db)
     .await?;
 

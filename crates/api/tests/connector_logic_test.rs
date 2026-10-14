@@ -98,6 +98,7 @@ fn test_connector_config_encryption_with_real_key_derivation() {
         smtp_password: None,
         smtp_from: None,
         dev_mode: true,
+        storefront_url: "http://localhost:5173".to_string(),
     };
 
     let key = config.encryption_key_bytes();

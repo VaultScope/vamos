@@ -83,6 +83,7 @@ struct PlaceOrder {
     product_id: Uuid,
     hostname: Option<String>,
     payment_intent_id: Option<String>,
+    partner_slug: Option<String>,
 }
 
 async fn place_order(
@@ -98,6 +99,32 @@ async fn place_order(
     .await?
     .ok_or(ApiError::NotFound("product not found".into()))?;
 
+    let (partner_id, partner_trial_override, partner_trial_quota_override, partner_quota_override, partner_limit_one_per_user): 
+        (Option<Uuid>, Option<i32>, Option<i32>, Option<i32>, Option<bool>) = if let Some(ref slug) = payload.partner_slug {
+        let _ = sqlx::query("UPDATE partners SET conversions = conversions + 1 WHERE LOWER(slug) = LOWER($1)")
+            .bind(slug.trim())
+            .execute(&state.db)
+            .await;
+
+        let row: Option<(Uuid, Option<i32>, Option<i32>, Option<i32>, bool)> = sqlx::query_as(
+            "SELECT id, trial_days_override, trial_quota_gb_override, quota_gb_override, limit_one_per_user FROM partners WHERE LOWER(slug) = LOWER($1) AND active = true"
+        )
+        .bind(slug.trim())
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+
+        match row {
+            Some((pid, trial, t_quota, quota, limit)) => (Some(pid), trial, t_quota, quota, Some(limit)),
+            None => (None, None, None, None, None),
+        }
+    } else {
+        (None, None, None, None, None)
+    };
+
+    let effective_trial_days = partner_trial_override.or(product.trial_days);
+
     use rust_decimal::prelude::ToPrimitive;
     let price_cents = (product.price * rust_decimal::Decimal::from(100))
         .to_i64()
@@ -105,7 +132,26 @@ async fn place_order(
     let vat_cents = price_cents * 19 / 100;
     let total_cents = price_cents + vat_cents;
 
-    let is_free = product.category == "sftp" || product.price <= rust_decimal::Decimal::ZERO;
+    let has_trial = effective_trial_days.unwrap_or(0) > 0;
+
+    // Enforce limit: check if campaign / trial can only be claimed once per customer
+    let is_single_claim_limited = partner_limit_one_per_user.unwrap_or(true);
+    if has_trial && is_single_claim_limited {
+        let existing_trials: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM services WHERE customer_id = $1 AND is_trial = true"
+        )
+        .bind(auth.0.sub)
+        .fetch_one(&state.db)
+        .await?;
+
+        if existing_trials >= 1 {
+            return Err(ApiError::BadRequest(
+                "This partner campaign can only be claimed once per user. You have already claimed a promotional trial.".into(),
+            ));
+        }
+    }
+
+    let is_free = has_trial || product.category == "sftp" || product.price <= rust_decimal::Decimal::ZERO;
 
     let verified_payment_intent_id: Option<String> = if is_free {
         None
@@ -168,24 +214,56 @@ async fn place_order(
     let service_id = Uuid::now_v7();
     let hostname = payload
         .hostname
-        .unwrap_or_else(|| format!("srv-{}", &service_id.to_string()[..8]));
+        .unwrap_or_else(|| {
+            if product.category == "sftp" {
+                "sftp.vaultscope.de".to_string()
+            } else {
+                format!("srv-{}", &service_id.to_string()[..8])
+            }
+        });
 
-    let initial_price: rust_decimal::Decimal;
-    let next_due: Option<chrono::DateTime<chrono::Utc>>;
-    let mut quota_size = 0_u64;
-
-    if product.category == "sftp" {
-        initial_price = rust_decimal::Decimal::new(0, 0); // 0.00 EUR initially
-        next_due = Some(chrono::Utc::now() + chrono::Duration::days(30));
-        quota_size = 26_843_545_600; // 25 GB in bytes
+    let is_trial = has_trial || (product.category == "sftp" && product.price <= rust_decimal::Decimal::ZERO);
+    let trial_days_count = if has_trial {
+        effective_trial_days.unwrap() as i64
+    } else if product.category == "sftp" {
+        30
     } else {
-        initial_price = product.price;
-        next_due = Some(chrono::Utc::now() + chrono::Duration::days(30));
-    }
+        30
+    };
+
+    let (initial_price, next_due, trial_ends_at) = if is_trial {
+        let expiry = chrono::Utc::now() + chrono::Duration::days(trial_days_count);
+        (rust_decimal::Decimal::ZERO, Some(expiry), Some(expiry))
+    } else {
+        (product.price, Some(chrono::Utc::now() + chrono::Duration::days(30)), None)
+    };
+
+    let is_storage = product.category.to_lowercase().contains("sftp") || product.category.to_lowercase().contains("storage") || product.name.to_lowercase().contains("sftp") || product.provider == "sftpgo";
+
+    let effective_trial_quota_gb = partner_trial_quota_override
+        .or(product.trial_quota_gb)
+        .unwrap_or(25);
+
+    let effective_post_trial_quota_gb = product.quota_gb
+        .or(partner_quota_override)
+        .or_else(|| product.specs.get("storage_gb").and_then(|v| v.as_i64()).map(|v| v as i32))
+        .unwrap_or(150);
+
+    let current_quota_gb = if is_trial {
+        effective_trial_quota_gb
+    } else {
+        effective_post_trial_quota_gb
+    };
+
+    let quota_size: u64 = if is_storage {
+        (current_quota_gb as u64) * 1024 * 1024 * 1024
+    } else {
+        0_u64
+    };
 
     sqlx::query(
-        r#"INSERT INTO services (id, customer_id, product_id, name, hostname, price, status, next_due, stripe_payment_intent_id)
-        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)"#,
+        r#"INSERT INTO services (id, customer_id, product_id, name, hostname, price, status, next_due, stripe_payment_intent_id, is_trial, trial_ends_at, partner_id, quota_gb)
+        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $10, $11, $12)"#,
     )
     .bind(service_id)
     .bind(auth.0.sub)
@@ -195,6 +273,10 @@ async fn place_order(
     .bind(initial_price)
     .bind(next_due)
     .bind(&verified_payment_intent_id)
+    .bind(is_trial)
+    .bind(trial_ends_at)
+    .bind(partner_id)
+    .bind(current_quota_gb)
     .execute(&state.db)
     .await?;
 
@@ -231,6 +313,8 @@ async fn place_order(
             "quota_size": quota_size,
             "extra": {
                 "customer_id": auth.0.sub.to_string(),
+                "is_trial": is_trial,
+                "quota_size": quota_size,
                 "specs": product.specs
             }
         })

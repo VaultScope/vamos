@@ -1,7 +1,9 @@
+pub mod activity;
 pub mod auth;
 pub mod config;
 pub mod error;
 pub mod mailer;
+pub mod media;
 pub mod middleware;
 pub mod pdf;
 pub mod routes;

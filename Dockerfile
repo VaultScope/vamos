@@ -17,6 +17,9 @@ RUN apt-get update && \
     apt-get install -y ca-certificates wget && \
     rm -rf /var/lib/apt/lists/*
 
+WORKDIR /app
+RUN mkdir -p /app/uploads/avatars /app/uploads/tickets /app/uploads/blog /app/uploads/media
+
 COPY --from=builder /app/target/release/vaultscope-api /usr/local/bin/vaultscope-api
 
 EXPOSE 3000

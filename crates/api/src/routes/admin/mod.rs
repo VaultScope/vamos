@@ -10,7 +10,9 @@ pub mod internal_tools;
 pub mod invoices;
 pub mod jobs;
 pub mod mailboxes;
+pub mod media;
 pub mod notifications;
+pub mod partners;
 pub mod products;
 pub mod service_forms;
 pub mod services;
@@ -36,7 +38,9 @@ pub fn routes() -> Router<AppState> {
         .nest("/internal-tools", internal_tools::routes())
         .nest("/invoices", invoices::routes())
         .nest("/jobs", jobs::routes())
+        .nest("/media", media::routes())
         .nest("/notifications", notifications::routes())
+        .nest("/partners", partners::routes())
         .nest("/products", products::routes())
         .nest("/services", services::routes())
         .nest("/service-forms", service_forms::routes())

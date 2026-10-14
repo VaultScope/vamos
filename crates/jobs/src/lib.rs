@@ -3,4 +3,4 @@ pub mod runner;
 pub mod tasks;
 
 pub use billing::BillingRunner;
-pub use runner::JobRunner;
+pub use runner::{JobNotifier, JobRunner};

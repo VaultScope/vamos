@@ -36,8 +36,10 @@ pub fn build_router(state: AppState) -> Router {
             csrf_middleware,
         ));
 
+    let uploads_path = crate::media::get_uploads_root();
     Router::new()
-        .nest_service("/uploads", tower_http::services::ServeDir::new("uploads"))
+        .nest_service("/uploads", tower_http::services::ServeDir::new(&uploads_path))
+        .nest_service("/api/uploads", tower_http::services::ServeDir::new(&uploads_path))
         .route("/api/csrf", axum::routing::get(csrf_token))
         .nest("/api/health", health::routes())
         .nest(

@@ -12,7 +12,7 @@ use vaultscope_db::models::{Customer, CustomerStatus, Staff};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list))
-        .route("/{id}", get(get_one).put(update))
+        .route("/{id}", get(get_one).put(update).delete(delete_customer))
         .route("/{id}/promote", post(promote_to_staff))
         .route("/{id}/resend-verification", post(resend_verification_email))
         .route("/{id}/verify", post(mark_email_verified))
@@ -165,7 +165,13 @@ async fn resend_verification_email(
     let base = state.config.storefront_url.trim_end_matches('/');
     let verification_link = format!("{}/verify-email?token={}", base, verification_token);
 
-    crate::routes::auth::send_verification_email(&state.config, &customer.email, &customer.name, &verification_token);
+    crate::routes::auth::send_verification_email(
+        &state.config,
+        Some(state.db.clone()),
+        &customer.email,
+        &customer.name,
+        &verification_token,
+    );
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -301,3 +307,90 @@ async fn promote_to_staff(
 
     Ok(Json(staff))
 }
+
+async fn delete_customer(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if crate::middleware::rbac::check_permission(&auth, &state, "customers.delete").await.is_err()
+        && crate::middleware::rbac::check_permission(&auth, &state, "accounts.delete").await.is_err()
+    {
+        crate::require_permission!(auth, state, "customers.manage");
+    }
+
+    let customer: Customer = sqlx::query_as("SELECT * FROM customers WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
+
+    // Delete secondary billing emails
+    let _ = sqlx::query("DELETE FROM customer_billing_emails WHERE customer_id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await;
+
+    // Delete tickets and ticket messages
+    let _ = sqlx::query(
+        "DELETE FROM ticket_messages WHERE ticket_id IN (SELECT id FROM tickets WHERE customer_id = $1)"
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await;
+    let _ = sqlx::query("DELETE FROM tickets WHERE customer_id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await;
+
+    // Delete invoices and invoice line items
+    let _ = sqlx::query(
+        "DELETE FROM invoice_line_items WHERE invoice_id IN (SELECT id FROM invoices WHERE customer_id = $1)"
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await;
+    let _ = sqlx::query("DELETE FROM invoices WHERE customer_id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await;
+
+    // Delete services
+    let _ = sqlx::query("DELETE FROM services WHERE customer_id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await;
+
+    // Unlink jobs
+    let _ = sqlx::query("UPDATE jobs SET customer_id = NULL WHERE customer_id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await;
+
+    // Delete customer
+    let res = sqlx::query("DELETE FROM customers WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError::NotFound("Customer not found".into()));
+    }
+
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(auth.0.sub),
+        vaultscope_db::models::ActorType::Staff,
+        auth.0.email.clone(),
+        "customer".to_string(),
+        "deleted_customer_account".to_string(),
+        customer.email.clone(),
+        format!("Deleted customer account {} ({})", customer.name, customer.email),
+    );
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": format!("Customer account for {} ({}) deleted successfully", customer.name, customer.email)
+    })))
+}
+

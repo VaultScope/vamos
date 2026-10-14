@@ -57,6 +57,7 @@ pub fn test_config() -> Config {
         smtp_password: None,
         smtp_from: None,
         dev_mode: true,
+        storefront_url: "http://localhost:5173".to_string(),
     }
 }
 

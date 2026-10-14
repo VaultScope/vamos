@@ -198,6 +198,12 @@ pub struct Product {
     pub billing_cycle: BillingCycle,
     pub hidden: bool,
     pub service_form_id: Option<Uuid>,
+    #[serde(default)]
+    pub trial_days: Option<i32>,
+    #[serde(default)]
+    pub trial_quota_gb: Option<i32>,
+    #[serde(default)]
+    pub quota_gb: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -222,6 +228,14 @@ pub struct Service {
     pub cancellation_reason: Option<String>,
     pub cancellation_feedback: Option<String>,
     pub stripe_payment_intent_id: Option<String>,
+    #[serde(default)]
+    pub is_trial: bool,
+    #[serde(default)]
+    pub trial_ends_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub partner_id: Option<Uuid>,
+    #[serde(default)]
+    pub quota_gb: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -438,6 +452,7 @@ pub struct BlogPost {
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub excerpt: String,
     pub image_url: Option<String>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -450,3 +465,27 @@ pub struct CustomerBillingEmail {
     pub created_at: DateTime<Utc>,
     pub verified_at: Option<DateTime<Utc>>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Partner {
+    pub id: Uuid,
+    pub slug: String,
+    pub name: String,
+    pub headline: Option<String>,
+    pub description: Option<String>,
+    pub badge_text: Option<String>,
+    pub product_id: Uuid,
+    pub trial_days_override: Option<i32>,
+    pub trial_quota_gb_override: Option<i32>,
+    pub quota_gb_override: Option<i32>,
+    pub limit_one_per_user: bool,
+    pub active: bool,
+    pub clicks: i32,
+    pub conversions: i32,
+    pub commission_type: Option<String>,
+    pub commission_rate: Option<rust_decimal::Decimal>,
+    pub commission_fixed_eur: Option<rust_decimal::Decimal>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+

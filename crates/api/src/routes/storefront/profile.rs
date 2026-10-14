@@ -12,7 +12,7 @@ use totp_rs::{Algorithm, Secret, TOTP};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/", get(get_profile).put(update_profile))
+        .route("/", get(get_profile).put(update_profile).delete(delete_own_account))
         .route("/billing-emails", get(list_billing_emails).post(add_billing_email))
         .route("/billing-emails/{id}", delete(delete_billing_email))
         .route("/billing-emails/{id}/resend", post(resend_billing_email_verification))
@@ -130,6 +130,17 @@ async fn update_profile(
     .await?
     .ok_or(ApiError::NotFound("customer not found".into()))?;
 
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(auth.0.sub),
+        vaultscope_db::models::ActorType::Customer,
+        customer.name.clone(),
+        "account".to_string(),
+        "profile_updated".to_string(),
+        customer.email.clone(),
+        "Updated contact and account profile details".to_string(),
+    );
+
     Ok(Json(ProfileResponse {
         id: customer.id,
         name: customer.name,
@@ -241,7 +252,13 @@ async fn add_billing_email(
     .fetch_one(&state.db)
     .await?;
 
-    crate::routes::auth::send_billing_email_verification(&state.config, &email, &customer.company, &token);
+    crate::routes::auth::send_billing_email_verification(
+        &state.config,
+        Some(state.db.clone()),
+        &email,
+        &customer.company,
+        &token,
+    );
 
     Ok(Json(billing_email))
 }
@@ -301,7 +318,13 @@ async fn resend_billing_email_verification(
         .execute(&state.db)
         .await?;
 
-    crate::routes::auth::send_billing_email_verification(&state.config, &billing_email.email, &customer.company, &token);
+    crate::routes::auth::send_billing_email_verification(
+        &state.config,
+        Some(state.db.clone()),
+        &billing_email.email,
+        &customer.company,
+        &token,
+    );
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -403,6 +426,17 @@ async fn enable_mfa(
         .execute(&state.db)
         .await?;
 
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(auth.0.sub),
+        vaultscope_db::models::ActorType::Customer,
+        customer.name.clone(),
+        "security".to_string(),
+        "2fa_enabled".to_string(),
+        "TOTP Authenticator".to_string(),
+        "Two-factor authentication (TOTP) successfully enabled".to_string(),
+    );
+
     Ok(Json(serde_json::json!({
         "ok": true,
         "message": "Two-factor authentication successfully activated."
@@ -462,6 +496,17 @@ async fn disable_mfa(
         .bind(auth.0.sub)
         .execute(&state.db)
         .await?;
+
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(auth.0.sub),
+        vaultscope_db::models::ActorType::Customer,
+        customer.name.clone(),
+        "security".to_string(),
+        "2fa_disabled".to_string(),
+        "TOTP Authenticator".to_string(),
+        "Two-factor authentication disabled".to_string(),
+    );
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -551,5 +596,55 @@ async fn verify_vat(
         }
     }
 }
+
+async fn delete_own_account(
+    auth: AuthCustomer,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let customer_id = auth.0.sub;
+
+    let running_services: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM services WHERE customer_id = $1 AND status = 'running'::service_status"
+    )
+    .bind(customer_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    if running_services.0 > 0 {
+        return Err(ApiError::BadRequest("Cannot delete account while you have active running services. Please terminate your services first.".into()));
+    }
+
+    let customer: Customer = sqlx::query_as("SELECT * FROM customers WHERE id = $1")
+        .bind(customer_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
+
+    let _ = sqlx::query("DELETE FROM customer_billing_emails WHERE customer_id = $1").bind(customer_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM ticket_messages WHERE ticket_id IN (SELECT id FROM tickets WHERE customer_id = $1)").bind(customer_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM tickets WHERE customer_id = $1").bind(customer_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM invoice_line_items WHERE invoice_id IN (SELECT id FROM invoices WHERE customer_id = $1)").bind(customer_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM invoices WHERE customer_id = $1").bind(customer_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM services WHERE customer_id = $1").bind(customer_id).execute(&state.db).await;
+    let _ = sqlx::query("UPDATE jobs SET customer_id = NULL WHERE customer_id = $1").bind(customer_id).execute(&state.db).await;
+    let _ = sqlx::query("DELETE FROM customers WHERE id = $1").bind(customer_id).execute(&state.db).await;
+
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(customer_id),
+        vaultscope_db::models::ActorType::Customer,
+        customer.name.clone(),
+        "customer".to_string(),
+        "account_closed".to_string(),
+        customer.email.clone(),
+        format!("Customer self-service account closure: {}", customer.email),
+    );
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": "Your account has been successfully deleted."
+    })))
+}
+
 
 

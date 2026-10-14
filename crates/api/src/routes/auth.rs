@@ -72,7 +72,7 @@ async fn login(
 
         let claims = Claims {
             sub: staff_id,
-            email,
+            email: email.clone(),
             role: role_name,
             audience: Audience::Admin,
             iat: Utc::now().timestamp(),
@@ -80,6 +80,18 @@ async fn login(
         };
 
         let token = jwt::sign(&claims, &state.config.jwt_secret)?;
+
+        crate::activity::spawn_record(
+            state.db.clone(),
+            Some(staff_id),
+            vaultscope_db::models::ActorType::Staff,
+            email.clone(),
+            "auth".to_string(),
+            "login".to_string(),
+            "CAMOS Admin".to_string(),
+            format!("Staff login by @{}", email),
+        );
+
         Ok(Json(json!({ "token": token, "claims": claims, "email_verified": email_verified })))
     } else {
         let customer: Option<(Uuid, String, String, Option<String>, bool, bool, Option<String>)> = sqlx::query_as(
@@ -137,7 +149,7 @@ async fn login(
 
         let claims = Claims {
             sub: customer_id,
-            email,
+            email: email.clone(),
             role: "customer".to_string(),
             audience: Audience::Storefront,
             iat: Utc::now().timestamp(),
@@ -145,6 +157,18 @@ async fn login(
         };
 
         let token = jwt::sign(&claims, &state.config.jwt_secret)?;
+
+        crate::activity::spawn_record(
+            state.db.clone(),
+            Some(customer_id),
+            vaultscope_db::models::ActorType::Customer,
+            name.clone(),
+            "auth".to_string(),
+            "login".to_string(),
+            "Customer Portal".to_string(),
+            format!("Customer login by {}", email),
+        );
+
         Ok(Json(json!({ "token": token, "claims": claims, "name": name, "email_verified": email_verified })))
     }
 }
@@ -234,7 +258,24 @@ async fn register(
     .execute(&state.db)
     .await?;
 
-    send_verification_email(&state.config, payload.email.trim(), payload.name.trim(), &verification_token);
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(customer_id),
+        vaultscope_db::models::ActorType::Customer,
+        payload.name.clone(),
+        "customer".to_string(),
+        "registered".to_string(),
+        payload.email.clone(),
+        format!("Account registered for {}", payload.name),
+    );
+
+    send_verification_email(
+        &state.config,
+        Some(state.db.clone()),
+        payload.email.trim(),
+        payload.name.trim(),
+        &verification_token,
+    );
 
     Ok(Json(json!({
         "ok": true,
@@ -244,6 +285,7 @@ async fn register(
 
 pub fn send_verification_email(
     config: &crate::config::Config,
+    db: Option<sqlx::PgPool>,
     to_email: &str,
     to_name: &str,
     token: &str,
@@ -311,15 +353,46 @@ The VaultScope Team",
         }
     };
 
-    if let Err(e) = lettre::Transport::send(&mailer, &email) {
-        tracing::error!("Could not send verification email to {}: {:?}", to_email, e);
-    } else {
-        tracing::info!("Verification email sent successfully to {}", to_email);
+    let send_res = lettre::Transport::send(&mailer, &email);
+    let (success, err_msg) = match send_res {
+        Ok(_) => {
+            tracing::info!("Verification email sent successfully to {}", to_email);
+            (true, None)
+        }
+        Err(e) => {
+            tracing::error!("Could not send verification email to {}: {:?}", to_email, e);
+            (false, Some(e.to_string()))
+        }
+    };
+
+    if let Some(pool) = db {
+        let recipient = to_email.to_string();
+        tokio::spawn(async move {
+            let status = if success {
+                vaultscope_db::models::EmailDeliveryStatus::Delivered
+            } else {
+                vaultscope_db::models::EmailDeliveryStatus::Failed
+            };
+            let _ = sqlx::query(
+                r#"INSERT INTO email_log (id, recipient, subject, template_id, status, error, sent_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+            )
+            .bind(uuid::Uuid::now_v7())
+            .bind(recipient)
+            .bind("Verify your VaultScope email address")
+            .bind(None::<uuid::Uuid>)
+            .bind(status)
+            .bind(err_msg)
+            .bind(chrono::Utc::now())
+            .execute(&pool)
+            .await;
+        });
     }
 }
 
 pub fn send_billing_email_verification(
     config: &crate::config::Config,
+    db: Option<sqlx::PgPool>,
     to_email: &str,
     company_name: &str,
     token: &str,
@@ -387,10 +460,41 @@ The VaultScope Team",
         }
     };
 
-    if let Err(e) = lettre::Transport::send(&mailer, &email) {
-        tracing::error!("Could not send billing verification email to {}: {:?}", to_email, e);
-    } else {
-        tracing::info!("Billing verification email sent successfully to {}", to_email);
+    let send_res = lettre::Transport::send(&mailer, &email);
+    let (success, err_msg) = match send_res {
+        Ok(_) => {
+            tracing::info!("Billing verification email sent successfully to {}", to_email);
+            (true, None)
+        }
+        Err(e) => {
+            tracing::error!("Could not send billing verification email to {}: {:?}", to_email, e);
+            (false, Some(e.to_string()))
+        }
+    };
+
+    if let Some(pool) = db {
+        let recipient = to_email.to_string();
+        let subject = format!("Confirm Billing CC Email for {} - VaultScope", company_name);
+        tokio::spawn(async move {
+            let status = if success {
+                vaultscope_db::models::EmailDeliveryStatus::Delivered
+            } else {
+                vaultscope_db::models::EmailDeliveryStatus::Failed
+            };
+            let _ = sqlx::query(
+                r#"INSERT INTO email_log (id, recipient, subject, template_id, status, error, sent_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+            )
+            .bind(uuid::Uuid::now_v7())
+            .bind(recipient)
+            .bind(subject)
+            .bind(None::<uuid::Uuid>)
+            .bind(status)
+            .bind(err_msg)
+            .bind(chrono::Utc::now())
+            .execute(&pool)
+            .await;
+        });
     }
 }
 
@@ -495,7 +599,13 @@ async fn resend_verification(
         .execute(&state.db)
         .await?;
 
-        send_verification_email(&state.config, &email, &name, &verification_token);
+        send_verification_email(
+            &state.config,
+            Some(state.db.clone()),
+            &email,
+            &name,
+            &verification_token,
+        );
     }
 
     Ok(Json(json!({

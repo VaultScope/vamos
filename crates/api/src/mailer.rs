@@ -192,3 +192,110 @@ pub fn spawn_customer_reply_notification(
         }
     });
 }
+
+/// Spawns a background task to notify the customer that their ordered service is provisioned and ready.
+pub fn spawn_service_welcome_notification(
+    state: AppState,
+    service_id: Uuid,
+    response_payload: serde_json::Value,
+) {
+    tokio::spawn(async move {
+        // Query service and customer info
+        let service_res = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<i32>, bool, rust_decimal::Decimal)>(
+            "SELECT customer_id, name, hostname, quota_gb, is_trial, price FROM services WHERE id = $1"
+        )
+        .bind(service_id)
+        .fetch_optional(&state.db)
+        .await;
+
+        let (customer_id, service_name, hostname_opt, quota_gb_opt, is_trial, price) = match service_res {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                tracing::warn!("Service {} not found for welcome notification", service_id);
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch service for welcome notification {}: {}", service_id, e);
+                return;
+            }
+        };
+
+        let customer_opt: Option<(String, String)> = sqlx::query_as(
+            "SELECT name, email FROM customers WHERE id = $1"
+        )
+        .bind(customer_id)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+
+        let (customer_name, customer_email) = match customer_opt {
+            Some(row) => row,
+            None => {
+                tracing::warn!("Customer {} not found for service welcome notification", customer_id);
+                return;
+            }
+        };
+
+        let hostname = hostname_opt.unwrap_or_else(|| "sftp.vaultscope.de".to_string());
+        let quota = quota_gb_opt.unwrap_or(25);
+
+        let is_sftp = response_payload.get("sftpgo_user").is_some()
+            || response_payload.get("raw_response").and_then(|r| r.get("sftpgo_user")).is_some()
+            || service_name.to_lowercase().contains("sftp")
+            || service_name.to_lowercase().contains("storage");
+
+        let email_subject = format!("[VaultScope] Your service is ready: {}", service_name);
+
+        let details_block = if is_sftp {
+            let username = response_payload.get("resource_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| response_payload.get("raw_response").and_then(|r| r.get("sftpgo_user")).and_then(|u| u.get("username")).and_then(|v| v.as_str()))
+                .unwrap_or("vs_user");
+
+            let password = response_payload.get("raw_response")
+                .and_then(|r| r.get("password"))
+                .and_then(|v| v.as_str())
+                .or_else(|| response_payload.get("password").and_then(|v| v.as_str()))
+                .unwrap_or("[Shown in Dashboard]");
+
+            let billing_line = if is_trial {
+                format!("Subscription: Free Trial ({} GB - auto-upgrades to full plan on renewal)", quota)
+            } else {
+                format!("Subscription: Regular Plan ({} GB) - €{}/mo", quota, price)
+            };
+
+            format!(
+                "SERVICE DETAILS & ACCESS CREDENTIALS\n----------------------------------------\nProduct: {}\n{}\nStorage Quota: {} GB\n\nProtocol: SFTP (SSH File Transfer Protocol) / FTPS / WebDAV\nHost: {}\nPort: 2022 (SFTP)\nUsername: {}\nPassword: {}\n----------------------------------------\n\nManage your service in Dashboard: https://vaultscope.de/dashboard/storage",
+                service_name, billing_line, quota, hostname, username, password
+            )
+        } else {
+            let ip = response_payload.get("ip")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Assigned in Dashboard");
+
+            let root_pass = response_payload.get("raw_response")
+                .and_then(|r| r.get("root_password"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("[Available in Dashboard / Configured SSH Key]");
+
+            let billing_line = if is_trial {
+                "Subscription: Free Trial".to_string()
+            } else {
+                format!("Subscription: Regular Plan - €{}/mo", price)
+            };
+
+            format!(
+                "SERVICE DETAILS & ACCESS CREDENTIALS\n----------------------------------------\nProduct: {}\n{}\n\nIP Address: {}\nHostname: {}\nSSH Port: 22\nUsername: root\nRoot Password: {}\n----------------------------------------\n\nManage your server in Dashboard: https://vaultscope.de/dashboard/vps/{}",
+                service_name, billing_line, ip, hostname, root_pass, service_id
+            )
+        };
+
+        let body = format!(
+            "Hello {},\n\nThank you for choosing VaultScope!\n\nYour service \"{}\" has been successfully provisioned and is now active.\n\n{}\n\nYou can access your service, manage configuration, or view billing anytime in your VaultScope Portal:\nhttps://vaultscope.de/dashboard\n\nIf you have any questions or require support, our team is available 24/7 in your dashboard:\nhttps://vaultscope.de/dashboard/support\n\nBest regards,\nThe VaultScope Team\nhttps://vaultscope.de",
+            customer_name, service_name, details_block
+        );
+
+        send_email(&state, &customer_email, &email_subject, &body, None).await;
+    });
+}

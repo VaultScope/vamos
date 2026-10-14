@@ -25,25 +25,33 @@ async fn list(
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<ActivityLog>>, ApiError> {
-    crate::require_permission!(auth, state, "staff.view");
+    if crate::middleware::rbac::check_permission(&auth, &state, "activity.view").await.is_err()
+        && crate::middleware::rbac::check_permission(&auth, &state, "staff.view").await.is_err()
+    {
+        crate::require_permission!(auth, state, "settings.manage");
+    }
     let limit = params.limit.unwrap_or(100).min(500);
 
     let logs = match (params.customer_id, params.category) {
         (Some(cid), Some(category)) => {
+            let cid_str = cid.to_string();
             sqlx::query_as::<_, ActivityLog>(
-                "SELECT * FROM activity_log WHERE actor_id = $1 AND category = $2 ORDER BY created_at DESC LIMIT $3",
+                "SELECT * FROM activity_log WHERE (actor_id = $1 OR target = $2 OR detail ILIKE '%' || $2 || '%') AND category = $3 ORDER BY created_at DESC LIMIT $4",
             )
             .bind(cid)
+            .bind(&cid_str)
             .bind(category)
             .bind(limit)
             .fetch_all(&state.db)
             .await?
         }
         (Some(cid), None) => {
+            let cid_str = cid.to_string();
             sqlx::query_as::<_, ActivityLog>(
-                "SELECT * FROM activity_log WHERE actor_id = $1 ORDER BY created_at DESC LIMIT $2",
+                "SELECT * FROM activity_log WHERE (actor_id = $1 OR target = $2 OR detail ILIKE '%' || $2 || '%') ORDER BY created_at DESC LIMIT $3",
             )
             .bind(cid)
+            .bind(&cid_str)
             .bind(limit)
             .fetch_all(&state.db)
             .await?

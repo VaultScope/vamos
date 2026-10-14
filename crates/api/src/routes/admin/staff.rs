@@ -1,8 +1,6 @@
 use axum::extract::{Multipart, Path, State};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::path::Path as StdPath;
-use tokio::fs;
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
@@ -313,7 +311,17 @@ async fn delete_staff(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<()>, ApiError> {
-    crate::require_permission!(auth, state, "staff.manage");
+    if crate::middleware::rbac::check_permission(&auth, &state, "staff.delete").await.is_err()
+        && crate::middleware::rbac::check_permission(&auth, &state, "accounts.delete").await.is_err()
+    {
+        crate::require_permission!(auth, state, "staff.manage");
+    }
+
+    let target_staff: Option<Staff> = sqlx::query_as("SELECT * FROM staff WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?;
+
     let result = sqlx::query("DELETE FROM staff WHERE id = $1")
         .bind(id)
         .execute(&state.db)
@@ -322,6 +330,20 @@ async fn delete_staff(
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("staff not found".into()));
     }
+
+    if let Some(target) = target_staff {
+        crate::activity::spawn_record(
+            state.db.clone(),
+            Some(auth.0.sub),
+            vaultscope_db::models::ActorType::Staff,
+            auth.0.email.clone(),
+            "staff".to_string(),
+            "deleted_staff_account".to_string(),
+            target.email.clone(),
+            format!("Deleted staff account @{} ({})", target.username, target.email),
+        );
+    }
+
     Ok(Json(()))
 }
 
@@ -378,33 +400,13 @@ async fn upload_avatar(
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?
     {
-        if field.name() == Some("avatar") {
-            let file_name = field.file_name().unwrap_or("avatar.png").to_string();
-            let ext = file_name
-                .split('.')
-                .next_back()
-                .unwrap_or("")
-                .to_lowercase();
-            if !["png", "jpg", "jpeg", "webp"].contains(&ext.as_str()) {
-                return Err(ApiError::BadRequest("Invalid file extension".to_string()));
-            }
-
+        if field.name() == Some("avatar") || field.name() == Some("file") {
             let data = field
                 .bytes()
                 .await
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-            let dir = StdPath::new("uploads/avatars");
-            fs::create_dir_all(dir)
-                .await
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-            let new_filename = format!("{}.{}", id, ext);
-            let path = dir.join(&new_filename);
-            fs::write(&path, data)
-                .await
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-            avatar_url = format!("/uploads/avatars/{}", new_filename);
+            let processed = crate::media::save_optimized_image(&data, "avatars", 512).await?;
+            avatar_url = processed.url;
             break;
         }
     }

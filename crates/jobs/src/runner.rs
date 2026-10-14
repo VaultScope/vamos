@@ -15,6 +15,12 @@ pub struct JobRunner {
     pool: PgPool,
     connectors: Arc<dyn ConnectorRegistry>,
     poll_interval: Duration,
+    notifier: Option<Arc<dyn JobNotifier>>,
+}
+
+#[async_trait::async_trait]
+pub trait JobNotifier: Send + Sync {
+    async fn on_service_provisioned(&self, service_id: uuid::Uuid, response: &serde_json::Value);
 }
 
 #[async_trait::async_trait]
@@ -32,7 +38,13 @@ impl JobRunner {
             pool,
             connectors,
             poll_interval,
+            notifier: None,
         }
+    }
+
+    pub fn with_notifier(mut self, notifier: Arc<dyn JobNotifier>) -> Self {
+        self.notifier = Some(notifier);
+        self
     }
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
@@ -87,6 +99,7 @@ impl JobRunner {
 
         let pool = self.pool.clone();
         let connectors = self.connectors.clone();
+        let notifier = self.notifier.clone();
 
         tokio::spawn(async move {
             let result = tasks::execute(&job, &connectors).await;
@@ -127,6 +140,14 @@ impl JobRunner {
                     }
                     
                     let _ = tx.commit().await;
+
+                    if job.task == "provision" {
+                        if let Some(service_id) = job.service_id {
+                            if let Some(ref n) = notifier {
+                                n.on_service_provisioned(service_id, &response).await;
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     let error_msg = e.to_string();

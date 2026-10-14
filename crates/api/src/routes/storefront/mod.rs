@@ -6,6 +6,7 @@ pub mod config;
 pub mod invoices;
 pub mod options;
 pub mod orders;
+pub mod partners;
 pub mod profile;
 pub mod services;
 pub mod tickets;
@@ -24,6 +25,8 @@ pub fn routes() -> Router<AppState> {
         .nest("/invoices", invoices::routes())
         .nest("/options", options::routes())
         .nest("/orders", orders::routes())
+        .nest("/partners", partners::routes())
+        .nest("/ps", partners::routes())
         .nest("/profile", profile::routes())
         .nest("/services", services::routes())
         .nest("/tickets", tickets::routes())

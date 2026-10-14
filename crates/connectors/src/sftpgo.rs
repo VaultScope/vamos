@@ -99,11 +99,20 @@ impl ProvisioningProvider for SftpGo {
         let customer_id = params.extra.get("customer_id").and_then(|v| v.as_str()).unwrap_or("unknown");
         let username = format!("vs_{}", &customer_id.to_string().replace("-", "")[..8]);
 
-        let mut quota_bytes: i64 = 26_843_545_600; // 25 GB default
+        let is_trial = params.extra.get("is_trial").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut quota_bytes: i64 = if is_trial {
+            5 * 1024 * 1024 * 1024 // 5 GB trial storage
+        } else {
+            150 * 1024 * 1024 * 1024 // 150 GB default
+        };
         
-        if let Some(specs) = params.extra.get("specs") {
-            if specs.get("storage_gb").and_then(|v| v.as_i64()).unwrap_or(0) == 150 {
-                quota_bytes = 150 * 1024 * 1024 * 1024;
+        if let Some(explicit_quota) = params.extra.get("quota_size").and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64))) {
+            quota_bytes = explicit_quota;
+        } else if let Some(specs) = params.extra.get("specs") {
+            if let Some(gb) = specs.get("storage_gb").and_then(|v| v.as_i64()) {
+                if !is_trial {
+                    quota_bytes = gb * 1024 * 1024 * 1024;
+                }
             }
         }
 
@@ -124,9 +133,10 @@ impl ProvisioningProvider for SftpGo {
         Ok(ProvisionResult {
             resource_id: username.clone(),
             ip: "10.20.10.60".to_string(), // Twingate LXC IP
-            hostname: "node1.vaultscope.de".to_string(), // Public unproxied domain for SFTP protocol
+            hostname: "sftp.vaultscope.de".to_string(), // Public unproxied domain for SFTP protocol
             raw_response: json!({ "password": password, "sftpgo_user": resp }),
         })
+
     }
 
     async fn power_action(&self, resource_id: &str, action: PowerAction) -> ConnectorResult<()> {

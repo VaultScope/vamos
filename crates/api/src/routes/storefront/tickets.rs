@@ -260,37 +260,14 @@ async fn upload_attachment(
             ));
         }
 
-        let dir = std::path::Path::new("uploads/tickets");
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-        let attach_id = Uuid::now_v7();
-        let clean_filename = format!(
-            "{}_{}.{}",
-            attach_id,
-            raw_filename
-                .rsplit('.')
-                .skip(1)
-                .collect::<Vec<_>>()
-                .join(".")
-                .replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_"),
-            ext
-        );
-        let path = dir.join(&clean_filename);
-
-        tokio::fs::write(&path, &data)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-        let url = format!("/uploads/tickets/{}", clean_filename);
+        let processed = crate::media::save_optimized_image(&data, "tickets", 2048).await?;
 
         return Ok(Json(AttachmentResponse {
-            id: attach_id,
+            id: processed.id,
             filename: raw_filename,
-            url,
-            size: data.len(),
-            content_type,
+            url: processed.url,
+            size: processed.size,
+            content_type: processed.content_type,
         }));
     }
 

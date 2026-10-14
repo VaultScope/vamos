@@ -117,6 +117,7 @@ async fn modify_task(
         .ok_or(ConnectorError::BadConfig)?;
     let resource_id = payload["resource_id"]
         .as_str()
+        .or_else(|| payload["provider_resource_id"].as_str())
         .ok_or(ConnectorError::BadConfig)?;
 
     connector.modify(resource_id, payload).await?;
