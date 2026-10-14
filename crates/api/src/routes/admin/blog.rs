@@ -190,23 +190,31 @@ async fn create(
 
 async fn get_one(
     auth: AuthAdmin,
-    Path(id): Path<Uuid>,
+    Path(id_or_slug): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<BlogPostResp>, ApiError> {
     check_permission(&auth, &state, "blog.read").await?;
 
-    let post = sqlx::query_as::<_, BlogPost>("SELECT * FROM blog_posts WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or(ApiError::NotFound("Post not found".into()))?;
+    let post = if let Ok(uuid) = Uuid::parse_str(&id_or_slug) {
+        sqlx::query_as::<_, BlogPost>("SELECT * FROM blog_posts WHERE id = $1")
+            .bind(uuid)
+            .fetch_optional(&state.db)
+            .await?
+    } else {
+        sqlx::query_as::<_, BlogPost>("SELECT * FROM blog_posts WHERE slug = $1")
+            .bind(&id_or_slug)
+            .fetch_optional(&state.db)
+            .await?
+    };
+
+    let post = post.ok_or(ApiError::NotFound("Post not found".into()))?;
 
     Ok(Json(post.into()))
 }
 
 async fn update(
     auth: AuthAdmin,
-    Path(id): Path<Uuid>,
+    Path(id_or_slug): Path<String>,
     State(state): State<AppState>,
     Json(payload): Json<CreatePostPayload>,
 ) -> Result<Json<BlogPostResp>, ApiError> {
@@ -219,11 +227,18 @@ async fn update(
     
     let status = payload.status.unwrap_or_else(|| "draft".to_string());
     
-    let current_post = sqlx::query_as::<_, BlogPost>("SELECT * FROM blog_posts WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or(ApiError::NotFound("Post not found".into()))?;
+    let current_post = if let Ok(uuid) = Uuid::parse_str(&id_or_slug) {
+        sqlx::query_as::<_, BlogPost>("SELECT * FROM blog_posts WHERE id = $1")
+            .bind(uuid)
+            .fetch_optional(&state.db)
+            .await?
+    } else {
+        sqlx::query_as::<_, BlogPost>("SELECT * FROM blog_posts WHERE slug = $1")
+            .bind(&id_or_slug)
+            .fetch_optional(&state.db)
+            .await?
+    };
+    let current_post = current_post.ok_or(ApiError::NotFound("Post not found".into()))?;
         
     let mut published_at = current_post.published_at;
     if status == "published" && published_at.is_none() {
@@ -250,7 +265,7 @@ async fn update(
     .bind(status)
     .bind(published_at)
     .bind(&tags)
-    .bind(id)
+    .bind(current_post.id)
     .fetch_one(&state.db)
     .await?;
 
@@ -259,15 +274,22 @@ async fn update(
 
 async fn delete(
     auth: AuthAdmin,
-    Path(id): Path<Uuid>,
+    Path(id_or_slug): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_permission(&auth, &state, "blog.delete").await?;
 
-    let result = sqlx::query("DELETE FROM blog_posts WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
+    let result = if let Ok(uuid) = Uuid::parse_str(&id_or_slug) {
+        sqlx::query("DELETE FROM blog_posts WHERE id = $1")
+            .bind(uuid)
+            .execute(&state.db)
+            .await?
+    } else {
+        sqlx::query("DELETE FROM blog_posts WHERE slug = $1")
+            .bind(&id_or_slug)
+            .execute(&state.db)
+            .await?
+    };
 
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Post not found".into()));
