@@ -4,6 +4,7 @@ pub mod blog;
 pub mod catalog;
 pub mod config;
 pub mod invoices;
+pub mod meta;
 pub mod options;
 pub mod orders;
 pub mod partners;
@@ -23,6 +24,7 @@ pub fn routes() -> Router<AppState> {
         .nest("/catalog", catalog::routes())
         .nest("/config", config::routes())
         .nest("/invoices", invoices::routes())
+        .nest("/meta", meta::routes())
         .nest("/options", options::routes())
         .nest("/orders", orders::routes())
         .nest("/partners", partners::routes())

@@ -130,10 +130,13 @@ impl ProvisioningProvider for SftpGo {
             .request(reqwest::Method::POST, "/api/v2/users", Some(&payload))
             .await?;
 
+        let sftp_ip = std::env::var("SFTP_PUBLIC_IP").unwrap_or_else(|_| "176.9.0.171".to_string());
+        let sftp_domain = std::env::var("SFTP_DOMAIN").unwrap_or_else(|_| "sftp.vaultscope.de".to_string());
+
         Ok(ProvisionResult {
             resource_id: username.clone(),
-            ip: "10.20.10.60".to_string(), // Twingate LXC IP
-            hostname: "sftp.vaultscope.de".to_string(), // Public unproxied domain for SFTP protocol
+            ip: sftp_ip,
+            hostname: sftp_domain,
             raw_response: json!({ "password": password, "sftpgo_user": resp }),
         })
 
