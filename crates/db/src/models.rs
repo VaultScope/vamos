@@ -180,6 +180,9 @@ pub struct Customer {
     pub totp_secret: Option<String>,
     #[serde(default)]
     pub vat_verified: bool,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub username: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

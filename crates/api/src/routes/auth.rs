@@ -28,7 +28,10 @@ pub fn routes(state: &AppState) -> Router<AppState> {
 
 #[derive(Deserialize)]
 struct LoginPayload {
+    #[serde(default)]
     email: String,
+    #[serde(default)]
+    username: Option<String>,
     password: String,
     audience: String,
     totp_code: Option<String>,
@@ -38,17 +41,25 @@ async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginPayload>,
 ) -> Result<Json<Value>, ApiError> {
-    validate_required_string(&payload.email, "Email")?;
+    let identifier = if !payload.email.trim().is_empty() {
+        payload.email.trim().to_string()
+    } else if let Some(ref u) = payload.username {
+        u.trim().to_string()
+    } else {
+        String::new()
+    };
+
+    validate_required_string(&identifier, "Email or username")?;
     validate_required_string(&payload.password, "Password")?;
-    validate_email(&payload.email)?;
 
     let is_admin = payload.audience == "admin";
 
     if is_admin {
+        validate_email(&identifier)?;
         let staff: Option<(Uuid, String, String, Option<String>, bool)> = sqlx::query_as(
             "SELECT s.id, s.email, r.name, s.password_hash, s.email_verified FROM staff s JOIN roles r ON s.role_id = r.id WHERE s.email = $1 LIMIT 1"
         )
-        .bind(&payload.email)
+        .bind(&identifier)
         .fetch_optional(&state.db)
         .await?;
 
@@ -94,14 +105,17 @@ async fn login(
 
         Ok(Json(json!({ "token": token, "claims": claims, "email_verified": email_verified })))
     } else {
-        let customer: Option<(Uuid, String, String, Option<String>, bool, bool, Option<String>)> = sqlx::query_as(
-            "SELECT id, name, email, password_hash, email_verified, two_factor_enabled, totp_secret FROM customers WHERE email = $1 AND status = 'active' LIMIT 1"
+        if identifier.contains('@') {
+            validate_email(&identifier)?;
+        }
+        let customer: Option<(Uuid, String, String, String, Option<String>, bool, bool, Option<String>)> = sqlx::query_as(
+            "SELECT id, COALESCE(username, '') as username, name, email, password_hash, email_verified, two_factor_enabled, totp_secret FROM customers WHERE (LOWER(email) = LOWER($1) OR (username <> '' AND LOWER(username) = LOWER($1))) AND status = 'active' LIMIT 1"
         )
-        .bind(&payload.email)
+        .bind(&identifier)
         .fetch_optional(&state.db)
         .await?;
 
-        let (customer_id, name, email, password_hash, email_verified, two_factor_enabled, totp_secret) = customer.ok_or_else(|| {
+        let (customer_id, username, name, email, password_hash, email_verified, two_factor_enabled, totp_secret) = customer.ok_or_else(|| {
             ApiError::Unauthorized
         })?;
 
@@ -169,7 +183,13 @@ async fn login(
             format!("Customer login by {}", email),
         );
 
-        Ok(Json(json!({ "token": token, "claims": claims, "name": name, "email_verified": email_verified })))
+        Ok(Json(json!({
+            "token": token,
+            "claims": claims,
+            "username": username,
+            "name": name,
+            "email_verified": email_verified
+        })))
     }
 }
 
@@ -219,14 +239,15 @@ async fn register(
     }
 
     let existing: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM customers WHERE email = $1"
+        "SELECT id FROM customers WHERE LOWER(email) = LOWER($1) OR (username <> '' AND LOWER(username) = LOWER($2))"
     )
-    .bind(&payload.email)
+    .bind(payload.email.trim())
+    .bind(payload.username.trim())
     .fetch_optional(&state.db)
     .await?;
 
     if existing.is_some() {
-        return Err(ApiError::BadRequest("An account with this email already exists".into()));
+        return Err(ApiError::BadRequest("An account with this email or username already exists".into()));
     }
 
     tracing::info!("Registering customer directly: {}", payload.email);
@@ -239,11 +260,12 @@ async fn register(
     let verification_token = hex::encode(token_bytes);
 
     sqlx::query(
-        r#"INSERT INTO customers (id, external_id, name, email, phone, company, address, postal_code, city, country, vat_id, status, email_verified, password_hash, verification_token)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'active', false, $12, $13)"#
+        r#"INSERT INTO customers (id, external_id, username, name, email, phone, company, address, postal_code, city, country, vat_id, status, email_verified, password_hash, verification_token)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'active', false, $13, $14)"#
     )
     .bind(customer_id)
     .bind(external_id)
+    .bind(payload.username.trim())
     .bind(payload.name.trim())
     .bind(payload.email.trim())
     .bind(payload.phone.as_deref().unwrap_or(""))

@@ -34,6 +34,7 @@ async fn get_profile(
 
     Ok(Json(ProfileResponse {
         id: customer.id,
+        username: customer.username,
         name: customer.name,
         email: customer.email,
         phone: customer.phone,
@@ -57,6 +58,7 @@ async fn get_profile(
 #[derive(serde::Serialize)]
 struct ProfileResponse {
     id: uuid::Uuid,
+    username: String,
     name: String,
     email: String,
     phone: String,
@@ -76,6 +78,7 @@ struct ProfileResponse {
 
 #[derive(Deserialize)]
 struct UpdateProfile {
+    username: Option<String>,
     name: Option<String>,
     phone: Option<String>,
     company: Option<String>,
@@ -91,6 +94,19 @@ async fn update_profile(
     State(state): State<AppState>,
     Json(payload): Json<UpdateProfile>,
 ) -> Result<Json<ProfileResponse>, ApiError> {
+    // Validate username if provided
+    if let Some(ref username) = payload.username {
+        let trimmed = username.trim();
+        if trimmed.is_empty() {
+            return Err(ApiError::BadRequest("Username cannot be empty".into()));
+        }
+        if trimmed.len() > 150 {
+            return Err(ApiError::BadRequest(
+                "Username exceeds maximum length of 150 characters".into(),
+            ));
+        }
+    }
+
     // Validate name if provided
     if let Some(ref name) = payload.name {
         if name.trim().is_empty() {
@@ -113,8 +129,9 @@ async fn update_profile(
                city = COALESCE($6, city),
                country = COALESCE($7, country),
                vat_id = COALESCE($8, vat_id),
+               username = COALESCE($9, username),
                updated_at = now()
-           WHERE id = $9
+           WHERE id = $10
            RETURNING *"#,
     )
     .bind(payload.name)
@@ -125,6 +142,7 @@ async fn update_profile(
     .bind(payload.city)
     .bind(payload.country)
     .bind(payload.vat_id)
+    .bind(payload.username.map(|u| u.trim().to_string()))
     .bind(auth.0.sub)
     .fetch_optional(&state.db)
     .await?
@@ -143,6 +161,7 @@ async fn update_profile(
 
     Ok(Json(ProfileResponse {
         id: customer.id,
+        username: customer.username,
         name: customer.name,
         email: customer.email,
         phone: customer.phone,
