@@ -49,18 +49,24 @@ pub async fn rate_limit_middleware(
     axum::extract::Extension(limiter): axum::extract::Extension<RateLimiter>,
     req: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Response {
     let ip = req
         .headers()
-        .get("x-forwarded-for")
+        .get("cf-connecting-ip")
+        .or_else(|| req.headers().get("x-forwarded-for"))
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(',').next())
         .map(|s| s.trim())
         .unwrap_or("unknown");
 
     if !limiter.check(ip) {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+        return axum::response::IntoResponse::into_response((
+            StatusCode::TOO_MANY_REQUESTS,
+            axum::Json(serde_json::json!({
+                "error": "Too many requests. Please wait a moment and try again."
+            })),
+        ));
     }
 
-    Ok(next.run(req).await)
+    next.run(req).await
 }
