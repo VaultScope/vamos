@@ -56,6 +56,8 @@ struct CreateProduct {
     trial_days: Option<i32>,
     trial_quota_gb: Option<i32>,
     quota_gb: Option<i32>,
+    service_form_id: Option<Uuid>,
+    hidden: Option<bool>,
 }
 
 async fn create(
@@ -66,8 +68,8 @@ async fn create(
     crate::require_permission!(auth, state, "products.create");
     let id = Uuid::now_v7();
     let product: Product = sqlx::query_as(
-        r#"INSERT INTO products (id, name, category, provider, target, specs, cost, price, setup_fee, billing_cycle, trial_days, trial_quota_gb, quota_gb)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::billing_cycle, $11, $12, $13)
+        r#"INSERT INTO products (id, name, category, provider, target, specs, cost, price, setup_fee, billing_cycle, trial_days, trial_quota_gb, quota_gb, service_form_id, hidden)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::billing_cycle, $11, $12, $13, $14, $15)
         RETURNING *"#
     )
     .bind(id)
@@ -83,6 +85,8 @@ async fn create(
     .bind(payload.trial_days)
     .bind(payload.trial_quota_gb)
     .bind(payload.quota_gb)
+    .bind(payload.service_form_id)
+    .bind(payload.hidden.unwrap_or(false))
     .fetch_one(&state.db)
     .await?;
 
@@ -99,8 +103,8 @@ async fn update(
     let product: Product = sqlx::query_as(
         r#"UPDATE products SET name=$1, category=$2, provider=$3, target=$4, specs=$5,
         cost=$6, price=$7, setup_fee=$8, billing_cycle=$9::billing_cycle, trial_days=$10,
-        trial_quota_gb=$11, quota_gb=$12, updated_at=now()
-        WHERE id=$13 RETURNING *"#
+        trial_quota_gb=$11, quota_gb=$12, service_form_id=$13, hidden=COALESCE($14, hidden), updated_at=now()
+        WHERE id=$15 RETURNING *"#
     )
     .bind(&payload.name)
     .bind(&payload.category)
@@ -114,6 +118,8 @@ async fn update(
     .bind(payload.trial_days)
     .bind(payload.trial_quota_gb)
     .bind(payload.quota_gb)
+    .bind(payload.service_form_id)
+    .bind(payload.hidden)
     .bind(id)
     .fetch_optional(&state.db)
     .await?

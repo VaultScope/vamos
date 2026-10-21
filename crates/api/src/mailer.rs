@@ -142,7 +142,7 @@ pub fn spawn_customer_reply_notification(
 ) {
     tokio::spawn(async move {
         let ticket_opt: Option<(String, Option<Uuid>, Uuid)> = match sqlx::query_as(
-            "SELECT subject, assigned_to, customer_id FROM tickets WHERE id = $1"
+            "SELECT subject, assignee_id, customer_id FROM tickets WHERE id = $1"
         )
         .bind(ticket_id)
         .fetch_optional(&state.db)

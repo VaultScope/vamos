@@ -20,8 +20,8 @@ async fn csrf_token(token: CsrfToken) -> (CsrfToken, Json<Value>) {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    let admin_rate_limiter = RateLimiter::new(600, 60); // 600 requests per 60 seconds
-    let auth_rate_limiter = RateLimiter::new(30, 60); // 30 requests per 60 seconds for login/register protection
+    let admin_rate_limiter = RateLimiter::new(2400, 60); // 2400 requests per 60 seconds
+    let auth_rate_limiter = RateLimiter::new(300, 60); // 300 requests per 60 seconds for auth/me, 2fa, passkeys, login
 
     let protected = Router::new()
         .nest(

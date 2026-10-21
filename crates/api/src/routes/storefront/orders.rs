@@ -74,8 +74,12 @@ async fn create_payment_intent(
     let client_secret = body["client_secret"]
         .as_str()
         .ok_or(ApiError::Internal("Missing client_secret from Stripe".into()))?;
+    let payment_intent_id = body["id"].as_str().unwrap_or("");
 
-    Ok(Json(json!({ "client_secret": client_secret })))
+    Ok(Json(json!({
+        "client_secret": client_secret,
+        "payment_intent_id": payment_intent_id
+    })))
 }
 
 #[derive(Deserialize)]
@@ -84,6 +88,7 @@ struct PlaceOrder {
     hostname: Option<String>,
     payment_intent_id: Option<String>,
     partner_slug: Option<String>,
+    config: Option<Value>,
 }
 
 async fn place_order(
@@ -133,6 +138,10 @@ async fn place_order(
     let total_cents = price_cents + vat_cents;
 
     let has_trial = effective_trial_days.unwrap_or(0) > 0;
+    let is_storage = product.category.to_lowercase().contains("sftp")
+        || product.category.to_lowercase().contains("storage")
+        || product.name.to_lowercase().contains("sftp")
+        || product.provider == "sftpgo";
 
     // Enforce limit: check if campaign / trial can only be claimed once per customer
     let is_single_claim_limited = partner_limit_one_per_user.unwrap_or(true);
@@ -214,19 +223,18 @@ async fn place_order(
     let service_id = Uuid::now_v7();
     let hostname = payload
         .hostname
+        .filter(|h| !h.trim().is_empty())
         .unwrap_or_else(|| {
-            if product.category == "sftp" {
+            if is_storage {
                 "sftp.vaultscope.de".to_string()
             } else {
                 format!("srv-{}", &service_id.to_string()[..8])
             }
         });
 
-    let is_trial = has_trial || (product.category == "sftp" && product.price <= rust_decimal::Decimal::ZERO);
+    let is_trial = has_trial || (is_storage && product.price <= rust_decimal::Decimal::ZERO);
     let trial_days_count = if has_trial {
         effective_trial_days.unwrap() as i64
-    } else if product.category == "sftp" {
-        30
     } else {
         30
     };
@@ -237,8 +245,6 @@ async fn place_order(
     } else {
         (product.price, Some(chrono::Utc::now() + chrono::Duration::days(30)), None)
     };
-
-    let is_storage = product.category.to_lowercase().contains("sftp") || product.category.to_lowercase().contains("storage") || product.name.to_lowercase().contains("sftp") || product.provider == "sftpgo";
 
     let effective_trial_quota_gb = partner_trial_quota_override
         .or(product.trial_quota_gb)
@@ -307,7 +313,15 @@ async fn place_order(
     }
 
     let job_id = Uuid::now_v7();
-    let provision_payload = if product.category == "sftp" {
+    let custom_image = payload
+        .config
+        .as_ref()
+        .and_then(|c| c.get("image").or_else(|| c.get("os_image")))
+        .and_then(|v| v.as_str())
+        .or_else(|| product.specs.get("image").and_then(|v| v.as_str()))
+        .unwrap_or("ubuntu-22.04");
+
+    let provision_payload = if is_storage {
         serde_json::json!({
             "name": hostname,
             "quota_size": quota_size,
@@ -315,19 +329,21 @@ async fn place_order(
                 "customer_id": auth.0.sub.to_string(),
                 "is_trial": is_trial,
                 "quota_size": quota_size,
-                "specs": product.specs
+                "specs": product.specs,
+                "config": payload.config
             }
         })
     } else {
         serde_json::json!({
             "server_type": product.specs.get("server_type").and_then(|v| v.as_str()).unwrap_or("cx22"),
             "location": product.specs.get("location").and_then(|v| v.as_str()).unwrap_or("fsn1"),
-            "image": product.specs.get("image").and_then(|v| v.as_str()).unwrap_or("ubuntu-22.04"),
+            "image": custom_image,
             "ssh_keys": [],
             "name": hostname,
             "extra": {
                 "customer_id": auth.0.sub.to_string(),
-                "specs": product.specs
+                "specs": product.specs,
+                "config": payload.config
             }
         })
     };
@@ -348,4 +364,3 @@ async fn place_order(
         json!({ "service_id": service_id, "job_id": job_id, "status": "pending" }),
     ))
 }
-
