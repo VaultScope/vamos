@@ -28,6 +28,18 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/vaultscope_test
     steps:
     - uses: actions/checkout@v4
+    - name: Initialize database roles
+      run: |
+        which psql || (sudo apt-get update && sudo apt-get install -y postgresql-client)
+        PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres <<'SQL'
+        DO $$
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vaultscope') THEN
+            CREATE ROLE vaultscope WITH LOGIN PASSWORD 'vaultscope';
+          END IF;
+        END
+        $$;
+        SQL
     - name: Build
       run: cargo build --verbose
     - name: Run tests
