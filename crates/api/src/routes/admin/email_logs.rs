@@ -1,25 +1,25 @@
 use axum::extract::{Path, State};
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use vaultscope_db::models::{EmailDeliveryStatus, EmailLog};
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", axum::routing::get(list).post(create))
-        .route("/send-test", axum::routing::post(send_test))
-        .route(
-            "/{id}",
-            axum::routing::get(get_email_log).put(update).delete(delete),
-        )
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list, create))
+        .routes(routes!(send_test))
+        .routes(routes!(get_email_log, update, delete))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct EmailLogResponse {
     pub id: Uuid,
     pub recipient: String,
@@ -70,7 +70,14 @@ fn to_response(log: EmailLog) -> EmailLogResponse {
     }
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Email Logs",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List email delivery logs", body = Vec<EmailLogResponse>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<EmailLogResponse>>, ApiError> {
@@ -86,7 +93,18 @@ async fn list(
     Ok(Json(resps))
 }
 
-async fn get_email_log(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Email Logs",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Email log ID")),
+    responses(
+        (status = 200, description = "Email log details", body = EmailLogResponse),
+        (status = 404, description = "Email log not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_email_log(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -104,14 +122,22 @@ async fn get_email_log(
     Ok(Json(to_response(log)))
 }
 
-#[derive(Deserialize)]
-struct SendTestPayload {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct SendTestPayload {
     to: String,
     subject: String,
     body: String,
 }
 
-async fn send_test(
+#[utoipa::path(
+    post,
+    path = "/send-test",
+    tag = "Admin Email Logs",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = SendTestPayload,
+    responses((status = 200, description = "Test email sent and logged", body = EmailLogResponse))
+)]
+pub(crate) async fn send_test(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<SendTestPayload>,
@@ -136,8 +162,8 @@ async fn send_test(
     Ok(Json(to_response(log)))
 }
 
-#[derive(Deserialize)]
-struct CreateEmailLog {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CreateEmailLog {
     recipient: String,
     subject: String,
     template_id: Option<Uuid>,
@@ -145,7 +171,15 @@ struct CreateEmailLog {
     error: Option<String>,
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Email Logs",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateEmailLog,
+    responses((status = 200, description = "Email log entry created", body = EmailLogResponse))
+)]
+pub(crate) async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateEmailLog>,
@@ -172,8 +206,8 @@ async fn create(
     Ok(Json(to_response(log)))
 }
 
-#[derive(Deserialize)]
-struct UpdateEmailLog {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateEmailLog {
     recipient: Option<String>,
     subject: Option<String>,
     template_id: Option<Uuid>,
@@ -181,7 +215,19 @@ struct UpdateEmailLog {
     error: Option<String>,
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Email Logs",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Email log ID")),
+    request_body = UpdateEmailLog,
+    responses(
+        (status = 200, description = "Email log updated", body = EmailLogResponse),
+        (status = 404, description = "Email log not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -214,7 +260,18 @@ async fn update(
     Ok(Json(to_response(log)))
 }
 
-async fn delete(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Admin Email Logs",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Email log ID")),
+    responses(
+        (status = 200, description = "Email log deleted"),
+        (status = 404, description = "Email log not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

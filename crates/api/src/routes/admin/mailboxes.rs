@@ -1,27 +1,36 @@
 use axum::extract::{Path, State};
-use axum::routing::{get, post, put};
-use axum::{Json, Router};
+use axum::Json;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkMessageResponse, OkResponse};
 use crate::state::AppState;
 use vaultscope_db::models::Mailbox;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list).post(create))
-        .route("/test", post(test_smtp_credentials))
-        .route("/{id}", get(get_one).put(update).delete(delete_mailbox))
-        .route("/{id}/test", post(test_mailbox))
-        .route("/{id}/default", put(set_default))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list, create))
+        .routes(routes!(test_smtp_credentials))
+        .routes(routes!(get_one, update, delete_mailbox))
+        .routes(routes!(test_mailbox))
+        .routes(routes!(set_default))
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Mailboxes",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List mailboxes", body = Vec<Mailbox>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Mailbox>>, ApiError> {
@@ -32,7 +41,18 @@ async fn list(
     Ok(Json(mailboxes))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Mailboxes",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Mailbox ID")),
+    responses(
+        (status = 200, description = "Mailbox details", body = Mailbox),
+        (status = 404, description = "Mailbox not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -46,8 +66,8 @@ async fn get_one(
     Ok(Json(mailbox))
 }
 
-#[derive(Deserialize)]
-struct CreateMailbox {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CreateMailbox {
     name: String,
     host: String,
     port: i32,
@@ -56,7 +76,15 @@ struct CreateMailbox {
     is_default: Option<bool>,
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Mailboxes",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateMailbox,
+    responses((status = 200, description = "Mailbox created", body = Mailbox))
+)]
+pub(crate) async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateMailbox>,
@@ -80,8 +108,8 @@ async fn create(
     Ok(Json(mailbox))
 }
 
-#[derive(Deserialize)]
-struct UpdateMailbox {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateMailbox {
     name: Option<String>,
     host: Option<String>,
     port: Option<i32>,
@@ -90,7 +118,16 @@ struct UpdateMailbox {
     is_default: Option<bool>,
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Mailboxes",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Mailbox ID")),
+    request_body = UpdateMailbox,
+    responses((status = 200, description = "Mailbox updated", body = OkResponse))
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -145,7 +182,18 @@ async fn update(
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn delete_mailbox(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Admin Mailboxes",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Mailbox ID")),
+    responses(
+        (status = 200, description = "Mailbox deleted", body = OkResponse),
+        (status = 404, description = "Mailbox not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete_mailbox(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -161,12 +209,24 @@ async fn delete_mailbox(
     Ok(Json(json!({ "ok": true })))
 }
 
-#[derive(Deserialize)]
-struct TestMailboxPayload {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct TestMailboxPayload {
     send_test_email: Option<String>,
 }
 
-async fn test_mailbox(
+#[utoipa::path(
+    post,
+    path = "/{id}/test",
+    tag = "Admin Mailboxes",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Mailbox ID")),
+    request_body = TestMailboxPayload,
+    responses(
+        (status = 200, description = "Mailbox connection or test email result", body = OkMessageResponse),
+        (status = 404, description = "Mailbox not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn test_mailbox(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -231,8 +291,8 @@ async fn test_mailbox(
     }
 }
 
-#[derive(Deserialize)]
-struct TestSmtpPayload {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct TestSmtpPayload {
     smtp_host: String,
     smtp_port: Option<i64>,
     smtp_user: String,
@@ -241,7 +301,15 @@ struct TestSmtpPayload {
     test_to: Option<String>,
 }
 
-async fn test_smtp_credentials(
+#[utoipa::path(
+    post,
+    path = "/test",
+    tag = "Admin Mailboxes",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = TestSmtpPayload,
+    responses((status = 200, description = "SMTP test result", body = OkMessageResponse))
+)]
+pub(crate) async fn test_smtp_credentials(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<TestSmtpPayload>,
@@ -302,7 +370,15 @@ async fn test_smtp_credentials(
     }
 }
 
-async fn set_default(
+#[utoipa::path(
+    put,
+    path = "/{id}/default",
+    tag = "Admin Mailboxes",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Mailbox ID")),
+    responses((status = 200, description = "Default mailbox updated", body = OkResponse))
+)]
+pub(crate) async fn set_default(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

@@ -1,21 +1,29 @@
 use axum::extract::{Path, State};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use vaultscope_db::models::Job;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list))
-        .route("/{id}/retry", post(retry_job))
-        .route("/{id}/cancel", post(cancel_job))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list))
+        .routes(routes!(retry_job))
+        .routes(routes!(cancel_job))
 }
 
-async fn list(auth: AuthAdmin, State(state): State<AppState>) -> Result<Json<Vec<Job>>, ApiError> {
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Jobs",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List background jobs", body = Vec<Job>))
+)]
+pub(crate) async fn list(auth: AuthAdmin, State(state): State<AppState>) -> Result<Json<Vec<Job>>, ApiError> {
     crate::require_permission!(auth, state, "jobs.view");
     let jobs = sqlx::query_as::<_, Job>("SELECT * FROM jobs ORDER BY created_at DESC")
         .fetch_all(&state.db)
@@ -24,7 +32,18 @@ async fn list(auth: AuthAdmin, State(state): State<AppState>) -> Result<Json<Vec
     Ok(Json(jobs))
 }
 
-async fn retry_job(
+#[utoipa::path(
+    post,
+    path = "/{id}/retry",
+    tag = "Admin Jobs",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Job ID")),
+    responses(
+        (status = 200, description = "Job requeued", body = Job),
+        (status = 404, description = "Job not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn retry_job(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -49,7 +68,18 @@ async fn retry_job(
     Ok(Json(job))
 }
 
-async fn cancel_job(
+#[utoipa::path(
+    post,
+    path = "/{id}/cancel",
+    tag = "Admin Jobs",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Job ID")),
+    responses(
+        (status = 200, description = "Job cancelled", body = Job),
+        (status = 404, description = "Job not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn cancel_job(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

@@ -1,24 +1,32 @@
 use axum::extract::{Path, State};
-use axum::routing::{get, post, put};
-use axum::{Json, Router};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkResponse};
 use crate::state::AppState;
 use vaultscope_db::models::EmailTemplate;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list))
-        .route("/{id}", get(get_one))
-        .route("/{id}", put(update))
-        .route("/{id}/test", post(test_send))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list))
+        .routes(routes!(get_one, update))
+        .routes(routes!(test_send))
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Email Templates",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List email templates", body = Vec<EmailTemplate>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<EmailTemplate>>, ApiError> {
@@ -30,7 +38,18 @@ async fn list(
     Ok(Json(templates))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Email Templates",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Email template ID")),
+    responses(
+        (status = 200, description = "Email template details", body = EmailTemplate),
+        (status = 404, description = "Template not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -44,15 +63,24 @@ async fn get_one(
     Ok(Json(template))
 }
 
-#[derive(Deserialize)]
-struct UpdateTemplate {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateTemplate {
     subject: Option<String>,
     body: Option<String>,
     enabled: Option<bool>,
     mailbox_id: Option<Uuid>,
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Email Templates",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Email template ID")),
+    request_body = UpdateTemplate,
+    responses((status = 200, description = "Template updated", body = OkResponse))
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -90,20 +118,32 @@ async fn update(
     Ok(Json(json!({ "ok": true })))
 }
 
-#[derive(Deserialize)]
-struct TestSendPayload {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct TestSendPayload {
     recipient: String,
 }
 
-#[derive(Serialize)]
-struct TestSendResponse {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct TestSendResponse {
     ok: bool,
     recipient: String,
     rendered_subject: String,
     rendered_body: String,
 }
 
-async fn test_send(
+#[utoipa::path(
+    post,
+    path = "/{id}/test",
+    tag = "Admin Email Templates",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Email template ID")),
+    request_body = TestSendPayload,
+    responses(
+        (status = 200, description = "Rendered test email preview", body = TestSendResponse),
+        (status = 404, description = "Template not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn test_send(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

@@ -125,6 +125,13 @@ async fn run_migrator_isolated(db_url: &str, migrator: &Migrator) -> Result<(), 
     res
 }
 
+async fn apply_repo_migrations_up_to_35(db_url: &str) {
+    let base_dir = TempMigrationDir::new("base_up_to_35");
+    base_dir.copy_repo_migrations_up_to(35);
+    let base_migrator = Migrator::new(base_dir.path()).await.unwrap();
+    run_migrator_isolated(db_url, &base_migrator).await.unwrap();
+}
+
 async fn with_scratch_db<F, Fut>(test_fn: F)
 where
     F: FnOnce(PgPool, String) -> Fut,
@@ -283,8 +290,8 @@ async fn test_vaultscope_test_migrations_through_0035_and_seeded_preservation() 
     .fetch_one(&pool)
     .await
     .expect("query _sqlx_migrations");
-    assert_eq!(max_ver, Some(35));
-    assert_eq!(count, 34); // 0001..0005, 0007..0035 (no 0006 file in repo)
+    assert_eq!(max_ver, Some(37));
+    assert_eq!(count, 35); // 0001..0005, 0007..0035, 0037 (no 0006 or 0036 file in repo)
     assert_eq!(failed_count, 0);
 
     // 2. Verify index idx_invoices_stripe_payment_intent_id is NOT created prematurely
@@ -686,7 +693,7 @@ async fn test_0036_option_a_transactional_candidate() {
         assert!(!m36.no_tx, "Option A must run inside a transaction");
 
         // Pre-apply 0001..0035 first, insert duplicates, and confirm Option A rolls back atomically
-        vaultscope_db::run_migrations(&pool).await.unwrap();
+        apply_repo_migrations_up_to_35(&db_url).await;
         let cust_id = Uuid::parse_str("01a09b2e-0532-7403-86db-a10464205764").unwrap();
         let dup_a = Uuid::now_v7();
         let dup_b = Uuid::now_v7();
@@ -792,7 +799,7 @@ async fn test_0036_option_b_clean_and_case1_invalid_index_recovery() {
 
     // Part 2: Case 1 — Concurrent build fails on duplicates -> leaves indisvalid = false + absent row 36
     with_scratch_db(|pool, db_url| async move {
-        vaultscope_db::run_migrations(&pool).await.unwrap();
+        apply_repo_migrations_up_to_35(&db_url).await;
 
         let dir = TempMigrationDir::new("opt_b_case1");
         dir.copy_repo_migrations_up_to(35);
@@ -891,7 +898,7 @@ async fn test_0036_option_b_clean_and_case1_invalid_index_recovery() {
 #[tokio::test]
 async fn test_0036_option_b_case2_disconnected_after_ddl_reconciliation() {
     with_scratch_db(|pool, db_url| async move {
-        vaultscope_db::run_migrations(&pool).await.unwrap();
+        apply_repo_migrations_up_to_35(&db_url).await;
 
         let dir = TempMigrationDir::new("opt_b_case2");
         dir.copy_repo_migrations_up_to(35);
@@ -945,7 +952,7 @@ async fn test_0036_option_b_case2_disconnected_after_ddl_reconciliation() {
 #[tokio::test]
 async fn test_0036_option_b_case3_misdefined_same_name_index_swap() {
     with_scratch_db(|pool, db_url| async move {
-        vaultscope_db::run_migrations(&pool).await.unwrap();
+        apply_repo_migrations_up_to_35(&db_url).await;
 
         let dir = TempMigrationDir::new("opt_b_case3");
         dir.copy_repo_migrations_up_to(35);

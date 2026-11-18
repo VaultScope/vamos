@@ -1,21 +1,23 @@
 use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::{DeletedResponse, ErrorResponse};
 use crate::state::AppState;
 use vaultscope_db::models::Partner;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list).post(create))
-        .route("/{id}", get(get_one).put(update).delete(delete))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list, create))
+        .routes(routes!(get_one, update, delete))
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow, ToSchema)]
 pub struct PartnerWithProduct {
     pub id: Uuid,
     pub slug: String,
@@ -45,7 +47,14 @@ pub struct PartnerWithProduct {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Partners",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List affiliate partners", body = Vec<PartnerWithProduct>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<PartnerWithProduct>>, ApiError> {
@@ -87,7 +96,18 @@ async fn list(
     Ok(Json(partners))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Partners",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Partner ID")),
+    responses(
+        (status = 200, description = "Partner details", body = Partner),
+        (status = 404, description = "Partner not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -101,7 +121,7 @@ async fn get_one(
     Ok(Json(partner))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct CreatePartner {
     pub slug: String,
     pub name: String,
@@ -119,7 +139,15 @@ pub struct CreatePartner {
     pub commission_fixed_eur: Option<rust_decimal::Decimal>,
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Partners",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreatePartner,
+    responses((status = 200, description = "Partner created", body = Partner))
+)]
+pub(crate) async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreatePartner>,
@@ -162,7 +190,19 @@ async fn create(
     Ok(Json(partner))
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Partners",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Partner ID")),
+    request_body = CreatePartner,
+    responses(
+        (status = 200, description = "Partner updated", body = Partner),
+        (status = 404, description = "Partner not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -206,7 +246,18 @@ async fn update(
     Ok(Json(partner))
 }
 
-async fn delete(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Admin Partners",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Partner ID")),
+    responses(
+        (status = 200, description = "Partner deleted", body = DeletedResponse),
+        (status = 404, description = "Partner not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

@@ -1,23 +1,32 @@
 use axum::extract::{Path, State};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
 use serde_json::Value;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::{DeletedResponse, ErrorResponse};
 use crate::state::AppState;
 use vaultscope_db::models::Product;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list).post(create))
-        .route("/{id}", get(get_one).put(update).delete(delete_product))
-        .route("/{id}/sync", post(sync_stock))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list, create))
+        .routes(routes!(get_one, update, delete_product))
+        .routes(routes!(sync_stock))
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Products",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List products", body = Vec<Product>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Product>>, ApiError> {
@@ -28,7 +37,18 @@ async fn list(
     Ok(Json(products))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Products",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Product ID")),
+    responses(
+        (status = 200, description = "Product details", body = Product),
+        (status = 404, description = "Product not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -42,8 +62,8 @@ async fn get_one(
     Ok(Json(product))
 }
 
-#[derive(Deserialize)]
-struct CreateProduct {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CreateProduct {
     name: String,
     category: String,
     provider: String,
@@ -60,7 +80,15 @@ struct CreateProduct {
     hidden: Option<bool>,
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Products",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateProduct,
+    responses((status = 200, description = "Product created", body = Product))
+)]
+pub(crate) async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateProduct>,
@@ -93,7 +121,19 @@ async fn create(
     Ok(Json(product))
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Products",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Product ID")),
+    request_body = CreateProduct,
+    responses(
+        (status = 200, description = "Product updated", body = Product),
+        (status = 404, description = "Product not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -128,7 +168,18 @@ async fn update(
     Ok(Json(product))
 }
 
-async fn sync_stock(
+#[utoipa::path(
+    post,
+    path = "/{id}/sync",
+    tag = "Admin Products",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Product ID")),
+    responses(
+        (status = 200, description = "Product stock synchronized", body = Product),
+        (status = 404, description = "Product not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn sync_stock(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -141,9 +192,53 @@ async fn sync_stock(
         .await?
         .ok_or(ApiError::NotFound("product not found".into()))?;
 
-    // Cloud-provisioned products have unlimited stock (on-demand);
-    // products without a provider keep their manually-set stock.
-    let new_stock = if !product.provider.is_empty() && product.provider != "manual" { -1 } else { product.stock };
+    // ReliableSite bare-metal inventory uses live Order API / SOAP Inventory stock
+    let new_stock = if product.provider == "reliablesite" {
+        if let Ok(rs_id) = product.target.trim().parse::<i32>() {
+            let rs = state.config.reliablesite_connector();
+            let fetched_stock = if !rs.is_mock() {
+                rs.order_api()
+                    .get_product_stock(rs_id)
+                    .await
+                    .ok()
+                    .map(|s| s.stock)
+            } else {
+                None
+            };
+
+            let stock_val = match fetched_stock {
+                Some(s) => Some(s),
+                None => rs
+                    .inventory_soap()
+                    .servers_list()
+                    .await
+                    .ok()
+                    .and_then(|list| list.into_iter().find(|s| s.product_id == rs_id))
+                    .map(|s| s.stock),
+            };
+
+            if let Some(s) = stock_val {
+                let _ = sqlx::query(
+                    "UPDATE reliablesite_servers SET stock = $1, synced_at = now() WHERE product_id = $2",
+                )
+                .bind(s)
+                .bind(rs_id)
+                .execute(&state.db)
+                .await;
+                s
+            } else {
+                product.stock
+            }
+        } else {
+            product.stock
+        }
+    } else if !product.provider.is_empty() && product.provider != "manual" {
+        // Cloud-provisioned products have unlimited stock (on-demand);
+        // products without a provider keep their manually-set stock.
+        -1
+    } else {
+        product.stock
+    };
 
     let updated_product: Product = sqlx::query_as(
         "UPDATE products SET stock=$1, updated_at=now() WHERE id=$2 RETURNING *",
@@ -156,7 +251,19 @@ async fn sync_stock(
     Ok(Json(updated_product))
 }
 
-async fn delete_product(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Admin Products",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Product ID")),
+    responses(
+        (status = 200, description = "Product deleted", body = DeletedResponse),
+        (status = 400, description = "Product has linked services", body = ErrorResponse),
+        (status = 404, description = "Product not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete_product(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

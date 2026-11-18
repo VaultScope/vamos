@@ -1,26 +1,103 @@
+use std::collections::BTreeMap;
+
 use axum::extract::State;
-use axum::routing::post;
-use axum::{Json, Router};
-use serde::Deserialize;
+use axum::Json;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthCustomer;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
+use crate::reliablesite_catalog;
 use crate::state::AppState;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", post(place_order))
-        .route("/create-payment-intent", post(create_payment_intent))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(place_order))
+        .routes(routes!(create_payment_intent))
 }
 
-#[derive(Deserialize)]
-struct CreatePaymentIntentPayload {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CreatePaymentIntentPayload {
     product_id: Uuid,
+    #[serde(default)]
+    billing_cycle: Option<String>,
+    #[serde(default)]
+    config_options: Option<BTreeMap<String, u32>>,
+    #[serde(default)]
+    config: Option<Value>,
 }
 
-async fn create_payment_intent(
+fn extract_config_options(
+    explicit: Option<&BTreeMap<String, u32>>,
+    config_json: Option<&Value>,
+) -> Option<BTreeMap<String, u32>> {
+    if let Some(m) = explicit {
+        if !m.is_empty() {
+            return Some(m.clone());
+        }
+    }
+    let obj = config_json
+        .and_then(|c| c.get("config_options").or_else(|| c.get("configOptions")))
+        .and_then(|v| v.as_object())?;
+
+    let mut out = BTreeMap::new();
+    for (k, v) in obj {
+        if let Some(val) = v
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u32>().ok()))
+        {
+            out.insert(k.trim().to_string(), val);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn extract_optional_string(
+    explicit: Option<&str>,
+    config_json: Option<&Value>,
+    keys: &[&str],
+) -> Option<String> {
+    if let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(s.to_string());
+    }
+    let cfg = config_json?;
+    for key in keys {
+        if let Some(s) = cfg.get(*key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
+pub struct OrderPaymentIntentResponse {
+    pub client_secret: String,
+    pub payment_intent_id: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/create-payment-intent",
+    tag = "Storefront Orders",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreatePaymentIntentPayload,
+    responses(
+        (status = 200, description = "Stripe PaymentIntent client secret for checkout", body = OrderPaymentIntentResponse),
+        (status = 400, description = "Out of stock or invalid configuration", body = ErrorResponse),
+        (status = 404, description = "Product not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create_payment_intent(
     _auth: AuthCustomer,
     State(state): State<AppState>,
     Json(payload): Json<CreatePaymentIntentPayload>,
@@ -33,16 +110,43 @@ async fn create_payment_intent(
     .await?
     .ok_or(ApiError::NotFound("product not found".into()))?;
 
+    use rust_decimal::prelude::ToPrimitive;
+    let price_cents = if product.provider == "reliablesite" {
+        let cycle = extract_optional_string(
+            payload.billing_cycle.as_deref(),
+            payload.config.as_ref(),
+            &["billing_cycle", "billingCycle"],
+        );
+        let opts = extract_config_options(payload.config_options.as_ref(), payload.config.as_ref());
+        let quote = reliablesite_catalog::compute_quote(
+            &state.db,
+            &product,
+            cycle.as_deref(),
+            opts.as_ref(),
+        )
+        .await?;
+
+        if quote.stock == 0 {
+            return Err(ApiError::BadRequest(
+                "Selected dedicated server is currently out of stock".into(),
+            ));
+        }
+
+        (quote.subtotal_net * rust_decimal::Decimal::from(100))
+            .to_i64()
+            .unwrap_or(0)
+    } else {
+        let subtotal = product.price + product.setup_fee;
+        (subtotal * rust_decimal::Decimal::from(100))
+            .to_i64()
+            .unwrap_or(0)
+    };
+
     let stripe_secret = state
         .config
         .stripe_secret_key
         .as_deref()
         .ok_or(ApiError::Internal("Stripe not configured".into()))?;
-
-    use rust_decimal::prelude::ToPrimitive;
-    let price_cents = (product.price * rust_decimal::Decimal::from(100))
-        .to_i64()
-        .unwrap_or(0);
 
     let vat_cents = price_cents * 19 / 100;
     let total_cents = price_cents + vat_cents;
@@ -82,16 +186,45 @@ async fn create_payment_intent(
     })))
 }
 
-#[derive(Deserialize)]
-struct PlaceOrder {
+#[derive(Deserialize, ToSchema)]
+#[schema(as = StorefrontPlaceOrder)]
+pub(crate) struct PlaceOrder {
     product_id: Uuid,
     hostname: Option<String>,
     payment_intent_id: Option<String>,
     partner_slug: Option<String>,
     config: Option<Value>,
+    #[serde(default)]
+    billing_cycle: Option<String>,
+    #[serde(default)]
+    config_options: Option<BTreeMap<String, u32>>,
+    #[serde(default)]
+    promo_code: Option<String>,
+    #[serde(default)]
+    order_notes: Option<String>,
 }
 
-async fn place_order(
+#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
+pub struct PlaceOrderResponse {
+    pub service_id: Uuid,
+    pub job_id: Uuid,
+    pub status: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Storefront Orders",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = PlaceOrder,
+    responses(
+        (status = 200, description = "Service order created and provisioning job queued", body = PlaceOrderResponse),
+        (status = 400, description = "Invalid order, partner limit, or payment verification failed", body = ErrorResponse),
+        (status = 404, description = "Product not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn place_order(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Json(payload): Json<PlaceOrder>,
@@ -130,14 +263,83 @@ async fn place_order(
 
     let effective_trial_days = partner_trial_override.or(product.trial_days);
 
+    let promo_code = extract_optional_string(
+        payload.promo_code.as_deref(),
+        payload.config.as_ref(),
+        &["promo_code", "promoCode"],
+    );
+    if let Some(ref pc) = promo_code {
+        if pc.len() > 64 {
+            return Err(ApiError::BadRequest(
+                "promo_code must be at most 64 characters".into(),
+            ));
+        }
+    }
+    let order_notes = extract_optional_string(
+        payload.order_notes.as_deref(),
+        payload.config.as_ref(),
+        &["order_notes", "orderNotes"],
+    );
+    if let Some(ref notes) = order_notes {
+        if notes.len() > 2000 {
+            return Err(ApiError::BadRequest(
+                "order_notes must be at most 2,000 characters".into(),
+            ));
+        }
+    }
+
+    let is_reliablesite = product.provider == "reliablesite";
+    let rs_quote = if is_reliablesite {
+        let cycle = extract_optional_string(
+            payload.billing_cycle.as_deref(),
+            payload.config.as_ref(),
+            &["billing_cycle", "billingCycle"],
+        );
+        let opts = extract_config_options(payload.config_options.as_ref(), payload.config.as_ref());
+        let q = reliablesite_catalog::compute_quote(
+            &state.db,
+            &product,
+            cycle.as_deref(),
+            opts.as_ref(),
+        )
+        .await?;
+
+        // Check live stock via Order API if configured, otherwise enforce DB stock
+        let rs_conn = state.config.reliablesite_connector();
+        let current_stock = if !rs_conn.is_mock() {
+            match rs_conn.order_api().get_product_stock(q.reliablesite_product_id).await {
+                Ok(s) if s.stock_controlled => s.stock,
+                Ok(_) => 1,
+                Err(_) => q.stock,
+            }
+        } else {
+            q.stock
+        };
+
+        if current_stock < 1 {
+            return Err(ApiError::BadRequest(
+                "Selected dedicated server is currently out of stock".into(),
+            ));
+        }
+        Some(q)
+    } else {
+        None
+    };
+
+    let (recurring_net, setup_fee_net, subtotal_net, period_days) = if let Some(ref q) = rs_quote {
+        (q.recurring_net, q.setup_fee_net, q.subtotal_net, q.period_days)
+    } else {
+        (product.price, product.setup_fee, product.price + product.setup_fee, 30i64)
+    };
+
     use rust_decimal::prelude::ToPrimitive;
-    let price_cents = (product.price * rust_decimal::Decimal::from(100))
+    let price_cents = (subtotal_net * rust_decimal::Decimal::from(100))
         .to_i64()
         .unwrap_or(0);
     let vat_cents = price_cents * 19 / 100;
     let total_cents = price_cents + vat_cents;
 
-    let has_trial = effective_trial_days.unwrap_or(0) > 0;
+    let has_trial = !is_reliablesite && effective_trial_days.unwrap_or(0) > 0;
     let is_storage = product.category.to_lowercase().contains("sftp")
         || product.category.to_lowercase().contains("storage")
         || product.name.to_lowercase().contains("sftp")
@@ -160,7 +362,7 @@ async fn place_order(
         }
     }
 
-    let is_free = has_trial || product.category == "sftp" || product.price <= rust_decimal::Decimal::ZERO;
+    let is_free = has_trial || product.category == "sftp" || subtotal_net <= rust_decimal::Decimal::ZERO;
 
     let verified_payment_intent_id: Option<String> = if is_free {
         None
@@ -243,7 +445,7 @@ async fn place_order(
         let expiry = chrono::Utc::now() + chrono::Duration::days(trial_days_count);
         (rust_decimal::Decimal::ZERO, Some(expiry), Some(expiry))
     } else {
-        (product.price, Some(chrono::Utc::now() + chrono::Duration::days(30)), None)
+        (recurring_net, Some(chrono::Utc::now() + chrono::Duration::days(period_days)), None)
     };
 
     let effective_trial_quota_gb = partner_trial_quota_override
@@ -267,9 +469,22 @@ async fn place_order(
         0_u64
     };
 
+    let initial_service_config = if let Some(ref q) = rs_quote {
+        json!({
+            "billing_cycle": q.billing_cycle,
+            "config_options": q.validated_config_options,
+            "setup_fee": setup_fee_net,
+            "quote_line_items": q.line_items,
+            "promo_code": promo_code,
+            "order_notes": order_notes,
+        })
+    } else {
+        payload.config.clone().unwrap_or_else(|| json!({}))
+    };
+
     sqlx::query(
-        r#"INSERT INTO services (id, customer_id, product_id, name, hostname, price, status, next_due, stripe_payment_intent_id, is_trial, trial_ends_at, partner_id, quota_gb)
-        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $10, $11, $12)"#,
+        r#"INSERT INTO services (id, customer_id, product_id, name, hostname, price, status, next_due, stripe_payment_intent_id, is_trial, trial_ends_at, partner_id, quota_gb, config)
+        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $10, $11, $12, $13)"#,
     )
     .bind(service_id)
     .bind(auth.0.sub)
@@ -283,6 +498,7 @@ async fn place_order(
     .bind(trial_ends_at)
     .bind(partner_id)
     .bind(current_quota_gb)
+    .bind(&initial_service_config)
     .execute(&state.db)
     .await?;
 
@@ -290,8 +506,8 @@ async fn place_order(
     if let Some(ref pi_id) = verified_payment_intent_id {
         let invoice_id = Uuid::now_v7();
         let inv_num = format!("INV-{}-{}", chrono::Utc::now().format("%Y%m"), &invoice_id.to_string()[..6].to_uppercase());
-        let subtotal = product.price;
-        let tax_amount = product.price * rust_decimal::Decimal::new(19, 2);
+        let subtotal = subtotal_net;
+        let tax_amount = (subtotal * rust_decimal::Decimal::new(19, 2)).round_dp(2);
         let total = subtotal + tax_amount;
         let today = chrono::Utc::now().date_naive();
 
@@ -329,6 +545,42 @@ async fn place_order(
                 "customer_id": auth.0.sub.to_string(),
                 "is_trial": is_trial,
                 "quota_size": quota_size,
+                "specs": product.specs,
+                "config": payload.config
+            }
+        })
+    } else if let Some(ref q) = rs_quote {
+        let reseller_promo: Option<String> = if promo_code.is_some() {
+            promo_code.clone()
+        } else {
+            sqlx::query_scalar(
+                "SELECT reseller_promo_code FROM reliablesite_servers WHERE product_id = $1",
+            )
+            .bind(q.reliablesite_product_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+        };
+
+        serde_json::json!({
+            "server_type": q.reliablesite_product_id.to_string(),
+            "location": product.specs.get("location").and_then(|v| v.as_str()).unwrap_or("NL"),
+            "image": custom_image,
+            "ssh_keys": [],
+            "name": hostname,
+            "extra": {
+                "customer_id": auth.0.sub.to_string(),
+                "reliablesite_product_id": q.reliablesite_product_id,
+                "billing_cycle": q.billing_cycle,
+                "config_options": q.validated_config_options,
+                "promo_code": reseller_promo,
+                "order_notes": order_notes,
+                "idempotency_key": service_id.to_string(),
+                "cpu": product.specs.get("cpu"),
+                "ram": product.specs.get("ram"),
+                "disk": product.specs.get("disk"),
                 "specs": product.specs,
                 "config": payload.config
             }

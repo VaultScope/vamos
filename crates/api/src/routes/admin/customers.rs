@@ -1,32 +1,42 @@
 use axum::extract::{Path, Query, State};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
+use utoipa::{IntoParams, ToSchema};
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkMessageResponse};
 use crate::state::AppState;
 use vaultscope_db::models::{Customer, CustomerStatus, Staff};
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list))
-        .route("/{id}", get(get_one).put(update).delete(delete_customer))
-        .route("/{id}/promote", post(promote_to_staff))
-        .route("/{id}/resend-verification", post(resend_verification_email))
-        .route("/{id}/verify", post(mark_email_verified))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list))
+        .routes(routes!(get_one, update, delete_customer))
+        .routes(routes!(promote_to_staff))
+        .routes(routes!(resend_verification_email))
+        .routes(routes!(mark_email_verified))
 }
 
-#[derive(Deserialize)]
-struct ListParams {
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct ListParams {
     status: Option<String>,
     search: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Customers",
+    security(("bearer_auth" = [])),
+    params(ListParams),
+    responses((status = 200, description = "List customers with active service counts", body = Vec<CustomerWithStats>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
@@ -92,7 +102,18 @@ async fn list(
     Ok(Json(with_stats))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Customers",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Customer ID")),
+    responses(
+        (status = 200, description = "Customer details", body = Customer),
+        (status = 404, description = "Customer not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -106,14 +127,26 @@ async fn get_one(
     Ok(Json(customer))
 }
 
-#[derive(Deserialize)]
-struct UpdateCustomer {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateCustomer {
     status: Option<CustomerStatus>,
     notes: Option<String>,
     email_verified: Option<bool>,
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Customers",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Customer ID")),
+    request_body = UpdateCustomer,
+    responses(
+        (status = 200, description = "Customer updated", body = Customer),
+        (status = 404, description = "Customer not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -140,7 +173,27 @@ async fn update(
     Ok(Json(customer))
 }
 
-async fn resend_verification_email(
+#[allow(dead_code)]
+#[derive(utoipa::ToSchema)]
+pub(crate) struct ResendVerificationResponse {
+    pub ok: bool,
+    pub message: String,
+    pub verification_token: String,
+    pub verification_link: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/{id}/resend-verification",
+    tag = "Admin Customers",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Customer ID")),
+    responses(
+        (status = 200, description = "Verification email resent", body = ResendVerificationResponse),
+        (status = 404, description = "Customer not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn resend_verification_email(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -181,7 +234,18 @@ async fn resend_verification_email(
     })))
 }
 
-async fn mark_email_verified(
+#[utoipa::path(
+    post,
+    path = "/{id}/verify",
+    tag = "Admin Customers",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Customer ID")),
+    responses(
+        (status = 200, description = "Customer email marked verified", body = Customer),
+        (status = 404, description = "Customer not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn mark_email_verified(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -204,21 +268,34 @@ async fn mark_email_verified(
     Ok(Json(customer))
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, ToSchema)]
 pub struct CustomerWithStats {
     #[serde(flatten)]
     pub customer: Customer,
     pub active_services: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct PromoteCustomerPayload {
     pub role_id: Uuid,
     pub username: Option<String>,
     pub password: Option<String>,
 }
 
-async fn promote_to_staff(
+#[utoipa::path(
+    post,
+    path = "/{id}/promote",
+    tag = "Admin Customers",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Customer ID")),
+    request_body = PromoteCustomerPayload,
+    responses(
+        (status = 200, description = "Customer promoted to staff", body = Staff),
+        (status = 400, description = "Invalid role ID", body = ErrorResponse),
+        (status = 404, description = "Customer not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn promote_to_staff(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -308,7 +385,18 @@ async fn promote_to_staff(
     Ok(Json(staff))
 }
 
-async fn delete_customer(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Admin Customers",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Customer ID")),
+    responses(
+        (status = 200, description = "Customer account deleted", body = OkMessageResponse),
+        (status = 404, description = "Customer not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete_customer(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

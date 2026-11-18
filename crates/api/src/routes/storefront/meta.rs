@@ -1,16 +1,15 @@
 use axum::extract::{Path, State};
 use axum::response::Html;
-use axum::routing::get;
-use axum::Router;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::state::AppState;
 use vaultscope_db::models::Partner;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/ps/{slug}", get(get_partner_meta))
-        .route("/resources/blog/{slug}", get(get_blog_meta))
-        .route("/blog/{slug}", get(get_blog_meta))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(get_partner_meta))
+        .routes(routes!(get_blog_meta))
+        .routes(routes!(get_blog_meta_alias))
 }
 
 fn escape_html(s: &str) -> String {
@@ -20,7 +19,14 @@ fn escape_html(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-async fn get_partner_meta(
+#[utoipa::path(
+    get,
+    path = "/ps/{slug}",
+    tag = "Storefront Meta",
+    params(("slug" = String, Path, description = "Partner campaign slug")),
+    responses((status = 200, description = "Open Graph metadata HTML page", content_type = "text/html", body = String))
+)]
+pub(crate) async fn get_partner_meta(
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> Html<String> {
@@ -80,7 +86,35 @@ struct BlogMetaRow {
     published_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-async fn get_blog_meta(
+#[utoipa::path(
+    get,
+    path = "/resources/blog/{slug}",
+    tag = "Storefront Meta",
+    params(("slug" = String, Path, description = "Blog post slug")),
+    responses((status = 200, description = "Open Graph metadata HTML page for blog post", content_type = "text/html", body = String))
+)]
+pub(crate) async fn get_blog_meta(
+    state: State<AppState>,
+    path: Path<String>,
+) -> Html<String> {
+    get_blog_meta_inner(state, path).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/blog/{slug}",
+    tag = "Storefront Meta",
+    params(("slug" = String, Path, description = "Blog post slug (short route)")),
+    responses((status = 200, description = "Open Graph metadata HTML page for blog post", content_type = "text/html", body = String))
+)]
+pub(crate) async fn get_blog_meta_alias(
+    state: State<AppState>,
+    path: Path<String>,
+) -> Html<String> {
+    get_blog_meta_inner(state, path).await
+}
+
+async fn get_blog_meta_inner(
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> Html<String> {

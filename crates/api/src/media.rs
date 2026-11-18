@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct ProcessedImage {
     pub id: Uuid,
     pub url: String,

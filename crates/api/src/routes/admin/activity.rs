@@ -1,26 +1,39 @@
 use axum::extract::{Query, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
+use utoipa::IntoParams;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use vaultscope_db::models::ActivityLog;
 
-pub fn routes() -> Router<AppState> {
-    Router::new().route("/", get(list))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(list))
 }
 
-#[derive(Deserialize)]
-struct ListParams {
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct ListParams {
     category: Option<String>,
     customer_id: Option<Uuid>,
     limit: Option<i64>,
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Activity",
+    security(("bearer_auth" = [])),
+    params(ListParams),
+    responses(
+        (status = 200, description = "Audit activity logs", body = Vec<ActivityLog>),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Query(params): Query<ListParams>,

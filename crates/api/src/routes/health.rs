@@ -1,13 +1,23 @@
-use axum::routing::get;
-use axum::{Json, Router};
-use serde_json::{json, Value};
+use axum::Json;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
+use crate::openapi::HealthResponse;
 use crate::state::AppState;
 
-pub fn routes() -> Router<AppState> {
-    Router::new().route("/", get(health_check))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(health_check))
 }
 
-async fn health_check() -> Json<Value> {
-    Json(json!({ "status": "ok" }))
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Health",
+    responses(
+        (status = 200, description = "Service health status", body = HealthResponse)
+    )
+)]
+pub(crate) async fn health_check() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_string(),
+    })
 }

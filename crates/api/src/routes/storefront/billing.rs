@@ -1,19 +1,21 @@
 use axum::extract::State;
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use chrono::Utc;
 use serde::Serialize;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::auth::AuthCustomer;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 
-pub fn routes() -> Router<AppState> {
-    Router::new().route("/", get(billing_info))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(billing_info))
 }
 
-#[derive(Serialize)]
-struct BillingInfo {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct BillingInfo {
     balance: String,
     amount_due: String,
     has_unpaid_invoices: bool,
@@ -31,16 +33,16 @@ struct BillingInfo {
     subscriptions: Vec<Subscription>,
 }
 
-#[derive(Serialize)]
-struct BillingAddress {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct BillingAddress {
     name: String,
     company: String,
     line1: String,
     country: String,
 }
 
-#[derive(Serialize)]
-struct Subscription {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct Subscription {
     id: String,
     name: String,
     description: String,
@@ -51,7 +53,18 @@ struct Subscription {
     due_soon: bool,
 }
 
-async fn billing_info(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Storefront Billing",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Customer billing summary, open balances, and active subscriptions", body = BillingInfo),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Customer not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn billing_info(
     auth: AuthCustomer,
     State(state): State<AppState>,
 ) -> Result<Json<BillingInfo>, ApiError> {

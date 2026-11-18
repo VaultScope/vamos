@@ -22,6 +22,9 @@ pub struct Config {
     pub hetzner_api_token: Option<String>,
     pub reliablesite_api_key: Option<String>,
     pub reliablesite_api_url: Option<String>,
+    pub reliablesite_order_api_url: Option<String>,
+    pub reliablesite_inventory_url: Option<String>,
+    pub reliablesite_payment_method: Option<String>,
     pub sftpgo_url: Option<String>,
     pub sftpgo_user: Option<String>,
     pub sftpgo_pass: Option<String>,
@@ -82,6 +85,9 @@ impl Config {
             hetzner_api_token: env::var("HETZNER_API_TOKEN").ok(),
             reliablesite_api_key: env::var("RELIABLESITE_API_KEY").ok(),
             reliablesite_api_url: env::var("RELIABLESITE_API_URL").ok(),
+            reliablesite_order_api_url: env::var("RELIABLESITE_ORDER_API_URL").ok(),
+            reliablesite_inventory_url: env::var("RELIABLESITE_INVENTORY_URL").ok(),
+            reliablesite_payment_method: env::var("RELIABLESITE_PAYMENT_METHOD").ok(),
             sftpgo_url: env::var("SFTPGO_URL").ok(),
             sftpgo_user: env::var("SFTPGO_USER").ok(),
             sftpgo_pass: env::var("SFTPGO_PASS").ok(),
@@ -114,6 +120,48 @@ impl Config {
         key[..len].copy_from_slice(&bytes[..len]);
 
         key
+    }
+
+    pub fn reliablesite_connector(&self) -> vaultscope_connectors::reliablesite::ReliableSite {
+        use vaultscope_connectors::reliablesite::{
+            inventory_soap::DEFAULT_INVENTORY_URL, order_api::DEFAULT_ORDER_API_URL, ReliableSite,
+        };
+
+        let api_key = self
+            .reliablesite_api_key
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        let order_url = self
+            .reliablesite_order_api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.reliablesite_api_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.contains("api.reliablesite.net"))
+            })
+            .unwrap_or(DEFAULT_ORDER_API_URL)
+            .to_string();
+
+        let inventory_url = self
+            .reliablesite_inventory_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_INVENTORY_URL)
+            .to_string();
+
+        ReliableSite::with_endpoints(
+            api_key,
+            order_url,
+            inventory_url,
+            self.reliablesite_payment_method.clone(),
+        )
     }
 }
 

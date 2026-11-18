@@ -1,28 +1,30 @@
 use axum::extract::State;
-use axum::routing::post;
-use axum::{Json, Router};
+use axum::Json;
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::{jwt, Audience, Claims};
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkMessageResponse};
 use crate::state::AppState;
 use crate::validation::{validate_email, validate_required_string, validate_string_length};
 use bcrypt::{hash, verify, DEFAULT_COST};
 use sha2::{Digest, Sha256};
 
-pub fn routes(_state: &AppState) -> Router<AppState> {
-    Router::new()
-        .route("/login", post(login))
-        .route("/register", post(register))
-        .route("/verify-email", post(verify_email))
-        .route("/resend-verification", post(resend_verification))
+pub fn routes(_state: &AppState) -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(login))
+        .routes(routes!(register))
+        .routes(routes!(verify_email))
+        .routes(routes!(resend_verification))
 }
 
-#[derive(Deserialize)]
-struct LoginPayload {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct LoginPayload {
     #[serde(default)]
     email: String,
     #[serde(default)]
@@ -32,7 +34,44 @@ struct LoginPayload {
     totp_code: Option<String>,
 }
 
-async fn login(
+#[derive(Serialize, ToSchema)]
+pub struct LoginSuccessResponse {
+    pub token: String,
+    pub claims: Claims,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub email_verified: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MfaChallengeResponse {
+    pub mfa_required: bool,
+    pub email: String,
+    pub message: String,
+}
+
+#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum LoginOutcome {
+    Token(LoginSuccessResponse),
+    MfaChallenge(MfaChallengeResponse),
+}
+
+#[utoipa::path(
+    post,
+    path = "/login",
+    tag = "Auth",
+    request_body = LoginPayload,
+    responses(
+        (status = 200, description = "JWT session or 2FA challenge required", body = LoginOutcome),
+        (status = 400, description = "Validation or invalid 2FA/recovery code", body = ErrorResponse),
+        (status = 401, description = "Invalid credentials", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginPayload>,
 ) -> Result<Json<Value>, ApiError> {
@@ -239,8 +278,8 @@ async fn login(
     }
 }
 
-#[derive(Deserialize)]
-struct RegisterPayload {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct RegisterPayload {
     username: String,
     email: String,
     password: String,
@@ -254,7 +293,17 @@ struct RegisterPayload {
     vat_id: Option<String>,
 }
 
-async fn register(
+#[utoipa::path(
+    post,
+    path = "/register",
+    tag = "Auth",
+    request_body = RegisterPayload,
+    responses(
+        (status = 200, description = "Account created and verification email dispatched", body = OkMessageResponse),
+        (status = 400, description = "Validation error or account already exists", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn register(
     State(state): State<AppState>,
     Json(payload): Json<RegisterPayload>,
 ) -> Result<Json<Value>, ApiError> {
@@ -566,12 +615,22 @@ The VaultScope Team",
     }
 }
 
-#[derive(Deserialize)]
-struct VerifyEmailPayload {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct VerifyEmailPayload {
     token: String,
 }
 
-async fn verify_email(
+#[utoipa::path(
+    post,
+    path = "/verify-email",
+    tag = "Auth",
+    request_body = VerifyEmailPayload,
+    responses(
+        (status = 200, description = "Email verified", body = OkMessageResponse),
+        (status = 400, description = "Invalid or expired verification token", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn verify_email(
     State(state): State<AppState>,
     Json(payload): Json<VerifyEmailPayload>,
 ) -> Result<Json<Value>, ApiError> {
@@ -629,12 +688,22 @@ async fn verify_email(
     Err(ApiError::BadRequest("Invalid or expired verification token.".into()))
 }
 
-#[derive(Deserialize)]
-struct ResendVerificationPayload {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct ResendVerificationPayload {
     email: String,
 }
 
-async fn resend_verification(
+#[utoipa::path(
+    post,
+    path = "/resend-verification",
+    tag = "Auth",
+    request_body = ResendVerificationPayload,
+    responses(
+        (status = 200, description = "Verification email resent if account exists and is unverified", body = OkMessageResponse),
+        (status = 400, description = "Invalid email format", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn resend_verification(
     State(state): State<AppState>,
     Json(payload): Json<ResendVerificationPayload>,
 ) -> Result<Json<Value>, ApiError> {

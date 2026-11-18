@@ -1,40 +1,42 @@
 use axum::extract::{Multipart, Path, State};
-use axum::{Json, Router};
+use axum::Json;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::{BinaryFileUpload, ErrorResponse};
 use crate::state::AppState;
 use crate::validation::{validate_email, validate_required_string};
 use vaultscope_db::models::{Role, Staff};
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", axum::routing::get(list).post(create_staff))
-        .route(
-            "/{id}",
-            axum::routing::put(update_staff).delete(delete_staff),
-        )
-        .route("/{id}/avatar", axum::routing::post(upload_avatar))
-        .route("/me", axum::routing::get(me).put(update_me))
-        .route("/roles", axum::routing::get(list_roles).post(create_role))
-        .route(
-            "/roles/{id}",
-            axum::routing::get(get_role)
-                .put(update_role)
-                .delete(delete_role),
-        )
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list, create_staff))
+        .routes(routes!(update_staff, delete_staff))
+        .routes(routes!(upload_avatar))
+        .routes(routes!(me, update_me))
+        .routes(routes!(list_roles, create_role))
+        .routes(routes!(get_role, update_role, delete_role))
 }
 
-#[derive(Serialize)]
-struct StaffWithRole {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct StaffWithRole {
     #[serde(flatten)]
     staff: Staff,
     role_name: String,
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Staff",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List staff accounts", body = Vec<StaffWithRole>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<StaffWithRole>>, ApiError> {
@@ -65,7 +67,17 @@ async fn list(
     Ok(Json(result))
 }
 
-async fn me(
+#[utoipa::path(
+    get,
+    path = "/me",
+    tag = "Admin Staff",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Current authenticated staff profile", body = StaffWithRole),
+        (status = 404, description = "Staff or role not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn me(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<StaffWithRole>, ApiError> {
@@ -88,7 +100,14 @@ async fn me(
     }))
 }
 
-async fn list_roles(
+#[utoipa::path(
+    get,
+    path = "/roles",
+    tag = "Admin Staff",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List RBAC roles", body = Vec<Role>))
+)]
+pub(crate) async fn list_roles(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Role>>, ApiError> {
@@ -100,7 +119,18 @@ async fn list_roles(
     Ok(Json(roles))
 }
 
-async fn get_role(
+#[utoipa::path(
+    get,
+    path = "/roles/{id}",
+    tag = "Admin Staff",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Role ID")),
+    responses(
+        (status = 200, description = "Role details", body = Role),
+        (status = 404, description = "Role not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_role(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -115,14 +145,22 @@ async fn get_role(
     Ok(Json(role))
 }
 
-#[derive(Deserialize)]
-struct CreateRole {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CreateRole {
     name: String,
     permissions: Vec<String>,
     mapped_group: String,
 }
 
-async fn create_role(
+#[utoipa::path(
+    post,
+    path = "/roles",
+    tag = "Admin Staff",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateRole,
+    responses((status = 200, description = "Role created", body = Role))
+)]
+pub(crate) async fn create_role(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateRole>,
@@ -142,14 +180,26 @@ async fn create_role(
     Ok(Json(role))
 }
 
-#[derive(Deserialize)]
-struct UpdateRole {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateRole {
     name: Option<String>,
     permissions: Option<Vec<String>>,
     mapped_group: Option<String>,
 }
 
-async fn update_role(
+#[utoipa::path(
+    put,
+    path = "/roles/{id}",
+    tag = "Admin Staff",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Role ID")),
+    request_body = UpdateRole,
+    responses(
+        (status = 200, description = "Role updated", body = Role),
+        (status = 404, description = "Role not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update_role(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -176,7 +226,19 @@ async fn update_role(
     Ok(Json(role))
 }
 
-async fn delete_role(
+#[utoipa::path(
+    delete,
+    path = "/roles/{id}",
+    tag = "Admin Staff",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Role ID")),
+    responses(
+        (status = 200, description = "Role deleted"),
+        (status = 400, description = "Role has assigned staff", body = ErrorResponse),
+        (status = 404, description = "Role not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete_role(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -206,8 +268,8 @@ async fn delete_role(
     Ok(Json(()))
 }
 
-#[derive(Deserialize)]
-struct CreateStaff {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CreateStaff {
     external_id: Option<String>,
     first_name: String,
     last_name: String,
@@ -217,7 +279,18 @@ struct CreateStaff {
     password: Option<String>,
 }
 
-async fn create_staff(
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Staff",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateStaff,
+    responses(
+        (status = 200, description = "Staff account created", body = Staff),
+        (status = 400, description = "Invalid input", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create_staff(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateStaff>,
@@ -256,8 +329,8 @@ async fn create_staff(
     Ok(Json(staff))
 }
 
-#[derive(Deserialize)]
-struct UpdateStaff {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateStaff {
     first_name: Option<String>,
     last_name: Option<String>,
     username: Option<String>,
@@ -266,7 +339,19 @@ struct UpdateStaff {
     password: Option<String>,
 }
 
-async fn update_staff(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Staff",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Staff ID")),
+    request_body = UpdateStaff,
+    responses(
+        (status = 200, description = "Staff account updated", body = Staff),
+        (status = 404, description = "Staff not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update_staff(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -306,7 +391,18 @@ async fn update_staff(
     Ok(Json(staff))
 }
 
-async fn delete_staff(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Admin Staff",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Staff ID")),
+    responses(
+        (status = 200, description = "Staff account deleted"),
+        (status = 404, description = "Staff not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete_staff(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -347,15 +443,26 @@ async fn delete_staff(
     Ok(Json(()))
 }
 
-#[derive(Deserialize)]
-struct UpdateMe {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateMe {
     first_name: Option<String>,
     last_name: Option<String>,
     username: Option<String>,
     email: Option<String>,
 }
 
-async fn update_me(
+#[utoipa::path(
+    put,
+    path = "/me",
+    tag = "Admin Staff",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = UpdateMe,
+    responses(
+        (status = 200, description = "Current staff profile updated", body = Staff),
+        (status = 404, description = "Staff not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update_me(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<UpdateMe>,
@@ -383,7 +490,20 @@ async fn update_me(
     Ok(Json(staff))
 }
 
-async fn upload_avatar(
+#[utoipa::path(
+    post,
+    path = "/{id}/avatar",
+    tag = "Admin Staff",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Staff ID")),
+    request_body(content = BinaryFileUpload, content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "Staff avatar uploaded", body = Staff),
+        (status = 400, description = "Invalid avatar upload", body = ErrorResponse),
+        (status = 404, description = "Staff not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn upload_avatar(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

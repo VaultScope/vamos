@@ -1,22 +1,31 @@
 use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use crate::validation::validate_required_string;
 use vaultscope_db::models::ServiceForm;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list).post(create))
-        .route("/{id}", get(get_one).put(update).delete(delete))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list, create))
+        .routes(routes!(get_one, update, delete))
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Service Forms",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List service forms", body = Vec<ServiceForm>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ServiceForm>>, ApiError> {
@@ -28,7 +37,18 @@ async fn list(
     Ok(Json(forms))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Service Forms",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Service form ID")),
+    responses(
+        (status = 200, description = "Service form details", body = ServiceForm),
+        (status = 404, description = "Service form not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -42,14 +62,25 @@ async fn get_one(
     Ok(Json(form))
 }
 
-#[derive(Deserialize)]
-struct CreateServiceForm {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CreateServiceForm {
     name: String,
     description: String,
     fields: serde_json::Value,
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Service Forms",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateServiceForm,
+    responses(
+        (status = 200, description = "Service form created", body = ServiceForm),
+        (status = 400, description = "Invalid input", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateServiceForm>,
@@ -71,14 +102,26 @@ async fn create(
     Ok(Json(form))
 }
 
-#[derive(Deserialize)]
-struct UpdateServiceForm {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateServiceForm {
     name: Option<String>,
     description: Option<String>,
     fields: Option<serde_json::Value>,
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Service Forms",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service form ID")),
+    request_body = UpdateServiceForm,
+    responses(
+        (status = 200, description = "Service form updated", body = ServiceForm),
+        (status = 404, description = "Service form not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -105,7 +148,18 @@ async fn update(
     Ok(Json(form))
 }
 
-async fn delete(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Admin Service Forms",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service form ID")),
+    responses(
+        (status = 200, description = "Service form deleted"),
+        (status = 404, description = "Service form not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

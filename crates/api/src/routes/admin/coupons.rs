@@ -1,12 +1,14 @@
 use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use crate::validation::{
     validate_percentage, validate_positive, validate_required_string, validate_string_length,
@@ -15,13 +17,20 @@ use crate::validation::{
 use serde_json::Value;
 use vaultscope_db::models::{Coupon, CouponDiscountType, CouponStatus};
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list).post(create))
-        .route("/{id}", get(get_one).put(update).delete(delete))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list, create))
+        .routes(routes!(get_one, update, delete))
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Coupons",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List coupons", body = Vec<Coupon>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Coupon>>, ApiError> {
@@ -32,7 +41,18 @@ async fn list(
     Ok(Json(coupons))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Coupons",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Coupon ID")),
+    responses(
+        (status = 200, description = "Coupon details", body = Coupon),
+        (status = 404, description = "Coupon not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -46,8 +66,8 @@ async fn get_one(
     Ok(Json(coupon))
 }
 
-#[derive(Deserialize)]
-struct CreateCoupon {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CreateCoupon {
     code: String,
     discount_type: CouponDiscountType,
     discount_value: f64,
@@ -83,7 +103,18 @@ async fn get_stripe_key(state: &AppState) -> Result<String, ApiError> {
     Ok(stripe_key)
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Coupons",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateCoupon,
+    responses(
+        (status = 200, description = "Coupon created", body = Coupon),
+        (status = 400, description = "Invalid input", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateCoupon>,
@@ -178,15 +209,27 @@ async fn create(
     Ok(Json(coupon))
 }
 
-#[derive(Deserialize)]
-struct UpdateCoupon {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateCoupon {
     discount_value: Option<f64>,
     usage_limit: Option<i32>,
     expires_at: Option<DateTime<Utc>>,
     status: Option<CouponStatus>,
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Coupons",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Coupon ID")),
+    request_body = UpdateCoupon,
+    responses(
+        (status = 200, description = "Coupon updated", body = Coupon),
+        (status = 404, description = "Coupon not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -258,7 +301,18 @@ async fn update(
     Ok(Json(coupon))
 }
 
-async fn delete(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Admin Coupons",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Coupon ID")),
+    responses(
+        (status = 200, description = "Coupon deleted"),
+        (status = 404, description = "Coupon not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

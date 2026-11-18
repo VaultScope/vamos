@@ -5,7 +5,9 @@ mod error;
 mod mailer;
 mod media;
 mod middleware;
+mod openapi;
 mod pdf;
+mod reliablesite_catalog;
 mod routes;
 mod state;
 mod validation;
@@ -20,7 +22,6 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use vaultscope_connectors::hetzner_cloud::HetznerCloud;
-use vaultscope_connectors::reliablesite::ReliableSite;
 use vaultscope_connectors::sftpgo::SftpGo;
 use vaultscope_connectors::ProvisioningProvider;
 use vaultscope_jobs::billing::BillingNotifier;
@@ -47,11 +48,7 @@ impl ConnectorRegistry for EnvConnectorRegistry {
                 let admin_pass = self.config.sftpgo_pass.as_ref()?.trim().to_string();
                 Some(Arc::new(SftpGo::new(base_url, admin_user, admin_pass)))
             }
-            "reliablesite" => {
-                let api_key = self.config.reliablesite_api_key.as_ref().map(|s| s.trim().to_string()).unwrap_or_default();
-                let base_url = self.config.reliablesite_api_url.as_ref().map(|s| s.trim().to_string()).unwrap_or_else(|| "https://api.reliablesite.net".to_string());
-                Some(Arc::new(ReliableSite::new(api_key, base_url)))
-            }
+            "reliablesite" => Some(Arc::new(self.config.reliablesite_connector())),
             _ => None,
         }
     }

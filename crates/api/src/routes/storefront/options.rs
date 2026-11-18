@@ -1,14 +1,16 @@
 use axum::extract::State;
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Serialize;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::auth::AuthCustomer;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use vaultscope_db::models::ServiceForm;
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StorefrontOptions {
     pub os_images: Vec<OsImage>,
@@ -16,23 +18,33 @@ pub struct StorefrontOptions {
     pub service_forms: Vec<ServiceForm>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct OsImage {
     pub id: String,
     pub name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct SshKey {
     pub id: String,
     pub name: String,
 }
 
-pub fn routes() -> Router<AppState> {
-    Router::new().route("/", get(get_options))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(get_options))
 }
 
-async fn get_options(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Storefront Options",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Available OS images, SSH keys, and custom order forms", body = StorefrontOptions),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_options(
     _auth: AuthCustomer,
     State(state): State<AppState>,
 ) -> Result<Json<StorefrontOptions>, ApiError> {

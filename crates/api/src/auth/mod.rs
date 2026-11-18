@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Claims {
     pub sub: Uuid,
     pub email: String,
@@ -19,7 +19,7 @@ pub struct Claims {
     pub iat: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Audience {
     Admin,

@@ -3,6 +3,7 @@ pub mod billing;
 pub mod blog;
 pub mod catalog;
 pub mod config;
+pub mod dedicated;
 pub mod invoices;
 pub mod meta;
 pub mod options;
@@ -12,17 +13,18 @@ pub mod profile;
 pub mod services;
 pub mod tickets;
 
-use axum::Router;
+use utoipa_axum::router::OpenApiRouter;
 
 use crate::state::AppState;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
         .nest("/activity", activity::routes())
         .nest("/billing", billing::routes())
         .nest("/blog", blog::routes())
         .nest("/catalog", catalog::routes())
         .nest("/config", config::routes())
+        .nest("/dedicated", dedicated::routes())
         .nest("/invoices", invoices::routes())
         .nest("/meta", meta::routes())
         .nest("/options", options::routes())

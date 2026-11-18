@@ -1,27 +1,29 @@
 use axum::extract::{Path, Query, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list_published))
-        .route("/tags", get(list_tags))
-        .route("/{slug}", get(get_by_slug))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list_published))
+        .routes(routes!(list_tags))
+        .routes(routes!(get_by_slug))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct BlogAuthorInfo {
     pub name: String,
     pub username: String,
     pub avatar: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct PublicBlogPost {
     pub id: Uuid,
     pub title: String,
@@ -83,12 +85,18 @@ impl BlogPostRow {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 pub struct ListBlogParams {
     tag: Option<String>,
 }
 
-async fn list_tags(
+#[utoipa::path(
+    get,
+    path = "/tags",
+    tag = "Storefront Blog",
+    responses((status = 200, description = "Published blog tags", body = Vec<String>))
+)]
+pub(crate) async fn list_tags(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<String>>, ApiError> {
     let tags: Vec<String> = sqlx::query_scalar(
@@ -101,7 +109,14 @@ async fn list_tags(
     Ok(Json(tags))
 }
 
-async fn list_published(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Storefront Blog",
+    params(ListBlogParams),
+    responses((status = 200, description = "Published blog posts", body = Vec<PublicBlogPost>))
+)]
+pub(crate) async fn list_published(
     State(state): State<AppState>,
     Query(params): Query<ListBlogParams>,
 ) -> Result<Json<Vec<PublicBlogPost>>, ApiError> {
@@ -135,7 +150,17 @@ async fn list_published(
     Ok(Json(public_posts))
 }
 
-async fn get_by_slug(
+#[utoipa::path(
+    get,
+    path = "/{slug}",
+    tag = "Storefront Blog",
+    params(("slug" = String, Path, description = "Blog post slug")),
+    responses(
+        (status = 200, description = "Published blog post details", body = PublicBlogPost),
+        (status = 404, description = "Post not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_by_slug(
     Path(slug): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<PublicBlogPost>, ApiError> {

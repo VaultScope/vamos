@@ -1,25 +1,28 @@
 use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 use vaultscope_db::models::BlogPost;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
 use crate::middleware::rbac::check_permission;
+use crate::openapi::{ErrorResponse, SuccessResponse};
 use crate::state::AppState;
 use crate::validation::{validate_required_string, validate_string_length};
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list).post(create))
-        .route("/tags", get(list_tags))
-        .route("/{id}", get(get_one).put(update).delete(delete))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list, create))
+        .routes(routes!(list_tags))
+        .routes(routes!(get_one, update, delete))
 }
 
-#[derive(Serialize)]
-struct BlogPostResp {
+#[derive(Serialize, ToSchema)]
+#[schema(as = AdminBlogPostResp)]
+pub(crate) struct BlogPostResp {
     id: Uuid,
     title: String,
     slug: String,
@@ -57,7 +60,14 @@ impl From<BlogPost> for BlogPostResp {
     }
 }
 
-async fn list_tags(
+#[utoipa::path(
+    get,
+    path = "/tags",
+    tag = "Admin Blog",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List unique blog tags", body = Vec<String>))
+)]
+pub(crate) async fn list_tags(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<String>>, ApiError> {
@@ -92,7 +102,14 @@ struct AdminBlogRow {
     author_last_name: Option<String>,
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Blog",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List blog posts", body = Vec<BlogPostResp>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<BlogPostResp>>, ApiError> {
@@ -138,8 +155,9 @@ async fn list(
     Ok(Json(resps))
 }
 
-#[derive(Deserialize)]
-struct CreatePostPayload {
+#[derive(Deserialize, ToSchema)]
+#[schema(as = AdminCreatePostPayload)]
+pub(crate) struct CreatePostPayload {
     title: String,
     slug: String,
     excerpt: String,
@@ -149,7 +167,18 @@ struct CreatePostPayload {
     tags: Option<Vec<String>>,
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Blog",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreatePostPayload,
+    responses(
+        (status = 200, description = "Blog post created", body = BlogPostResp),
+        (status = 400, description = "Invalid input", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreatePostPayload>,
@@ -188,7 +217,18 @@ async fn create(
     Ok(Json(post.into()))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Blog",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path, description = "Blog post UUID or slug")),
+    responses(
+        (status = 200, description = "Blog post details", body = BlogPostResp),
+        (status = 404, description = "Post not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     Path(id_or_slug): Path<String>,
     State(state): State<AppState>,
@@ -212,7 +252,19 @@ async fn get_one(
     Ok(Json(post.into()))
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Blog",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = String, Path, description = "Blog post UUID or slug")),
+    request_body = CreatePostPayload,
+    responses(
+        (status = 200, description = "Blog post updated", body = BlogPostResp),
+        (status = 404, description = "Post not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     Path(id_or_slug): Path<String>,
     State(state): State<AppState>,
@@ -272,7 +324,18 @@ async fn update(
     Ok(Json(post.into()))
 }
 
-async fn delete(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Admin Blog",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = String, Path, description = "Blog post UUID or slug")),
+    responses(
+        (status = 200, description = "Blog post deleted", body = SuccessResponse),
+        (status = 404, description = "Post not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete(
     auth: AuthAdmin,
     Path(id_or_slug): Path<String>,
     State(state): State<AppState>,

@@ -2,14 +2,16 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::Response;
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use chrono::NaiveDate;
 use serde::Deserialize;
+use utoipa::{IntoParams, ToSchema};
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use crate::validation::{
     validate_greater_than_zero, validate_percentage, validate_positive, validate_required_string,
@@ -17,27 +19,35 @@ use crate::validation::{
 };
 use vaultscope_db::models::{Customer, Invoice, InvoiceLineItem, InvoiceStatus};
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/stats/comprehensive", get(get_comprehensive_stats))
-        .route("/stats", get(get_stats))
-        .route("/", get(list).post(create))
-        .route("/{id}", get(get_one).put(update).delete(delete))
-        .route("/{id}/pdf", get(download_pdf))
-        .route("/{id}/send", axum::routing::post(send))
-        .route("/{id}/mark-paid", axum::routing::post(mark_paid))
-        .route("/{id}/line-items", get(list_line_items))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(get_comprehensive_stats))
+        .routes(routes!(get_stats))
+        .routes(routes!(list, create))
+        .routes(routes!(get_one, update, delete))
+        .routes(routes!(download_pdf))
+        .routes(routes!(send))
+        .routes(routes!(mark_paid))
+        .routes(routes!(list_line_items))
 }
 
-#[derive(Deserialize)]
-struct ListParams {
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct ListParams {
     customer_id: Option<Uuid>,
     status: Option<InvoiceStatus>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Invoices",
+    security(("bearer_auth" = [])),
+    params(ListParams),
+    responses((status = 200, description = "List invoices", body = Vec<Invoice>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
@@ -92,7 +102,18 @@ async fn list(
     Ok(Json(invoices))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Invoices",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Invoice ID")),
+    responses(
+        (status = 200, description = "Invoice details", body = Invoice),
+        (status = 404, description = "Invoice not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -106,16 +127,16 @@ async fn get_one(
     Ok(Json(invoice))
 }
 
-#[derive(Deserialize)]
-struct LineItemInput {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct LineItemInput {
     description: String,
     quantity: i32,
     unit_price: f64,
     service_id: Option<Uuid>,
 }
 
-#[derive(Deserialize)]
-struct CreateInvoice {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CreateInvoice {
     customer_id: Uuid,
     due_date: NaiveDate,
     tax_rate: f64,
@@ -123,7 +144,18 @@ struct CreateInvoice {
     line_items: Vec<LineItemInput>,
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Invoices",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateInvoice,
+    responses(
+        (status = 200, description = "Draft invoice created", body = Invoice),
+        (status = 400, description = "Invalid input", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateInvoice>,
@@ -200,14 +232,26 @@ async fn create(
     Ok(Json(invoice))
 }
 
-#[derive(Deserialize)]
-struct UpdateInvoice {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateInvoice {
     status: Option<InvoiceStatus>,
     due_date: Option<NaiveDate>,
     notes: Option<String>,
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Invoices",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Invoice ID")),
+    request_body = UpdateInvoice,
+    responses(
+        (status = 200, description = "Invoice updated", body = Invoice),
+        (status = 404, description = "Invoice not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -234,7 +278,18 @@ async fn update(
     Ok(Json(invoice))
 }
 
-async fn delete(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Admin Invoices",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Draft invoice ID")),
+    responses(
+        (status = 200, description = "Draft invoice deleted"),
+        (status = 404, description = "Draft invoice not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -253,7 +308,18 @@ async fn delete(
     Ok(Json(()))
 }
 
-async fn send(
+#[utoipa::path(
+    post,
+    path = "/{id}/send",
+    tag = "Admin Invoices",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Draft invoice ID")),
+    responses(
+        (status = 200, description = "Invoice finalized to pending and emailed to customer", body = Invoice),
+        (status = 404, description = "Draft invoice not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn send(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -378,7 +444,15 @@ The VaultScope Billing Team",
     Ok(())
 }
 
-async fn mark_paid(
+#[utoipa::path(
+    post,
+    path = "/{id}/mark-paid",
+    tag = "Admin Invoices",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Invoice ID")),
+    responses((status = 200, description = "Invoice marked paid", body = Invoice))
+)]
+pub(crate) async fn mark_paid(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -399,7 +473,15 @@ async fn mark_paid(
     Ok(Json(invoice))
 }
 
-async fn list_line_items(
+#[utoipa::path(
+    get,
+    path = "/{id}/line-items",
+    tag = "Admin Invoices",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Invoice ID")),
+    responses((status = 200, description = "List invoice line items", body = Vec<InvoiceLineItem>))
+)]
+pub(crate) async fn list_line_items(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(invoice_id): Path<Uuid>,
@@ -415,13 +497,20 @@ async fn list_line_items(
     Ok(Json(items))
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, ToSchema)]
 pub struct InvoiceStats {
     pub unpaid_total: rust_decimal::Decimal,
     pub unpaid_count: i64,
 }
 
-async fn get_stats(
+#[utoipa::path(
+    get,
+    path = "/stats",
+    tag = "Admin Invoices",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "Unpaid invoice totals", body = InvoiceStats))
+)]
+pub(crate) async fn get_stats(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<InvoiceStats>, ApiError> {
@@ -438,7 +527,7 @@ async fn get_stats(
     }))
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, ToSchema)]
 pub struct ComprehensiveStats {
     pub unpaid_invoices: i64,
     pub paid_invoices: i64,
@@ -452,26 +541,33 @@ pub struct ComprehensiveStats {
     pub top_products: Vec<ProductSales>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, ToSchema)]
 pub struct MonthlyRevenue {
     pub month: String,
     pub revenue: rust_decimal::Decimal,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, ToSchema)]
 pub struct ClientSpent {
     pub customer_id: uuid::Uuid,
     pub name: String,
     pub total_spent: rust_decimal::Decimal,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, ToSchema)]
 pub struct ProductSales {
     pub name: String,
     pub count: i64,
 }
 
-async fn get_comprehensive_stats(
+#[utoipa::path(
+    get,
+    path = "/stats/comprehensive",
+    tag = "Admin Invoices",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "Comprehensive billing and revenue analytics", body = ComprehensiveStats))
+)]
+pub(crate) async fn get_comprehensive_stats(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<ComprehensiveStats>, ApiError> {
@@ -625,7 +721,18 @@ async fn get_comprehensive_stats(
     }))
 }
 
-async fn download_pdf(
+#[utoipa::path(
+    get,
+    path = "/{id}/pdf",
+    tag = "Admin Invoices",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Invoice ID")),
+    responses(
+        (status = 200, description = "Rendered PDF invoice", content_type = "application/pdf", body = Vec<u8>),
+        (status = 404, description = "Invoice or customer not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn download_pdf(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

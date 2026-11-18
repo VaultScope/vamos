@@ -1,15 +1,17 @@
 use std::convert::Infallible;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use utoipa::{IntoParams, ToSchema};
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::{BinaryFileUpload, ErrorResponse};
 use crate::state::AppState;
 use crate::validation::{
     validate_required_string, validate_string_length, MAX_SHORT_STRING_LENGTH, MAX_STRING_LENGTH,
@@ -18,27 +20,36 @@ use vaultscope_db::models::{
     ActorType, Ticket, TicketCategory, TicketMessage, TicketPriority, TicketStatus,
 };
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list).post(create))
-        .route("/{id}", get(get_one).put(update))
-        .route("/{id}/messages", get(list_messages).post(create_message))
-        .route(
-            "/{id}/attachments",
-            axum::routing::post(upload_attachment).layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list, create))
+        .routes(routes!(get_one, update))
+        .routes(routes!(list_messages, create_message))
+        .merge(
+            OpenApiRouter::new()
+                .routes(routes!(upload_attachment))
+                .layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
         )
-        .route("/{id}/events", get(ticket_events))
+        .routes(routes!(ticket_events))
 }
 
-#[derive(Deserialize)]
-struct ListParams {
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct ListParams {
     customer_id: Option<Uuid>,
     status: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Tickets",
+    security(("bearer_auth" = [])),
+    params(ListParams),
+    responses((status = 200, description = "List support tickets", body = Vec<Ticket>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
@@ -85,7 +96,18 @@ async fn list(
     Ok(Json(tickets))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Tickets",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Ticket ID")),
+    responses(
+        (status = 200, description = "Ticket details", body = Ticket),
+        (status = 404, description = "Ticket not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -99,8 +121,9 @@ async fn get_one(
     Ok(Json(ticket))
 }
 
-#[derive(Deserialize)]
-struct CreateTicket {
+#[derive(Deserialize, ToSchema)]
+#[schema(as = AdminCreateTicket)]
+pub(crate) struct CreateTicket {
     customer_id: Uuid,
     category: TicketCategory,
     subject: String,
@@ -111,7 +134,18 @@ struct CreateTicket {
     ip: Option<String>,
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Tickets",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateTicket,
+    responses(
+        (status = 200, description = "Ticket created", body = Ticket),
+        (status = 400, description = "Invalid input", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateTicket>,
@@ -144,8 +178,8 @@ async fn create(
     Ok(Json(ticket))
 }
 
-#[derive(Deserialize)]
-struct UpdateTicket {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateTicket {
     subject: Option<String>,
     status: Option<TicketStatus>,
     priority: Option<TicketPriority>,
@@ -153,7 +187,19 @@ struct UpdateTicket {
     related_service_id: Option<Uuid>,
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Tickets",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Ticket ID")),
+    request_body = UpdateTicket,
+    responses(
+        (status = 200, description = "Ticket updated", body = Ticket),
+        (status = 404, description = "Ticket not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -184,7 +230,15 @@ async fn update(
     Ok(Json(ticket))
 }
 
-async fn list_messages(
+#[utoipa::path(
+    get,
+    path = "/{id}/messages",
+    tag = "Admin Tickets",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Ticket ID")),
+    responses((status = 200, description = "List ticket messages", body = Vec<TicketMessage>))
+)]
+pub(crate) async fn list_messages(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(ticket_id): Path<Uuid>,
@@ -200,8 +254,9 @@ async fn list_messages(
     Ok(Json(messages))
 }
 
-#[derive(Deserialize)]
-struct CreateTicketMessage {
+#[derive(Deserialize, ToSchema)]
+#[schema(as = AdminCreateTicketMessage)]
+pub(crate) struct CreateTicketMessage {
     author_id: Uuid,
     author_type: ActorType,
     content: String,
@@ -209,7 +264,8 @@ struct CreateTicketMessage {
     attachments: Option<serde_json::Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
+#[schema(as = AdminAttachmentResponse)]
 pub struct AttachmentResponse {
     pub id: Uuid,
     pub filename: String,
@@ -220,7 +276,20 @@ pub struct AttachmentResponse {
 
 const MAX_ATTACHMENT_SIZE: usize = 10 * 1024 * 1024; // 10MB limit
 
-async fn upload_attachment(
+#[utoipa::path(
+    post,
+    path = "/{id}/attachments",
+    tag = "Admin Tickets",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Ticket ID")),
+    request_body(content = BinaryFileUpload, content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "Uploaded image attachment", body = AttachmentResponse),
+        (status = 400, description = "Invalid image upload", body = ErrorResponse),
+        (status = 404, description = "Ticket not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn upload_attachment(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -307,7 +376,19 @@ async fn upload_attachment(
     Err(ApiError::BadRequest("No file uploaded.".into()))
 }
 
-async fn create_message(
+#[utoipa::path(
+    post,
+    path = "/{id}/messages",
+    tag = "Admin Tickets",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Ticket ID")),
+    request_body = CreateTicketMessage,
+    responses(
+        (status = 200, description = "Ticket message posted", body = TicketMessage),
+        (status = 400, description = "Invalid message content", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create_message(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(ticket_id): Path<Uuid>,
@@ -353,7 +434,18 @@ async fn create_message(
     Ok(Json(message))
 }
 
-async fn ticket_events(
+#[utoipa::path(
+    get,
+    path = "/{id}/events",
+    tag = "Admin Tickets",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Ticket ID")),
+    responses(
+        (status = 200, description = "Server-Sent Events stream of real-time ticket messages", content_type = "text/event-stream", body = String),
+        (status = 404, description = "Ticket not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn ticket_events(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

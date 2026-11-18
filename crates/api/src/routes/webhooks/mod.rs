@@ -1,9 +1,9 @@
 pub mod stripe;
 
-use axum::{routing::post, Router};
+use utoipa_axum::{router::OpenApiRouter, routes};
+
 use crate::state::AppState;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/stripe", post(stripe::handle_stripe_webhook))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(stripe::handle_stripe_webhook))
 }

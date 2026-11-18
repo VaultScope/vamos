@@ -2,27 +2,48 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::Response;
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use rust_decimal::prelude::ToPrimitive;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthCustomer;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use vaultscope_db::models::{Customer, Invoice, InvoiceLineItem, InvoiceStatus};
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list_mine))
-        .route("/{id}/pdf", get(download_pdf))
-        .route("/{id}/create-payment-intent", post(create_invoice_payment_intent))
-        .route("/{id}/pay", post(pay_invoice))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list_mine))
+        .routes(routes!(download_pdf))
+        .routes(routes!(create_invoice_payment_intent))
+        .routes(routes!(pay_invoice))
 }
 
-async fn list_mine(
+#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
+pub struct InvoicePaymentIntentResponse {
+    pub client_secret: String,
+    pub payment_intent_id: String,
+    pub amount: rust_decimal::Decimal,
+    pub invoice_number: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Storefront Invoices",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Customer invoices excluding drafts", body = Vec<Invoice>),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn list_mine(
     auth: AuthCustomer,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Invoice>>, ApiError> {
@@ -35,7 +56,19 @@ async fn list_mine(
     Ok(Json(invoices))
 }
 
-async fn create_invoice_payment_intent(
+#[utoipa::path(
+    post,
+    path = "/{id}/create-payment-intent",
+    tag = "Storefront Invoices",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Invoice ID")),
+    responses(
+        (status = 200, description = "Stripe PaymentIntent client secret for an open invoice", body = InvoicePaymentIntentResponse),
+        (status = 400, description = "Invoice cannot be paid", body = ErrorResponse),
+        (status = 404, description = "Invoice not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create_invoice_payment_intent(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -121,12 +154,25 @@ async fn create_invoice_payment_intent(
     })))
 }
 
-#[derive(Deserialize)]
-struct PayInvoicePayload {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct PayInvoicePayload {
     payment_intent_id: String,
 }
 
-async fn pay_invoice(
+#[utoipa::path(
+    post,
+    path = "/{id}/pay",
+    tag = "Storefront Invoices",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Invoice ID")),
+    request_body = PayInvoicePayload,
+    responses(
+        (status = 200, description = "Verified payment and marked invoice paid", body = Invoice),
+        (status = 400, description = "Payment verification failed or invalid invoice state", body = ErrorResponse),
+        (status = 404, description = "Invoice not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn pay_invoice(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -242,7 +288,18 @@ async fn pay_invoice(
     Ok(Json(updated))
 }
 
-async fn download_pdf(
+#[utoipa::path(
+    get,
+    path = "/{id}/pdf",
+    tag = "Storefront Invoices",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Invoice ID")),
+    responses(
+        (status = 200, description = "Generated invoice PDF", content_type = "application/pdf", body = Vec<u8>),
+        (status = 404, description = "Invoice not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn download_pdf(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

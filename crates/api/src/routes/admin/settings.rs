@@ -1,19 +1,28 @@
 use axum::extract::State;
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::OkResponse;
 use crate::state::AppState;
 use vaultscope_db::models::Setting;
 
-pub fn routes() -> Router<AppState> {
-    Router::new().route("/", get(list).put(update_batch))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(list, update_batch))
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Settings",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List platform settings", body = Vec<Setting>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Setting>>, ApiError> {
@@ -24,13 +33,21 @@ async fn list(
     Ok(Json(settings))
 }
 
-#[derive(Deserialize)]
-struct SettingEntry {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct SettingEntry {
     key: String,
     value: Value,
 }
 
-async fn update_batch(
+#[utoipa::path(
+    put,
+    path = "/",
+    tag = "Admin Settings",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = Vec<SettingEntry>,
+    responses((status = 200, description = "Settings updated", body = OkResponse))
+)]
+pub(crate) async fn update_batch(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(entries): Json<Vec<SettingEntry>>,

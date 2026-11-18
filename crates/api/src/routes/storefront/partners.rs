@@ -1,23 +1,25 @@
 use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Serialize;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use vaultscope_db::models::{Partner, Product};
 
-pub fn routes() -> Router<AppState> {
-    Router::new().route("/{slug}", get(get_by_slug))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(get_by_slug))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct PartnerResponse {
     pub partner: PartnerInfo,
     pub product: Product,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct PartnerInfo {
     pub id: uuid::Uuid,
     pub slug: String,
@@ -31,7 +33,19 @@ pub struct PartnerInfo {
     pub limit_one_per_user: bool,
 }
 
-async fn get_by_slug(
+#[utoipa::path(
+    get,
+    path = "/{slug}",
+    tag = "Storefront Partners",
+    params(
+        ("slug" = String, Path, description = "Partner campaign slug")
+    ),
+    responses(
+        (status = 200, description = "Partner campaign metadata and discounted/trial product", body = PartnerResponse),
+        (status = 404, description = "Partner campaign not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_by_slug(
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> Result<Json<PartnerResponse>, ApiError> {

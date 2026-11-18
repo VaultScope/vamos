@@ -1,21 +1,23 @@
 use axum::extract::State;
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Serialize;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/stats", get(stats))
-        .route("/export/invoices", get(export_invoices))
-        .route("/export/customers", get(export_customers))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(stats))
+        .routes(routes!(export_invoices))
+        .routes(routes!(export_customers))
 }
 
-#[derive(Serialize)]
-struct DashboardStats {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct DashboardStats {
     active_services: i64,
     total_customers: i64,
     open_tickets: i64,
@@ -23,7 +25,17 @@ struct DashboardStats {
     mrr: f64,
 }
 
-async fn stats(
+#[utoipa::path(
+    get,
+    path = "/stats",
+    tag = "Admin Dashboard",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Admin dashboard summary metrics", body = DashboardStats),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn stats(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<DashboardStats>, ApiError> {
@@ -65,7 +77,17 @@ async fn stats(
     }))
 }
 
-async fn export_invoices(
+#[utoipa::path(
+    get,
+    path = "/export/invoices",
+    tag = "Admin Dashboard",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Invoices CSV export", content_type = "text/csv", body = String),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn export_invoices(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
@@ -93,7 +115,17 @@ async fn export_invoices(
     ))
 }
 
-async fn export_customers(
+#[utoipa::path(
+    get,
+    path = "/export/customers",
+    tag = "Admin Dashboard",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Customers CSV export", content_type = "text/csv", body = String),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn export_customers(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {

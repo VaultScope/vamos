@@ -1,21 +1,30 @@
 use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use vaultscope_db::models::Department;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list).post(create))
-        .route("/{id}", get(get_one).put(update).delete(delete))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list, create))
+        .routes(routes!(get_one, update, delete))
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Departments",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List support departments", body = Vec<Department>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Department>>, ApiError> {
@@ -26,7 +35,18 @@ async fn list(
     Ok(Json(departments))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Departments",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Department ID")),
+    responses(
+        (status = 200, description = "Support department details", body = Department),
+        (status = 404, description = "Department not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -40,14 +60,22 @@ async fn get_one(
     Ok(Json(department))
 }
 
-#[derive(Deserialize)]
-struct CreateDepartment {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CreateDepartment {
     name: String,
     mailbox: String,
     default_assignee_id: Option<Uuid>,
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Departments",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateDepartment,
+    responses((status = 200, description = "Created support department", body = Department))
+)]
+pub(crate) async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateDepartment>,
@@ -67,14 +95,26 @@ async fn create(
     Ok(Json(department))
 }
 
-#[derive(Deserialize)]
-struct UpdateDepartment {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateDepartment {
     name: Option<String>,
     mailbox: Option<String>,
     default_assignee_id: Option<Uuid>,
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Departments",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Department ID")),
+    request_body = UpdateDepartment,
+    responses(
+        (status = 200, description = "Updated support department", body = Department),
+        (status = 404, description = "Department not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -100,7 +140,18 @@ async fn update(
     Ok(Json(department))
 }
 
-async fn delete(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Admin Departments",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Department ID")),
+    responses(
+        (status = 200, description = "Department deleted"),
+        (status = 404, description = "Department not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

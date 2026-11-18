@@ -1,11 +1,12 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 // --- Enum types (mirroring Postgres enums) ---
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "customer_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum CustomerStatus {
@@ -14,7 +15,7 @@ pub enum CustomerStatus {
     Banned,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "service_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceStatus {
@@ -24,7 +25,7 @@ pub enum ServiceStatus {
     Terminated,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "invoice_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum InvoiceStatus {
@@ -35,7 +36,7 @@ pub enum InvoiceStatus {
     Void,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "ticket_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum TicketStatus {
@@ -45,7 +46,7 @@ pub enum TicketStatus {
     Closed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "ticket_priority", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum TicketPriority {
@@ -55,7 +56,7 @@ pub enum TicketPriority {
     Critical,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "ticket_category", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum TicketCategory {
@@ -64,7 +65,7 @@ pub enum TicketCategory {
     Dmca,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "job_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
@@ -75,7 +76,7 @@ pub enum JobStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "billing_cycle", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum BillingCycle {
@@ -85,7 +86,7 @@ pub enum BillingCycle {
 }
 
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "actor_type", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum ActorType {
@@ -94,7 +95,7 @@ pub enum ActorType {
     System,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "email_delivery_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum EmailDeliveryStatus {
@@ -104,7 +105,7 @@ pub enum EmailDeliveryStatus {
     Queued,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "coupon_discount_type", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum CouponDiscountType {
@@ -112,7 +113,7 @@ pub enum CouponDiscountType {
     Fixed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "coupon_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum CouponStatus {
@@ -124,7 +125,7 @@ pub enum CouponStatus {
 
 // --- Row structs ---
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Role {
     pub id: Uuid,
     pub name: String,
@@ -134,7 +135,7 @@ pub struct Role {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Staff {
     pub id: Uuid,
     pub external_id: String,
@@ -153,7 +154,7 @@ pub struct Staff {
     pub password_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Customer {
     pub id: Uuid,
     pub external_id: String,
@@ -185,7 +186,7 @@ pub struct Customer {
     pub username: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Product {
     pub id: Uuid,
     pub name: String,
@@ -211,7 +212,7 @@ pub struct Product {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Service {
     pub id: Uuid,
     pub customer_id: Uuid,
@@ -241,7 +242,7 @@ pub struct Service {
     pub quota_gb: Option<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, ToSchema)]
 pub struct InvoiceBillingSnapshot {
     #[serde(default)]
     pub name: String,
@@ -267,7 +268,7 @@ pub struct InvoiceBillingSnapshot {
     pub captured_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Invoice {
     pub id: Uuid,
     pub invoice_number: String,
@@ -283,6 +284,7 @@ pub struct Invoice {
     pub stripe_payment_intent_id: Option<String>,
     pub notes: String,
     #[serde(default)]
+    #[schema(value_type = Option<InvoiceBillingSnapshot>)]
     pub billing_snapshot: Option<sqlx::types::Json<InvoiceBillingSnapshot>>,
     #[serde(default)]
     pub tax_regime: String,
@@ -298,7 +300,7 @@ pub struct Invoice {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct InvoiceLineItem {
     pub id: Uuid,
     pub invoice_id: Uuid,
@@ -310,7 +312,7 @@ pub struct InvoiceLineItem {
     pub sort_order: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Coupon {
     pub id: Uuid,
     pub code: String,
@@ -324,7 +326,7 @@ pub struct Coupon {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct TaxRate {
     pub id: Uuid,
     pub name: String,
@@ -333,7 +335,7 @@ pub struct TaxRate {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Ticket {
     pub id: Uuid,
     pub ticket_number: String,
@@ -350,7 +352,7 @@ pub struct Ticket {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct TicketMessage {
     pub id: Uuid,
     pub ticket_id: Uuid,
@@ -363,7 +365,7 @@ pub struct TicketMessage {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Department {
     pub id: Uuid,
     pub name: String,
@@ -372,7 +374,7 @@ pub struct Department {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Job {
     pub id: Uuid,
     pub task: String,
@@ -391,7 +393,7 @@ pub struct Job {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct ActivityLog {
     pub id: Uuid,
     pub actor_id: Option<Uuid>,
@@ -404,7 +406,7 @@ pub struct ActivityLog {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Notification {
     pub id: Uuid,
     pub category: String,
@@ -417,7 +419,7 @@ pub struct Notification {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Mailbox {
     pub id: Uuid,
     pub name: String,
@@ -429,7 +431,7 @@ pub struct Mailbox {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct EmailTemplate {
     pub id: Uuid,
     pub name: String,
@@ -443,7 +445,7 @@ pub struct EmailTemplate {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct EmailLog {
     pub id: Uuid,
     pub recipient: String,
@@ -454,14 +456,14 @@ pub struct EmailLog {
     pub sent_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Setting {
     pub key: String,
     pub value: serde_json::Value,
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct ServiceForm {
     pub id: Uuid,
     pub name: String,
@@ -471,7 +473,7 @@ pub struct ServiceForm {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct InternalTool {
     pub id: Uuid,
     pub name: String,
@@ -480,7 +482,7 @@ pub struct InternalTool {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct BlogPost {
     pub id: uuid::Uuid,
     pub title: String,
@@ -496,7 +498,7 @@ pub struct BlogPost {
     pub tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct CustomerBillingEmail {
     pub id: Uuid,
     pub customer_id: Uuid,
@@ -507,7 +509,7 @@ pub struct CustomerBillingEmail {
     pub verified_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Partner {
     pub id: Uuid,
     pub slug: String,
@@ -528,5 +530,62 @@ pub struct Partner {
     pub commission_fixed_eur: Option<rust_decimal::Decimal>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
+pub struct ReliableSiteServer {
+    pub product_id: i32,
+    pub description: String,
+    pub data_center: String,
+    pub detail: String,
+    pub stock: i32,
+    pub is_preorder: bool,
+    pub setup_1_hour: rust_decimal::Decimal,
+    pub setup_1_month: rust_decimal::Decimal,
+    pub setup_3_month: rust_decimal::Decimal,
+    pub setup_6_month: rust_decimal::Decimal,
+    pub setup_12_month: rust_decimal::Decimal,
+    pub setup_24_month: rust_decimal::Decimal,
+    pub setup_36_month: rust_decimal::Decimal,
+    pub recurring_1_hour: rust_decimal::Decimal,
+    pub recurring_1_month: rust_decimal::Decimal,
+    pub recurring_3_month: rust_decimal::Decimal,
+    pub recurring_6_month: rust_decimal::Decimal,
+    pub recurring_12_month: rust_decimal::Decimal,
+    pub recurring_24_month: rust_decimal::Decimal,
+    pub recurring_36_month: rust_decimal::Decimal,
+    pub vaultscope_product_id: Option<Uuid>,
+    pub reseller_promo_code: Option<String>,
+    pub synced_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
+pub struct ReliableSiteAddonGroup {
+    pub group_id: i32,
+    pub description: String,
+    pub sort_order: i32,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
+pub struct ReliableSiteAddon {
+    pub addon_id: i32,
+    pub group_id: i32,
+    pub addon_description: String,
+    pub sort_order: i32,
+    pub setup_1_hour: rust_decimal::Decimal,
+    pub setup_1_month: rust_decimal::Decimal,
+    pub setup_3_month: rust_decimal::Decimal,
+    pub setup_6_month: rust_decimal::Decimal,
+    pub setup_12_month: rust_decimal::Decimal,
+    pub setup_24_month: rust_decimal::Decimal,
+    pub setup_36_month: rust_decimal::Decimal,
+    pub recurring_1_hour: rust_decimal::Decimal,
+    pub recurring_1_month: rust_decimal::Decimal,
+    pub recurring_3_month: rust_decimal::Decimal,
+    pub recurring_6_month: rust_decimal::Decimal,
+    pub recurring_12_month: rust_decimal::Decimal,
+    pub recurring_24_month: rust_decimal::Decimal,
+    pub recurring_36_month: rust_decimal::Decimal,
 }
 

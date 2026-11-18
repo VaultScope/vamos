@@ -63,6 +63,20 @@ fn verify_stripe_signature(payload: &str, sig_header: &str, secret: &str) -> Res
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/stripe",
+    tag = "Webhooks",
+    params(
+        ("Stripe-Signature" = String, Header, description = "Stripe webhook HMAC signature header")
+    ),
+    request_body(content = String, content_type = "application/json", description = "Raw Stripe webhook event JSON payload"),
+    responses(
+        (status = 200, description = "Webhook processed"),
+        (status = 400, description = "Invalid signature or malformed JSON"),
+        (status = 500, description = "Webhook secret not configured")
+    )
+)]
 pub async fn handle_stripe_webhook(
     State(state): State<AppState>,
     request: Request,

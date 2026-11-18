@@ -32,11 +32,12 @@ struct RenewalRow {
     cancel_at_period_end: bool,
     product_category: String,
     provider: String,
-    is_trial: bool,
     product_price: rust_decimal::Decimal,
     partner_id: Option<Uuid>,
     product_quota_gb: Option<i32>,
     partner_quota_gb_override: Option<i32>,
+    is_trial: bool,
+    config: serde_json::Value,
 }
 
 #[derive(sqlx::FromRow)]
@@ -244,7 +245,7 @@ impl BillingRunner {
             r#"
             SELECT 
                 s.id, s.customer_id, s.price, s.name, s.provider_resource_id, s.cancel_at_period_end,
-                s.is_trial, s.partner_id,
+                s.is_trial, s.partner_id, s.config,
                 p.category as product_category, p.provider, p.price as product_price,
                 p.quota_gb as product_quota_gb,
                 part.quota_gb_override as partner_quota_gb_override
@@ -369,8 +370,17 @@ impl BillingRunner {
                 created_invoice_id = Some(invoice_id);
             }
 
-            // Add 30 days to next_due (monthly renewal)
-            let next_due = Utc::now() + chrono::Duration::days(30);
+            let renewal_days = if row.provider == "reliablesite" {
+                row.config
+                    .get("billing_cycle")
+                    .and_then(|v| v.as_str())
+                    .and_then(vaultscope_connectors::reliablesite::OrderBillingCycle::from_str_loose)
+                    .map(|c| c.period_days())
+                    .unwrap_or(30)
+            } else {
+                30
+            };
+            let next_due = Utc::now() + chrono::Duration::days(renewal_days);
 
             let target_quota_gb = row
                 .partner_quota_gb_override

@@ -1,24 +1,35 @@
 use axum::extract::State;
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Serialize;
 use serde_json::Value;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use vaultscope_db::models::Setting;
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct StorefrontConfig {
     pub stripe_public_key: Option<String>,
     pub custom_domain: Option<String>,
 }
 
-pub fn routes() -> Router<AppState> {
-    Router::new().route("/", get(get_config))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(get_config))
 }
 
-async fn get_config(State(state): State<AppState>) -> Result<Json<StorefrontConfig>, ApiError> {
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Storefront Config",
+    responses(
+        (status = 200, description = "Public storefront configuration", body = StorefrontConfig),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_config(State(state): State<AppState>) -> Result<Json<StorefrontConfig>, ApiError> {
     let settings: Vec<Setting> = sqlx::query_as(
         "SELECT * FROM settings WHERE key IN ('stripe_public_key', 'stripe_sandbox_public_key', 'stripe_test_mode_enabled', 'custom_domain')"
     )

@@ -1,31 +1,50 @@
 use axum::extract::{Path, State};
-use axum::routing::{get, post};
-use axum::{Json, Router};
-use serde::Deserialize;
+use axum::Json;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthCustomer;
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkMessageResponse, OkResponse};
 use crate::state::AppState;
 use vaultscope_common::types::PowerAction;
 use vaultscope_db::models::Service;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list_mine))
-        .route("/{id}", get(get_one).delete(delete_service))
-        .route("/{id}/start", post(power_start))
-        .route("/{id}/stop", post(power_stop))
-        .route("/{id}/restart", post(power_restart))
-        .route("/{id}/reinstall", post(reinstall))
-        .route("/{id}/console", post(vnc_console))
-        .route("/{id}/ipmi", post(ipmi_access).get(ipmi_access))
-        .route("/{id}/cancel", post(cancel_service))
-        .route("/{id}/uncancel", post(uncancel_service))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list_mine))
+        .routes(routes!(get_one, delete_service))
+        .routes(routes!(power_start))
+        .routes(routes!(power_stop))
+        .routes(routes!(power_restart))
+        .routes(routes!(reinstall))
+        .routes(routes!(vnc_console))
+        .routes(routes!(ipmi_access, ipmi_access_get))
+        .routes(routes!(cancel_service))
+        .routes(routes!(uncancel_service))
 }
 
-async fn list_mine(
+#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
+pub struct JobQueuedResponse {
+    pub job_id: Uuid,
+    pub status: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Storefront Services",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Customer services", body = Vec<Service>),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn list_mine(
     auth: AuthCustomer,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Service>>, ApiError> {
@@ -34,10 +53,26 @@ async fn list_mine(
             .bind(auth.0.sub)
             .fetch_all(&state.db)
             .await?;
-    Ok(Json(services))
+    Ok(Json(
+        services
+            .into_iter()
+            .map(crate::reliablesite_catalog::sanitize_service_for_storefront)
+            .collect(),
+    ))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Storefront Services",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "Customer service details", body = Service),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -49,10 +84,23 @@ async fn get_one(
             .fetch_optional(&state.db)
             .await?
             .ok_or(ApiError::NotFound("service not found".into()))?;
-    Ok(Json(service))
+    Ok(Json(
+        crate::reliablesite_catalog::sanitize_service_for_storefront(service),
+    ))
 }
 
-async fn power_start(
+#[utoipa::path(
+    post,
+    path = "/{id}/start",
+    tag = "Storefront Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "Power-on job queued", body = JobQueuedResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn power_start(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -60,7 +108,18 @@ async fn power_start(
     power_action_helper(auth, state, id, PowerAction::Start).await
 }
 
-async fn power_stop(
+#[utoipa::path(
+    post,
+    path = "/{id}/stop",
+    tag = "Storefront Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "Power-off job queued", body = JobQueuedResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn power_stop(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -68,7 +127,18 @@ async fn power_stop(
     power_action_helper(auth, state, id, PowerAction::Stop).await
 }
 
-async fn power_restart(
+#[utoipa::path(
+    post,
+    path = "/{id}/restart",
+    tag = "Storefront Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "Reboot job queued", body = JobQueuedResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn power_restart(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -136,12 +206,25 @@ async fn power_action_helper(
     Ok(Json(json!({ "job_id": job_id, "status": "queued" })))
 }
 
-#[derive(Deserialize)]
-struct ReinstallPayload {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct ReinstallPayload {
     os: String,
 }
 
-async fn reinstall(
+#[utoipa::path(
+    post,
+    path = "/{id}/reinstall",
+    tag = "Storefront Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    request_body = ReinstallPayload,
+    responses(
+        (status = 200, description = "OS reinstall job queued", body = JobQueuedResponse),
+        (status = 400, description = "Service not yet provisioned", body = ErrorResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn reinstall(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -182,7 +265,19 @@ async fn reinstall(
     Ok(Json(json!({ "job_id": job_id, "status": "queued" })))
 }
 
-async fn delete_service(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Storefront Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "Service deleted/terminated", body = OkResponse),
+        (status = 400, description = "Cannot delete a running service", body = ErrorResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete_service(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -228,14 +323,27 @@ async fn delete_service(
     Ok(Json(json!({ "ok": true })))
 }
 
-#[derive(Deserialize)]
-struct CancelServicePayload {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CancelServicePayload {
     mode: String,
     reason: Option<String>,
     feedback: Option<String>,
 }
 
-async fn cancel_service(
+#[utoipa::path(
+    post,
+    path = "/{id}/cancel",
+    tag = "Storefront Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    request_body = CancelServicePayload,
+    responses(
+        (status = 200, description = "Cancellation processed or scheduled", body = OkMessageResponse),
+        (status = 400, description = "Service already terminated", body = ErrorResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn cancel_service(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -311,7 +419,19 @@ async fn cancel_service(
     }
 }
 
-async fn uncancel_service(
+#[utoipa::path(
+    post,
+    path = "/{id}/uncancel",
+    tag = "Storefront Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "Pending cancellation revoked", body = OkMessageResponse),
+        (status = 400, description = "Cannot restore a terminated service", body = ErrorResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn uncancel_service(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -364,12 +484,24 @@ async fn send_cancellation_email(state: &AppState, email_to: &str, service_name:
     }
 }
 
-#[derive(Deserialize, Default)]
-struct IpmiPayload {
+#[derive(Deserialize, Default, ToSchema)]
+pub(crate) struct IpmiPayload {
     client_ip: Option<String>,
 }
 
-async fn ipmi_access(
+#[utoipa::path(
+    post,
+    path = "/{id}/ipmi",
+    tag = "Storefront Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    request_body = Option<IpmiPayload>,
+    responses(
+        (status = 200, description = "IPMI / KVM session details", body = Value),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn ipmi_access(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -387,28 +519,64 @@ async fn ipmi_access(
     ipmi_access_inner(&state, &service, client_ip.as_deref()).await
 }
 
+#[utoipa::path(
+    get,
+    path = "/{id}/ipmi",
+    tag = "Storefront Services",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "IPMI / KVM session details", body = Value),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn ipmi_access_get(
+    auth: AuthCustomer,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    ipmi_access(auth, State(state), Path(id), None).await
+}
+
 async fn ipmi_access_inner(
     state: &AppState,
     service: &Service,
     client_ip: Option<&str>,
 ) -> Result<Json<Value>, ApiError> {
     let resource_id = if service.provider_resource_id.is_empty() {
-        format!("rs-ds-{}", &service.id.to_string()[..8])
+        format!("ds-{}", &service.id.to_string()[..8])
     } else {
         service.provider_resource_id.clone()
     };
 
-    let api_key = state.config.reliablesite_api_key.as_deref().unwrap_or("").trim().to_string();
-    let base_url = state.config.reliablesite_api_url.as_deref().unwrap_or("https://api.reliablesite.net").trim().to_string();
-    let rs = vaultscope_connectors::reliablesite::ReliableSite::new(api_key, base_url);
+    let rs = state.config.reliablesite_connector();
 
-    let session = rs.request_ipmi_session(&resource_id, client_ip).await
+    let mut session = rs.request_ipmi_session(&resource_id, client_ip).await
         .map_err(|e| ApiError::Internal(format!("Failed to generate IPMI session: {e}")))?;
+
+    if let Some(obj) = session.as_object_mut() {
+        obj.insert(
+            "provider".to_string(),
+            Value::String("vaultscope_bmc".to_string()),
+        );
+    }
 
     Ok(Json(session))
 }
 
-async fn vnc_console(
+#[utoipa::path(
+    post,
+    path = "/{id}/console",
+    tag = "Storefront Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "VNC or IPMI console session payload", body = Value),
+        (status = 400, description = "Service is not running or not provisioned", body = ErrorResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn vnc_console(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

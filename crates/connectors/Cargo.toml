@@ -10,12 +10,16 @@ async-trait = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rust_decimal = { workspace = true }
+roxmltree = "0.20"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+tokio = { workspace = true }
+utoipa = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+axum = { workspace = true }
 
 

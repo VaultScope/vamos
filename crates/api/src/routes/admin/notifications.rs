@@ -1,22 +1,33 @@
 use axum::extract::{Path, State};
-use axum::routing::{get, put};
-use axum::{Json, Router};
+use axum::Json;
 use serde_json::{json, Value};
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkResponse};
 use crate::state::AppState;
 use vaultscope_db::models::Notification;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list))
-        .route("/{id}/read", put(mark_read))
-        .route("/{id}/resolve", put(resolve))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list))
+        .routes(routes!(mark_read))
+        .routes(routes!(resolve))
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Notifications",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Admin notifications", body = Vec<Notification>),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Notification>>, ApiError> {
@@ -28,7 +39,15 @@ async fn list(
     Ok(Json(notifications))
 }
 
-async fn mark_read(
+#[utoipa::path(
+    put,
+    path = "/{id}/read",
+    tag = "Admin Notifications",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Notification ID")),
+    responses((status = 200, description = "Notification marked read", body = OkResponse))
+)]
+pub(crate) async fn mark_read(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -41,7 +60,15 @@ async fn mark_read(
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn resolve(
+#[utoipa::path(
+    put,
+    path = "/{id}/resolve",
+    tag = "Admin Notifications",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Notification ID")),
+    responses((status = 200, description = "Notification resolved", body = OkResponse))
+)]
+pub(crate) async fn resolve(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

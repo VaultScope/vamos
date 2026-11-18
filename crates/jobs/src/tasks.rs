@@ -43,8 +43,19 @@ async fn provision(
         .request_payload
         .as_ref()
         .ok_or(ConnectorError::BadConfig)?;
-    let params: ProvisionParams =
+    let mut params: ProvisionParams =
         serde_json::from_value(payload.clone()).map_err(|e| ConnectorError::Api(e.to_string()))?;
+
+    if params.extra.get("idempotency_key").is_none() {
+        if let Some(obj) = params.extra.as_object_mut() {
+            obj.insert(
+                "idempotency_key".to_string(),
+                serde_json::Value::String(job.id.to_string()),
+            );
+        } else {
+            params.extra = serde_json::json!({ "idempotency_key": job.id.to_string() });
+        }
+    }
 
     info!(connector = connector.name(), server = %params.name, "provisioning server");
     let result = connector.provision(&params).await?;

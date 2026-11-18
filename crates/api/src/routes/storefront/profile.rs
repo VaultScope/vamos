@@ -1,29 +1,41 @@
 use axum::extract::{Path, State};
-use axum::routing::{get, post, delete};
-use axum::{Json, Router};
-use serde::Deserialize;
+use axum::Json;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthCustomer;
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkMessageResponse, OkResponse};
 use crate::state::AppState;
 use vaultscope_db::models::{Customer, CustomerBillingEmail};
 use totp_rs::{Algorithm, Secret, TOTP};
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(get_profile).put(update_profile).delete(delete_own_account))
-        .route("/billing-emails", get(list_billing_emails).post(add_billing_email))
-        .route("/billing-emails/{id}", delete(delete_billing_email))
-        .route("/billing-emails/{id}/resend", post(resend_billing_email_verification))
-        .route("/mfa/setup", post(setup_mfa))
-        .route("/mfa/enable", post(enable_mfa))
-        .route("/mfa/disable", post(disable_mfa))
-        .route("/verify-vat", post(verify_vat))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(get_profile, update_profile, delete_own_account))
+        .routes(routes!(list_billing_emails, add_billing_email))
+        .routes(routes!(delete_billing_email))
+        .routes(routes!(resend_billing_email_verification))
+        .routes(routes!(setup_mfa))
+        .routes(routes!(enable_mfa))
+        .routes(routes!(disable_mfa))
+        .routes(routes!(verify_vat))
 }
 
-async fn get_profile(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Storefront Profile",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Customer profile details", body = ProfileResponse),
+        (status = 404, description = "Customer not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_profile(
     auth: AuthCustomer,
     State(state): State<AppState>,
 ) -> Result<Json<ProfileResponse>, ApiError> {
@@ -56,8 +68,8 @@ async fn get_profile(
 
 /// A filtered response that does NOT expose internal admin fields
 /// like notes, stripe_customer_id, or status.
-#[derive(serde::Serialize)]
-struct ProfileResponse {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ProfileResponse {
     id: uuid::Uuid,
     username: String,
     name: String,
@@ -77,8 +89,8 @@ struct ProfileResponse {
     last_login: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Deserialize)]
-struct UpdateProfile {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateProfile {
     username: Option<String>,
     name: Option<String>,
     phone: Option<String>,
@@ -90,7 +102,18 @@ struct UpdateProfile {
     vat_id: Option<String>,
 }
 
-async fn update_profile(
+#[utoipa::path(
+    put,
+    path = "/",
+    tag = "Storefront Profile",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = UpdateProfile,
+    responses(
+        (status = 200, description = "Updated customer profile", body = ProfileResponse),
+        (status = 400, description = "Validation error", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update_profile(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Json(payload): Json<UpdateProfile>,
@@ -181,12 +204,21 @@ async fn update_profile(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct AddBillingEmailPayload {
     pub email: String,
 }
 
-async fn list_billing_emails(
+#[utoipa::path(
+    get,
+    path = "/billing-emails",
+    tag = "Storefront Profile",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "List customer billing CC email addresses", body = Vec<CustomerBillingEmail>)
+    )
+)]
+pub(crate) async fn list_billing_emails(
     auth: AuthCustomer,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<CustomerBillingEmail>>, ApiError> {
@@ -200,7 +232,18 @@ async fn list_billing_emails(
     Ok(Json(emails))
 }
 
-async fn add_billing_email(
+#[utoipa::path(
+    post,
+    path = "/billing-emails",
+    tag = "Storefront Profile",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = AddBillingEmailPayload,
+    responses(
+        (status = 200, description = "Added billing CC email address", body = CustomerBillingEmail),
+        (status = 400, description = "Invalid or disallowed billing email", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn add_billing_email(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Json(payload): Json<AddBillingEmailPayload>,
@@ -283,7 +326,18 @@ async fn add_billing_email(
     Ok(Json(billing_email))
 }
 
-async fn delete_billing_email(
+#[utoipa::path(
+    delete,
+    path = "/billing-emails/{id}",
+    tag = "Storefront Profile",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Billing email ID")),
+    responses(
+        (status = 200, description = "Billing email removed", body = OkResponse),
+        (status = 404, description = "Billing email not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete_billing_email(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -302,7 +356,18 @@ async fn delete_billing_email(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn resend_billing_email_verification(
+#[utoipa::path(
+    post,
+    path = "/billing-emails/{id}/resend",
+    tag = "Storefront Profile",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Billing email ID")),
+    responses(
+        (status = 200, description = "Verification email resent", body = OkMessageResponse),
+        (status = 404, description = "Billing email not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn resend_billing_email_verification(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -352,23 +417,62 @@ async fn resend_billing_email_verification(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct MfaEnablePayload {
     pub code: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct MfaDisablePayload {
     pub code: Option<String>,
     pub password: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct VerifyVatPayload {
     pub vat_id: String,
 }
 
-async fn setup_mfa(
+#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
+pub struct MfaSetupResponse {
+    pub secret: String,
+    pub qr_url: String,
+    pub qr_base64: String,
+    pub url: String,
+}
+
+#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
+pub struct MfaEnableResponse {
+    pub ok: bool,
+    pub message: String,
+    pub recovery_codes: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
+pub struct VerifyVatResponse {
+    pub valid: bool,
+    pub vat_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub company_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    pub message: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/mfa/setup",
+    tag = "Storefront Profile",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    responses(
+        (status = 200, description = "Generated TOTP secret and QR code payload", body = MfaSetupResponse),
+        (status = 400, description = "2FA already enabled", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn setup_mfa(
     auth: AuthCustomer,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -427,7 +531,18 @@ fn hash_recovery_code(normalized: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-async fn enable_mfa(
+#[utoipa::path(
+    post,
+    path = "/mfa/enable",
+    tag = "Storefront Profile",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = MfaEnablePayload,
+    responses(
+        (status = 200, description = "2FA enabled with single-use recovery codes", body = MfaEnableResponse),
+        (status = 400, description = "Invalid verification code or setup not initiated", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn enable_mfa(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Json(payload): Json<MfaEnablePayload>,
@@ -513,7 +628,18 @@ async fn enable_mfa(
     })))
 }
 
-async fn disable_mfa(
+#[utoipa::path(
+    post,
+    path = "/mfa/disable",
+    tag = "Storefront Profile",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = MfaDisablePayload,
+    responses(
+        (status = 200, description = "2FA disabled", body = OkMessageResponse),
+        (status = 400, description = "Invalid password, TOTP code, or recovery code", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn disable_mfa(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Json(payload): Json<MfaDisablePayload>,
@@ -610,7 +736,18 @@ async fn disable_mfa(
     })))
 }
 
-async fn verify_vat(
+#[utoipa::path(
+    post,
+    path = "/verify-vat",
+    tag = "Storefront Profile",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = VerifyVatPayload,
+    responses(
+        (status = 200, description = "EU VIES VAT verification result", body = VerifyVatResponse),
+        (status = 400, description = "Malformed VAT ID", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn verify_vat(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Json(payload): Json<VerifyVatPayload>,
@@ -693,7 +830,17 @@ async fn verify_vat(
     }
 }
 
-async fn delete_own_account(
+#[utoipa::path(
+    delete,
+    path = "/",
+    tag = "Storefront Profile",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    responses(
+        (status = 200, description = "Customer account deleted", body = OkMessageResponse),
+        (status = 400, description = "Active services prevent account deletion", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete_own_account(
     auth: AuthCustomer,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

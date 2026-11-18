@@ -1,21 +1,30 @@
 use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use vaultscope_db::models::InternalTool;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list).post(create))
-        .route("/{id}", get(get_one).put(update).delete(delete))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list, create))
+        .routes(routes!(get_one, update, delete))
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Internal Tools",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List internal admin links/tools", body = Vec<InternalTool>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<InternalTool>>, ApiError> {
@@ -27,7 +36,18 @@ async fn list(
     Ok(Json(tools))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Internal Tools",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Internal tool ID")),
+    responses(
+        (status = 200, description = "Internal tool details", body = InternalTool),
+        (status = 404, description = "Internal tool not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -41,14 +61,22 @@ async fn get_one(
     Ok(Json(tool))
 }
 
-#[derive(Deserialize)]
-struct CreateInternalTool {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CreateInternalTool {
     name: String,
     url: String,
     required_permission: String,
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Internal Tools",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateInternalTool,
+    responses((status = 200, description = "Created internal tool", body = InternalTool))
+)]
+pub(crate) async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateInternalTool>,
@@ -68,14 +96,26 @@ async fn create(
     Ok(Json(tool))
 }
 
-#[derive(Deserialize)]
-struct UpdateInternalTool {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateInternalTool {
     name: Option<String>,
     url: Option<String>,
     required_permission: Option<String>,
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Internal Tools",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Internal tool ID")),
+    request_body = UpdateInternalTool,
+    responses(
+        (status = 200, description = "Updated internal tool", body = InternalTool),
+        (status = 404, description = "Internal tool not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -101,7 +141,18 @@ async fn update(
     Ok(Json(tool))
 }
 
-async fn delete(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Admin Internal Tools",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Internal tool ID")),
+    responses(
+        (status = 200, description = "Internal tool deleted"),
+        (status = 404, description = "Internal tool not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

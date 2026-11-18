@@ -1,33 +1,43 @@
 use axum::extract::{Path, Query, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
+use utoipa::{IntoParams, ToSchema};
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use vaultscope_db::models::Service;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list).post(create))
-        .route("/{id}", get(get_one))
-        .route("/{id}/suspend", axum::routing::post(suspend))
-        .route("/{id}/reactivate", axum::routing::post(reactivate))
-        .route("/{id}/terminate", axum::routing::post(terminate))
-        .route("/{id}/ipmi", axum::routing::post(admin_ipmi).get(admin_ipmi))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list, create))
+        .routes(routes!(get_one))
+        .routes(routes!(suspend))
+        .routes(routes!(reactivate))
+        .routes(routes!(terminate))
+        .routes(routes!(admin_ipmi, admin_ipmi_get))
 }
 
-#[derive(Deserialize)]
-struct ListParams {
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct ListParams {
     customer_id: Option<Uuid>,
     status: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Services",
+    security(("bearer_auth" = [])),
+    params(ListParams),
+    responses((status = 200, description = "List customer services", body = Vec<Service>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
@@ -74,7 +84,18 @@ async fn list(
     Ok(Json(services))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Services",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "Service details", body = Service),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -88,7 +109,7 @@ async fn get_one(
     Ok(Json(service))
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 pub struct CreateService {
     pub customer_id: uuid::Uuid,
     pub product_id: uuid::Uuid,
@@ -99,6 +120,14 @@ pub struct CreateService {
     pub is_trial: Option<bool>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateService,
+    responses((status = 200, description = "Manual service created", body = Service))
+)]
 pub async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
@@ -142,6 +171,17 @@ pub async fn create(
     Ok(axum::Json(service))
 }
 
+#[utoipa::path(
+    post,
+    path = "/{id}/suspend",
+    tag = "Admin Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "Service suspended", body = Service),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
 pub async fn suspend(
     auth: AuthAdmin,
     State(state): State<AppState>,
@@ -158,6 +198,17 @@ pub async fn suspend(
     Ok(axum::Json(service))
 }
 
+#[utoipa::path(
+    post,
+    path = "/{id}/reactivate",
+    tag = "Admin Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "Service reactivated", body = Service),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
 pub async fn reactivate(
     auth: AuthAdmin,
     State(state): State<AppState>,
@@ -174,6 +225,17 @@ pub async fn reactivate(
     Ok(axum::Json(service))
 }
 
+#[utoipa::path(
+    post,
+    path = "/{id}/terminate",
+    tag = "Admin Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "Service terminated", body = Service),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
 pub async fn terminate(
     auth: AuthAdmin,
     State(state): State<AppState>,
@@ -190,6 +252,17 @@ pub async fn terminate(
     Ok(axum::Json(service))
 }
 
+#[utoipa::path(
+    post,
+    path = "/{id}/ipmi",
+    tag = "Admin Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "IPMI KVM session details", body = serde_json::Value),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
 pub async fn admin_ipmi(
     auth: AuthAdmin,
     State(state): State<AppState>,
@@ -210,13 +283,30 @@ pub async fn admin_ipmi(
         service.provider_resource_id.clone()
     };
 
-    let api_key = state.config.reliablesite_api_key.as_deref().unwrap_or("").trim().to_string();
-    let base_url = state.config.reliablesite_api_url.as_deref().unwrap_or("https://api.reliablesite.net").trim().to_string();
-    let rs = vaultscope_connectors::reliablesite::ReliableSite::new(api_key, base_url);
+    let rs = state.config.reliablesite_connector();
 
     let session = rs.request_ipmi_session(&resource_id, Some("Admin Staff Session")).await
         .map_err(|e| ApiError::Internal(format!("Failed to generate IPMI session: {e}")))?;
 
     Ok(axum::Json(session))
+}
+
+#[utoipa::path(
+    get,
+    path = "/{id}/ipmi",
+    tag = "Admin Services",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "IPMI KVM session details", body = serde_json::Value),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn admin_ipmi_get(
+    auth: AuthAdmin,
+    state: State<AppState>,
+    path: axum::extract::Path<uuid::Uuid>,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    admin_ipmi(auth, state, path).await
 }
 

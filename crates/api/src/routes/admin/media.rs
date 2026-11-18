@@ -1,18 +1,31 @@
 use axum::extract::{DefaultBodyLimit, Multipart, State};
-use axum::routing::post;
-use axum::{Json, Router};
+use axum::Json;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
 use crate::media::{save_optimized_image, ProcessedImage};
+use crate::openapi::{BinaryFileUpload, ErrorResponse};
 use crate::state::AppState;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/upload", post(upload_media).layer(DefaultBodyLimit::max(20 * 1024 * 1024)))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(upload_media))
+        .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
 }
 
-async fn upload_media(
+#[utoipa::path(
+    post,
+    path = "/upload",
+    tag = "Admin Media",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body(content = BinaryFileUpload, content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "Optimized uploaded media metadata", body = ProcessedImage),
+        (status = 400, description = "Missing or invalid image file", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn upload_media(
     _auth: AuthAdmin,
     State(_state): State<AppState>,
     mut multipart: Multipart,

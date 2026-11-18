@@ -1,19 +1,35 @@
 use axum::extract::State;
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
+use crate::reliablesite_catalog::sanitize_product_for_storefront;
 use crate::state::AppState;
 use vaultscope_db::models::Product;
 
-pub fn routes() -> Router<AppState> {
-    Router::new().route("/", get(list_visible))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(list_visible))
 }
 
-async fn list_visible(State(state): State<AppState>) -> Result<Json<Vec<Product>>, ApiError> {
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Storefront Catalog",
+    responses(
+        (status = 200, description = "Visible products in storefront catalog", body = Vec<Product>),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn list_visible(State(state): State<AppState>) -> Result<Json<Vec<Product>>, ApiError> {
     let products: Vec<Product> =
         sqlx::query_as("SELECT * FROM products WHERE hidden = false ORDER BY category, name")
             .fetch_all(&state.db)
             .await?;
-    Ok(Json(products))
+    Ok(Json(
+        products
+            .into_iter()
+            .map(sanitize_product_for_storefront)
+            .collect(),
+    ))
 }

@@ -1,23 +1,24 @@
 use axum::extract::{Query, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::FromRow;
+use utoipa::{IntoParams, ToSchema};
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::auth::AuthCustomer;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 
 const MAX_PER_PAGE: i64 = 100;
 const DEFAULT_PER_PAGE: i64 = 20;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list_mine))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(list_mine))
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, IntoParams)]
 pub struct ListActivityParams {
     pub search: Option<String>,
     pub category: Option<String>,
@@ -28,7 +29,7 @@ pub struct ListActivityParams {
     pub paginate: Option<bool>,
 }
 
-#[derive(Serialize, FromRow, Clone)]
+#[derive(Serialize, FromRow, Clone, ToSchema)]
 pub struct ActivityEntry {
     pub id: uuid::Uuid,
     pub category: String,
@@ -38,7 +39,37 @@ pub struct ActivityEntry {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-async fn list_mine(
+#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
+pub struct PaginatedActivityResponse {
+    pub items: Vec<ActivityEntry>,
+    pub total: usize,
+    pub page: i64,
+    pub per_page: i64,
+    pub total_pages: i64,
+    pub max_per_page: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum ActivityListOutcome {
+    Paginated(PaginatedActivityResponse),
+    List(Vec<ActivityEntry>),
+}
+
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Storefront Activity",
+    security(("bearer_auth" = [])),
+    params(ListActivityParams),
+    responses(
+        (status = 200, description = "Customer activity log list or paginated response when page/paginate is set", body = ActivityListOutcome),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn list_mine(
     auth: AuthCustomer,
     State(state): State<AppState>,
     Query(params): Query<ListActivityParams>,

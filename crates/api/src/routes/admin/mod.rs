@@ -14,6 +14,7 @@ pub mod media;
 pub mod notifications;
 pub mod partners;
 pub mod products;
+pub mod reliablesite;
 pub mod service_forms;
 pub mod services;
 pub mod settings;
@@ -21,12 +22,12 @@ pub mod staff;
 pub mod tax_rates;
 pub mod tickets;
 
-use axum::Router;
+use utoipa_axum::router::OpenApiRouter;
 
 use crate::state::AppState;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
         .nest("/activity", activity::routes())
         .nest("/blog", blog::routes())
         .nest("/coupons", coupons::routes())
@@ -42,6 +43,7 @@ pub fn routes() -> Router<AppState> {
         .nest("/notifications", notifications::routes())
         .nest("/partners", partners::routes())
         .nest("/products", products::routes())
+        .nest("/reliablesite", reliablesite::routes())
         .nest("/services", services::routes())
         .nest("/service-forms", service_forms::routes())
         .nest("/settings", settings::routes())

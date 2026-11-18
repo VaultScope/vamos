@@ -1,24 +1,33 @@
 use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::auth::AuthAdmin;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use crate::validation::{
     validate_percentage, validate_required_string, validate_string_length, MAX_SHORT_STRING_LENGTH,
 };
 use vaultscope_db::models::TaxRate;
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list).post(create))
-        .route("/{id}", get(get_one).put(update).delete(delete))
+pub fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list, create))
+        .routes(routes!(get_one, update, delete))
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Admin Tax Rates",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "List tax rates", body = Vec<TaxRate>))
+)]
+pub(crate) async fn list(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<TaxRate>>, ApiError> {
@@ -29,7 +38,18 @@ async fn list(
     Ok(Json(rates))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Admin Tax Rates",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Tax rate ID")),
+    responses(
+        (status = 200, description = "Tax rate details", body = TaxRate),
+        (status = 404, description = "Tax rate not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_one(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -43,14 +63,25 @@ async fn get_one(
     Ok(Json(rate))
 }
 
-#[derive(Deserialize)]
-struct CreateTaxRate {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CreateTaxRate {
     name: String,
     country: String,
     rate: f64,
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Tax Rates",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateTaxRate,
+    responses(
+        (status = 200, description = "Tax rate created", body = TaxRate),
+        (status = 400, description = "Invalid input", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateTaxRate>,
@@ -79,14 +110,26 @@ async fn create(
     Ok(Json(tax_rate))
 }
 
-#[derive(Deserialize)]
-struct UpdateTaxRate {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdateTaxRate {
     name: Option<String>,
     country: Option<String>,
     rate: Option<f64>,
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Admin Tax Rates",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Tax rate ID")),
+    request_body = UpdateTaxRate,
+    responses(
+        (status = 200, description = "Tax rate updated", body = TaxRate),
+        (status = 404, description = "Tax rate not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -116,7 +159,18 @@ async fn update(
     Ok(Json(tax_rate))
 }
 
-async fn delete(
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Admin Tax Rates",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Tax rate ID")),
+    responses(
+        (status = 200, description = "Tax rate deleted"),
+        (status = 404, description = "Tax rate not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
