@@ -1,4 +1,5 @@
 use chrono::Datelike;
+use sha2::{Digest, Sha256};
 use vaultscope_db::models::{Customer, Invoice, InvoiceLineItem, InvoiceStatus};
 
 /// Generates a GoBD-compliant PDF document for the given invoice, customer, and line items.
@@ -30,7 +31,7 @@ pub fn generate_invoice_pdf(
 
     // --- Company Address Header (DIN 5008 Sender Line) ---
     content.push_str("0.5 0.5 0.5 rg\n");
-    content.push_str("BT /F1 7.5 Tf 45 745 Td (VaultScope GmbH - Hanauer Landstrasse 291b - 60314 Frankfurt am Main - Deutschland) Tj ET\n");
+    content.push_str("BT /F1 7.5 Tf 45 745 Td (VaultScope - Anton Schmidt - Gottlob-Spiess-Strasse 2 - 74343 Sachsenheim - Deutschland) Tj ET\n");
     content.push_str("0.8 0.8 0.8 RG 0.5 w 45 738 m 300 738 l S\n"); // Thin separator line
 
     // --- Customer Address Block ---
@@ -261,52 +262,63 @@ pub fn generate_invoice_pdf(
         ));
     } else {
         content.push_str(&format!(
-            "BT /F1 7.5 Tf 45 {} Td (Bitte ueberweisen Sie den faelligen Betrag unter Angabe der Rechnungsnummer bis zum Faelligkeitsdatum.) Tj ET\n",
+            "BT /F1 7.5 Tf 45 {} Td (Bitte begleichen Sie den offenen Betrag bis zum Faelligkeitsdatum direkt im Kundenportal unter vaultscope.de/dashboard/profile/billing.) Tj ET\n",
             legal_y - 22
         ));
     }
 
-    // --- GoBD Audit Integrity Hash Bar ---
+    // --- Document Integrity Hash Bar ---
+    let mut hasher = Sha256::new();
+    hasher.update(
+        format!(
+            "{}:{}:{}:{}:{}",
+            invoice.id, invoice.invoice_number, invoice.total, invoice.issue_date, customer.id
+        )
+        .as_bytes(),
+    );
+    let digest_hex = hex::encode(hasher.finalize());
+
     content.push_str("0.92 0.94 0.96 rg 0.8 0.85 0.9 RG 0.5 w\n");
     content.push_str("45 95 505 24 re B\n");
     content.push_str("0.3 0.35 0.45 rg\n");
+    content.push_str(
+        "BT /F1 7 Tf 55 108 Td (Elektronischer Rechnungsbeleg - VaultScope Abrechnungssystem) Tj ET\n",
+    );
     content.push_str(&format!(
-        "BT /F1 7 Tf 55 108 Td (GoBD Audit-Trail: Unveraenderbare elektronische Rechnung gem. BMF-Schreiben IV A 4 - S 0316/19/10003) Tj ET\n"
-    ));
-    content.push_str(&format!(
-        "BT /F2 7 Tf 55 99 Td (Hash: SHA-256 [INV-{}-{}] | Signiert: {}) Tj ET\n",
+        "BT /F2 7 Tf 55 99 Td (SHA-256: {} | Ref: INV-{}-{} | Erstellt: {}) Tj ET\n",
+        &digest_hex[..16],
         invoice.issue_date.year(),
-        &invoice.id.to_string()[..12],
+        &invoice.id.to_string()[..8],
         invoice.created_at.format("%Y-%m-%d %H:%M:%S UTC")
     ));
 
-    // --- Footer DIN 5008 (4 Columns: Company, Management, Registry/Tax, Banking) ---
+    // --- Footer DIN 5008 (4 Columns: Provider, Contact, Legal, Payment) ---
     content.push_str("0.8 0.8 0.8 RG 0.5 w 45 80 m 550 80 l S\n");
 
     content.push_str("0.45 0.45 0.45 rg\n");
     // Col 1
-    content.push_str("BT /F2 7 Tf 45 70 Td (VaultScope GmbH) Tj ET\n");
-    content.push_str("BT /F1 6.5 Tf 45 61 Td (Hanauer Landstr. 291b) Tj ET\n");
-    content.push_str("BT /F1 6.5 Tf 45 52 Td (60314 Frankfurt am Main) Tj ET\n");
-    content.push_str("BT /F1 6.5 Tf 45 43 Td (www.vaultscope.de) Tj ET\n");
+    content.push_str("BT /F2 7 Tf 45 70 Td (VaultScope \\(Einzelunternehmen\\)) Tj ET\n");
+    content.push_str("BT /F1 6.5 Tf 45 61 Td (Inh. Anton Schmidt) Tj ET\n");
+    content.push_str("BT /F1 6.5 Tf 45 52 Td (Gottlob-Spiess-Strasse 2) Tj ET\n");
+    content.push_str("BT /F1 6.5 Tf 45 43 Td (74343 Sachsenheim, Deutschland) Tj ET\n");
 
     // Col 2
-    content.push_str("BT /F2 7 Tf 175 70 Td (Geschaeftsfuehrung) Tj ET\n");
-    content.push_str("BT /F1 6.5 Tf 175 61 Td (VaultScope Executive Board) Tj ET\n");
-    content.push_str("BT /F1 6.5 Tf 175 52 Td (Support: help@vaultscope.de) Tj ET\n");
-    content.push_str("BT /F1 6.5 Tf 175 43 Td (Billing: billing@vaultscope.de) Tj ET\n");
+    content.push_str("BT /F2 7 Tf 175 70 Td (Kontakt) Tj ET\n");
+    content.push_str("BT /F1 6.5 Tf 175 61 Td (E-Mail: administration@vaultscope.de) Tj ET\n");
+    content.push_str("BT /F1 6.5 Tf 175 52 Td (Support: support@vaultscope.de) Tj ET\n");
+    content.push_str("BT /F1 6.5 Tf 175 43 Td (Web: https://vaultscope.de) Tj ET\n");
 
     // Col 3
-    content.push_str("BT /F2 7 Tf 315 70 Td (Register & Steuern) Tj ET\n");
-    content.push_str("BT /F1 6.5 Tf 315 61 Td (AG Frankfurt am Main, HRB 118492) Tj ET\n");
-    content.push_str("BT /F1 6.5 Tf 315 52 Td (USt-IdNr.: DE 312 984 920) Tj ET\n");
-    content.push_str("BT /F1 6.5 Tf 315 43 Td (Steuernummer: 045 240 81290) Tj ET\n");
+    content.push_str("BT /F2 7 Tf 315 70 Td (Rechtsform & Datenschutz) Tj ET\n");
+    content.push_str("BT /F1 6.5 Tf 315 61 Td (Einzelunternehmen \\(DE\\)) Tj ET\n");
+    content.push_str("BT /F1 6.5 Tf 315 52 Td (Kein Handelsregistereintrag) Tj ET\n");
+    content.push_str("BT /F1 6.5 Tf 315 43 Td (Datenschutz: Anton Schmidt) Tj ET\n");
 
     // Col 4
-    content.push_str("BT /F2 7 Tf 445 70 Td (Bankverbindung) Tj ET\n");
-    content.push_str("BT /F1 6.5 Tf 445 61 Td (Commerzbank AG Frankfurt) Tj ET\n");
-    content.push_str("BT /F1 6.5 Tf 445 52 Td (IBAN: DE44 5008 0000 0123 4567 89) Tj ET\n");
-    content.push_str("BT /F1 6.5 Tf 445 43 Td (BIC: COBADEFFXXX) Tj ET\n");
+    content.push_str("BT /F2 7 Tf 445 70 Td (Zahlungsabwicklung) Tj ET\n");
+    content.push_str("BT /F1 6.5 Tf 445 61 Td (Stripe Payments Europe) Tj ET\n");
+    content.push_str("BT /F1 6.5 Tf 445 52 Td (Karten, SEPA, Apple/Google Pay) Tj ET\n");
+    content.push_str("BT /F1 6.5 Tf 445 43 Td (Portal: vaultscope.de/dashboard) Tj ET\n");
 
     // Build the complete PDF document with valid cross-reference table and trailer
     build_pdf_document(&content)
@@ -397,10 +409,11 @@ mod tests {
 
     #[test]
     fn test_generate_invoice_pdf_valid() {
+        let customer_id = Uuid::now_v7();
         let invoice = Invoice {
             id: Uuid::now_v7(),
             invoice_number: "INV-2026-0042".to_string(),
-            customer_id: Uuid::now_v7(),
+            customer_id: Some(customer_id),
             status: InvoiceStatus::Paid,
             subtotal: Decimal::new(10000, 2),
             tax_rate: Decimal::new(19, 2),
@@ -411,12 +424,18 @@ mod tests {
             paid_at: Some(Utc::now()),
             stripe_payment_intent_id: Some("pi_test_123".to_string()),
             notes: "Test invoice".to_string(),
+            billing_snapshot: None,
+            tax_regime: "unverified_pending".to_string(),
+            retention_until: None,
+            retention_hold: false,
+            corrects_invoice_id: None,
+            retention_resolution_approved: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
 
         let customer = Customer {
-            id: invoice.customer_id,
+            id: customer_id,
             external_id: "ext_1".to_string(),
             name: "Max Mustermann".to_string(),
             company: "Muster GmbH".to_string(),
@@ -439,6 +458,7 @@ mod tests {
             verification_token: None,
             totp_secret: None,
             vat_verified: true,
+            username: "mmustermann".to_string(),
         };
 
         let items = vec![InvoiceLineItem {

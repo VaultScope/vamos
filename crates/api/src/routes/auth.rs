@@ -11,19 +11,14 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use crate::validation::{validate_email, validate_required_string, validate_string_length};
 use bcrypt::{hash, verify, DEFAULT_COST};
+use sha2::{Digest, Sha256};
 
-pub fn routes(state: &AppState) -> Router<AppState> {
-    let mut router = Router::new()
+pub fn routes(_state: &AppState) -> Router<AppState> {
+    Router::new()
         .route("/login", post(login))
         .route("/register", post(register))
         .route("/verify-email", post(verify_email))
-        .route("/resend-verification", post(resend_verification));
-
-    if state.config.dev_mode {
-        router = router.route("/dev-login", post(dev_login));
-    }
-
-    router
+        .route("/resend-verification", post(resend_verification))
 }
 
 #[derive(Deserialize)]
@@ -129,23 +124,74 @@ async fn login(
         }
 
         if two_factor_enabled {
-            if let Some(ref code) = payload.totp_code {
-                let secret_str = totp_secret.ok_or(ApiError::Unauthorized)?;
-                let secret = totp_rs::Secret::Encoded(secret_str);
-                let bytes = secret.to_bytes().map_err(|_| ApiError::Unauthorized)?;
-                let totp = totp_rs::TOTP::new(
-                    totp_rs::Algorithm::SHA1,
-                    6,
-                    1,
-                    30,
-                    bytes,
-                    Some("VaultScope".to_string()),
-                    email.clone(),
-                ).map_err(|_| ApiError::Unauthorized)?;
+            let provided_code = payload
+                .totp_code
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
 
-                let clean_code = code.trim().replace(' ', "");
-                if !totp.check_current(&clean_code).unwrap_or(false) {
-                    return Err(ApiError::BadRequest("Invalid two-factor authentication code".into()));
+            if let Some(raw_code) = provided_code {
+                let mut mfa_ok = false;
+
+                if let Some(ref secret_str) = totp_secret {
+                    if let Ok(bytes) = totp_rs::Secret::Encoded(secret_str.clone()).to_bytes() {
+                        if let Ok(totp) = totp_rs::TOTP::new(
+                            totp_rs::Algorithm::SHA1,
+                            6,
+                            1,
+                            30,
+                            bytes,
+                            Some("VaultScope".to_string()),
+                            email.clone(),
+                        ) {
+                            let clean_code = raw_code.replace(' ', "");
+                            if totp.check_current(&clean_code).unwrap_or(false) {
+                                mfa_ok = true;
+                            }
+                        }
+                    }
+                }
+
+                if !mfa_ok {
+                    let normalized = raw_code.replace(['-', ' '], "").to_uppercase();
+                    let mut hasher = Sha256::new();
+                    hasher.update(normalized.as_bytes());
+                    let code_hash = hex::encode(hasher.finalize());
+
+                    let consumed: Option<Uuid> = sqlx::query_scalar(
+                        r#"UPDATE customer_mfa_recovery_codes
+                           SET used_at = now()
+                           WHERE id = (
+                               SELECT id FROM customer_mfa_recovery_codes
+                               WHERE customer_id = $1 AND code_hash = $2 AND used_at IS NULL
+                               LIMIT 1
+                           )
+                           RETURNING id"#,
+                    )
+                    .bind(customer_id)
+                    .bind(&code_hash)
+                    .fetch_optional(&state.db)
+                    .await?;
+
+                    if consumed.is_some() {
+                        mfa_ok = true;
+                        crate::activity::spawn_record(
+                            state.db.clone(),
+                            Some(customer_id),
+                            vaultscope_db::models::ActorType::Customer,
+                            name.clone(),
+                            "security".to_string(),
+                            "2fa_recovery_used".to_string(),
+                            "TOTP Recovery Code".to_string(),
+                            format!("Recovery code used during login for {}", email),
+                        );
+                    }
+                }
+
+                if !mfa_ok {
+                    return Err(ApiError::BadRequest(
+                        "Invalid two-factor authentication or recovery code".into(),
+                    ));
                 }
             } else {
                 return Ok(Json(json!({
@@ -634,84 +680,4 @@ async fn resend_verification(
         "ok": true,
         "message": "If your account exists and is unverified, a verification link has been sent. Please check your inbox and spam folder."
     })))
-}
-
-#[derive(Deserialize)]
-struct DevLoginPayload {
-    role: Option<String>,
-    persona: Option<String>,
-}
-
-async fn dev_login(
-    State(state): State<AppState>,
-    Json(payload): Json<DevLoginPayload>,
-) -> Result<Json<Value>, ApiError> {
-    if !state.config.dev_mode {
-        return Err(ApiError::NotFound("Not found".into()));
-    }
-
-    let persona = payload.persona.as_deref().or(payload.role.as_deref()).unwrap_or("Owner");
-
-    if persona.eq_ignore_ascii_case("customer") || persona.eq_ignore_ascii_case("customer1") {
-        let customer: Option<(Uuid, String, bool)> = sqlx::query_as(
-            "SELECT id, email, email_verified FROM customers WHERE email = 'customer1@test.local' OR status = 'active' ORDER BY created_at ASC LIMIT 1"
-        )
-        .fetch_optional(&state.db)
-        .await?;
-
-        let (customer_id, email, email_verified) = customer.ok_or_else(|| {
-            ApiError::Internal("No customer found in database. Run database seeding.".into())
-        })?;
-
-        let claims = Claims {
-            sub: customer_id,
-            email,
-            role: "customer".to_string(),
-            audience: Audience::Storefront,
-            iat: Utc::now().timestamp(),
-            exp: jwt::new_expiry(),
-        };
-
-        let token = jwt::sign(&claims, &state.config.jwt_secret)?;
-        return Ok(Json(json!({ "token": token, "claims": claims, "email_verified": email_verified })));
-    }
-
-    let persona_lower = persona.to_lowercase();
-    let query_role = match persona_lower.as_str() {
-        "admin1" | "owner" => "Owner",
-        "support1" | "support" => "Support",
-        "billing1" | "billing" => "Billing",
-        "tech1" | "technical" => "Technical",
-        _ => persona,
-    };
-
-    let staff: Option<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT s.id, s.email, r.name FROM staff s JOIN roles r ON s.role_id = r.id WHERE r.name = $1 OR s.username = $2 LIMIT 1"
-    )
-    .bind(query_role)
-    .bind(persona)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(ApiError::from)?;
-
-    let (staff_id, email, role_name) = staff.ok_or_else(|| {
-        ApiError::BadRequest(format!("Staff member for persona '{}' not found. Please run database seeding.", persona))
-    })?;
-
-    sqlx::query("UPDATE staff SET last_login = now() WHERE id = $1")
-        .bind(staff_id)
-        .execute(&state.db)
-        .await?;
-
-    let claims = Claims {
-        sub: staff_id,
-        email,
-        role: role_name,
-        audience: Audience::Admin,
-        iat: Utc::now().timestamp(),
-        exp: jwt::new_expiry(),
-    };
-
-    let token = jwt::sign(&claims, &state.config.jwt_secret)?;
-    Ok(Json(json!({ "token": token, "claims": claims, "email_verified": true })))
 }

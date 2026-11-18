@@ -2,3 +2,7 @@
 .env
 *.pdb
 uploads/
+
+# Local LLM documentation
+local-llm/
+/local-llm

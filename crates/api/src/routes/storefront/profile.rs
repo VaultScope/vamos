@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::routing::{get, post, delete};
 use axum::{Json, Router};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::auth::AuthCustomer;
@@ -377,6 +378,12 @@ async fn setup_mfa(
         .await?
         .ok_or(ApiError::NotFound("Customer not found".into()))?;
 
+    if customer.two_factor_enabled {
+        return Err(ApiError::BadRequest(
+            "Two-factor authentication is already enabled. Disable it first before reconfiguring.".into(),
+        ));
+    }
+
     let secret = Secret::generate_secret();
     let secret_base32 = secret.to_encoded().to_string();
 
@@ -392,6 +399,7 @@ async fn setup_mfa(
     .map_err(|e| ApiError::Internal(format!("TOTP init error: {e}")))?;
 
     let qr_base64 = totp.get_qr_base64().map_err(|e| ApiError::Internal(format!("QR generation error: {e}")))?;
+    let qr_url = format!("data:image/png;base64,{}", qr_base64);
     let url = totp.get_url();
 
     // Store unconfirmed secret on customer
@@ -403,9 +411,20 @@ async fn setup_mfa(
 
     Ok(Json(serde_json::json!({
         "secret": secret_base32,
+        "qr_url": qr_url,
         "qr_base64": qr_base64,
         "url": url,
     })))
+}
+
+fn normalize_recovery_code(raw: &str) -> String {
+    raw.trim().replace(['-', ' '], "").to_uppercase()
+}
+
+fn hash_recovery_code(normalized: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 async fn enable_mfa(
@@ -440,10 +459,41 @@ async fn enable_mfa(
         return Err(ApiError::BadRequest("Invalid 6-digit verification code. Please check your authenticator app and system clock.".into()));
     }
 
+    let mut recovery_codes = Vec::with_capacity(8);
+    let mut code_hashes = Vec::with_capacity(8);
+    for _ in 0..8 {
+        let bytes: [u8; 4] = rand::random();
+        let hex_str = hex::encode_upper(bytes);
+        let formatted = format!("{}-{}", &hex_str[..4], &hex_str[4..]);
+        let normalized = normalize_recovery_code(&formatted);
+        code_hashes.push(hash_recovery_code(&normalized));
+        recovery_codes.push(formatted);
+    }
+
+    let mut tx = state.db.begin().await?;
+
     sqlx::query("UPDATE customers SET two_factor_enabled = true, updated_at = now() WHERE id = $1")
         .bind(auth.0.sub)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+
+    sqlx::query("DELETE FROM customer_mfa_recovery_codes WHERE customer_id = $1")
+        .bind(auth.0.sub)
+        .execute(&mut *tx)
+        .await?;
+
+    for code_hash in &code_hashes {
+        sqlx::query(
+            "INSERT INTO customer_mfa_recovery_codes (id, customer_id, code_hash) VALUES ($1, $2, $3)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(auth.0.sub)
+        .bind(code_hash)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
 
     crate::activity::spawn_record(
         state.db.clone(),
@@ -458,7 +508,8 @@ async fn enable_mfa(
 
     Ok(Json(serde_json::json!({
         "ok": true,
-        "message": "Two-factor authentication successfully activated."
+        "message": "Two-factor authentication successfully activated.",
+        "recovery_codes": recovery_codes,
     })))
 }
 
@@ -507,11 +558,37 @@ async fn disable_mfa(
         }
     }
 
+    // Or verify an unused recovery code
     if !authorized {
-        return Err(ApiError::BadRequest("Invalid account password or 2FA code to disable two-factor authentication.".into()));
+        if let Some(ref code) = payload.code {
+            let normalized = normalize_recovery_code(code);
+            if !normalized.is_empty() {
+                let code_hash = hash_recovery_code(&normalized);
+                let matched_id: Option<Uuid> = sqlx::query_scalar(
+                    "SELECT id FROM customer_mfa_recovery_codes WHERE customer_id = $1 AND code_hash = $2 AND used_at IS NULL LIMIT 1",
+                )
+                .bind(auth.0.sub)
+                .bind(&code_hash)
+                .fetch_optional(&state.db)
+                .await?;
+
+                if matched_id.is_some() {
+                    authorized = true;
+                }
+            }
+        }
+    }
+
+    if !authorized {
+        return Err(ApiError::BadRequest("Invalid account password, 2FA code, or recovery code to disable two-factor authentication.".into()));
     }
 
     sqlx::query("UPDATE customers SET two_factor_enabled = false, totp_secret = NULL, updated_at = now() WHERE id = $1")
+        .bind(auth.0.sub)
+        .execute(&state.db)
+        .await?;
+
+    sqlx::query("DELETE FROM customer_mfa_recovery_codes WHERE customer_id = $1")
         .bind(auth.0.sub)
         .execute(&state.db)
         .await?;

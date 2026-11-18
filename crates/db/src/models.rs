@@ -241,11 +241,37 @@ pub struct Service {
     pub quota_gb: Option<i32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct InvoiceBillingSnapshot {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub company: String,
+    #[serde(default)]
+    pub address_line1: String,
+    #[serde(default)]
+    pub postal_code: String,
+    #[serde(default)]
+    pub city: String,
+    #[serde(default)]
+    pub country: String,
+    #[serde(default)]
+    pub vat_id: String,
+    #[serde(default)]
+    pub snapshot_complete: bool,
+    #[serde(default)]
+    pub missing_fields: Vec<String>,
+    #[serde(default)]
+    pub snapshot_source: String,
+    #[serde(default)]
+    pub captured_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Invoice {
     pub id: Uuid,
     pub invoice_number: String,
-    pub customer_id: Uuid,
+    pub customer_id: Option<Uuid>,
     pub status: InvoiceStatus,
     pub subtotal: rust_decimal::Decimal,
     pub tax_rate: rust_decimal::Decimal,
@@ -256,6 +282,18 @@ pub struct Invoice {
     pub paid_at: Option<DateTime<Utc>>,
     pub stripe_payment_intent_id: Option<String>,
     pub notes: String,
+    #[serde(default)]
+    pub billing_snapshot: Option<sqlx::types::Json<InvoiceBillingSnapshot>>,
+    #[serde(default)]
+    pub tax_regime: String,
+    #[serde(default)]
+    pub retention_until: Option<NaiveDate>,
+    #[serde(default)]
+    pub retention_hold: bool,
+    #[serde(default)]
+    pub corrects_invoice_id: Option<Uuid>,
+    #[serde(default)]
+    pub retention_resolution_approved: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

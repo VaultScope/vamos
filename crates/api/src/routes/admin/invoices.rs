@@ -280,10 +280,14 @@ async fn dispatch_invoice_email(
     state: &AppState,
     invoice: &Invoice,
 ) -> Result<(), ApiError> {
+    let Some(customer_id) = invoice.customer_id else {
+        return Ok(());
+    };
+
     let customer: Option<(String, String)> = sqlx::query_as(
         "SELECT name, email FROM customers WHERE id = $1"
     )
-    .bind(invoice.customer_id)
+    .bind(customer_id)
     .fetch_optional(&state.db)
     .await?;
 
@@ -296,7 +300,7 @@ async fn dispatch_invoice_email(
     let cc_emails: Vec<String> = sqlx::query_scalar(
         "SELECT email FROM customer_billing_emails WHERE customer_id = $1 AND verified = true"
     )
-    .bind(invoice.customer_id)
+    .bind(customer_id)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
@@ -306,6 +310,10 @@ async fn dispatch_invoice_email(
     let smtp_pass = state.config.smtp_password.clone().unwrap_or_else(|| "".to_string());
     let smtp_from = state.config.smtp_from.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
 
+    let billing_url = format!(
+        "{}/dashboard/profile/billing",
+        state.config.storefront_url.trim_end_matches('/')
+    );
     let subject = format!("Invoice {} from VaultScope", invoice.invoice_number);
     let body = format!(
 "Hello {},
@@ -316,12 +324,12 @@ Invoice Number: {}
 Total Amount: €{}
 Due Date: {}
 
-You can view and manage your invoice directly in the VaultScope customer dashboard:
-http://localhost:5173/dashboard/billing
+You can view and pay your invoice directly in the VaultScope customer dashboard:
+{}
 
 Best regards,
 The VaultScope Billing Team",
-        customer_name, invoice.invoice_number, invoice.total, invoice.due_date
+        customer_name, invoice.invoice_number, invoice.total, invoice.due_date, billing_url
     );
 
     let from_m = match smtp_from.parse() {
@@ -629,8 +637,12 @@ async fn download_pdf(
         .await?
         .ok_or(ApiError::NotFound("invoice not found".into()))?;
 
+    let customer_id = invoice
+        .customer_id
+        .ok_or_else(|| ApiError::NotFound("customer not found".into()))?;
+
     let customer: Customer = sqlx::query_as("SELECT * FROM customers WHERE id = $1")
-        .bind(invoice.customer_id)
+        .bind(customer_id)
         .fetch_optional(&state.db)
         .await?
         .ok_or(ApiError::NotFound("customer not found".into()))?;
