@@ -27,7 +27,7 @@ pub fn verify(token: &str, secret: &str, expected_audience: Audience) -> Result<
     // SEC-003: Enforce audience validation
     // Prevent cross-audience token reuse (e.g., admin token used for storefront)
     if data.claims.audience != expected_audience {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden);
     }
 
     Ok(data.claims)
