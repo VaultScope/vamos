@@ -17,8 +17,12 @@ pub struct SftpGo {
 
 impl SftpGo {
     pub fn new(base_url: String, admin_user: String, admin_pass: String) -> Self {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            client: Client::new(),
+            client,
             base_url,
             admin_user,
             admin_pass,
@@ -81,6 +85,39 @@ impl SftpGo {
     }
 }
 
+/// Generates a collision-free SFTPGo username of the form `vs_<cust6>_<rand8>`
+/// safely handling short, empty, `"unknown"`, or non-ASCII customer IDs.
+pub fn generate_sftpgo_username(customer_id: Option<&str>) -> String {
+    let clean: String = customer_id
+        .unwrap_or("unknown")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let tail: String = if clean.is_empty() {
+        "unknwn".to_string()
+    } else {
+        let skip = clean.len().saturating_sub(6);
+        clean.chars().skip(skip).collect::<String>().to_ascii_lowercase()
+    };
+    let rand_suffix = vaultscope_common::crypto::generate_random_secret(8).to_ascii_lowercase();
+    format!("vs_{}_{}", tail, rand_suffix)
+}
+
+/// Validates an SFTPGo resource identifier (username) before embedding into URL paths.
+pub fn validate_resource_id(resource_id: &str) -> ConnectorResult<&str> {
+    if resource_id.is_empty()
+        || resource_id.len() > 128
+        || resource_id == "."
+        || resource_id == ".."
+        || !resource_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    {
+        return Err(ConnectorError::Api("invalid SFTPGo resource_id".into()));
+    }
+    Ok(resource_id)
+}
+
 #[async_trait]
 impl ProvisioningProvider for SftpGo {
     fn name(&self) -> &'static str {
@@ -93,11 +130,9 @@ impl ProvisioningProvider for SftpGo {
     }
 
     async fn provision(&self, params: &ProvisionParams) -> ConnectorResult<ProvisionResult> {
-        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let password = format!("{:x}", timestamp)[..16].to_string();
-            
-        let customer_id = params.extra.get("customer_id").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let username = format!("vs_{}", &customer_id.to_string().replace("-", "")[..8]);
+        let password = vaultscope_common::crypto::generate_random_secret(24);
+        let customer_id = params.extra.get("customer_id").and_then(|v| v.as_str());
+        let username = generate_sftpgo_username(customer_id);
 
         let is_trial = params.extra.get("is_trial").and_then(|v| v.as_bool()).unwrap_or(false);
         let mut quota_bytes: i64 = if is_trial {
@@ -143,6 +178,7 @@ impl ProvisioningProvider for SftpGo {
     }
 
     async fn power_action(&self, resource_id: &str, action: PowerAction) -> ConnectorResult<()> {
+        let resource_id = validate_resource_id(resource_id)?;
         let mut user: serde_json::Value = self
             .request(reqwest::Method::GET, &format!("/api/v2/users/{}", resource_id), None::<&()>)
             .await?;
@@ -164,6 +200,7 @@ impl ProvisioningProvider for SftpGo {
     }
 
     async fn status(&self, resource_id: &str) -> ConnectorResult<ResourceStatus> {
+        let resource_id = validate_resource_id(resource_id)?;
         let user: serde_json::Value = self
             .request(reqwest::Method::GET, &format!("/api/v2/users/{}", resource_id), None::<&()>)
             .await?;
@@ -177,6 +214,7 @@ impl ProvisioningProvider for SftpGo {
     }
 
     async fn delete(&self, resource_id: &str) -> ConnectorResult<()> {
+        let resource_id = validate_resource_id(resource_id)?;
         let _ = self
             .request::<serde_json::Value>(reqwest::Method::DELETE, &format!("/api/v2/users/{}", resource_id), None::<&()>)
             .await;
@@ -188,6 +226,7 @@ impl ProvisioningProvider for SftpGo {
     }
 
     async fn modify(&self, resource_id: &str, params: &serde_json::Value) -> ConnectorResult<()> {
+        let resource_id = validate_resource_id(resource_id)?;
         let mut user: serde_json::Value = self
             .request(reqwest::Method::GET, &format!("/api/v2/users/{}", resource_id), None::<&()>)
             .await?;
@@ -201,5 +240,46 @@ impl ProvisioningProvider for SftpGo {
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sftpgo_username_generation_safe_and_unique() {
+        let u_unknown = generate_sftpgo_username(Some("unknown"));
+        assert!(u_unknown.starts_with("vs_nknown_"));
+        assert!(validate_resource_id(&u_unknown).is_ok());
+
+        let u_none = generate_sftpgo_username(None);
+        assert!(u_none.starts_with("vs_nknown_"));
+
+        let u_short = generate_sftpgo_username(Some("ab"));
+        assert!(u_short.starts_with("vs_ab_"));
+
+        let u_unicode = generate_sftpgo_username(Some("äöüß"));
+        assert!(u_unicode.starts_with("vs_unknwn_"));
+
+        let cust = "01948a2b-1234-7000-8000-abcdef123456";
+        let u1 = generate_sftpgo_username(Some(cust));
+        let u2 = generate_sftpgo_username(Some(cust));
+        assert!(u1.starts_with("vs_123456_"));
+        assert!(u2.starts_with("vs_123456_"));
+        assert_ne!(u1, u2);
+    }
+
+    #[test]
+    fn test_sftpgo_validate_resource_id() {
+        assert!(validate_resource_id("vs_123456_abcdefgh").is_ok());
+        assert!(validate_resource_id("user.name-01").is_ok());
+
+        for bad in ["", ".", "..", "../admin", "foo/bar", "foo?bar=1", "foo bar", "foo\nbar"] {
+            assert!(
+                validate_resource_id(bad).is_err(),
+                "Expected validate_resource_id({bad:?}) to reject unsafe input"
+            );
+        }
     }
 }

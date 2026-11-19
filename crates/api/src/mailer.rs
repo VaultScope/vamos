@@ -4,6 +4,11 @@ use vaultscope_db::models::EmailDeliveryStatus;
 
 use crate::state::AppState;
 
+/// Strips CR, LF, and NUL bytes from email header values to prevent SMTP header injection.
+pub fn sanitize_email_header(value: &str) -> String {
+    value.replace(['\r', '\n', '\0'], "")
+}
+
 /// Asynchronously dispatches an email via SMTP and writes an audit entry into `email_log`.
 pub async fn send_email(
     state: &AppState,
@@ -16,12 +21,19 @@ pub async fn send_email(
     let smtp_user = state.config.smtp_username.clone().unwrap_or_else(|| "support@vaultscope.de".to_string());
     let smtp_pass = state.config.smtp_password.clone().unwrap_or_default();
     let smtp_from = state.config.smtp_from.clone().unwrap_or_else(|| "support@vaultscope.de".to_string());
+    let safe_subject = sanitize_email_header(subject);
+
+    if to_email.contains(['\r', '\n', '\0']) || smtp_from.contains(['\r', '\n', '\0']) {
+        tracing::warn!("Rejected email address containing header control characters");
+        let _ = record_email_log(state, &sanitize_email_header(to_email), &safe_subject, template_id, EmailDeliveryStatus::Failed, Some("Invalid email address format")).await;
+        return false;
+    }
 
     let (from_addr, to_addr) = match (smtp_from.parse(), to_email.parse()) {
         (Ok(f), Ok(t)) => (f, t),
         _ => {
             tracing::warn!("Invalid email address format for dispatch: {} or {}", smtp_from, to_email);
-            let _ = record_email_log(state, to_email, subject, template_id, EmailDeliveryStatus::Failed, Some("Invalid email address format")).await;
+            let _ = record_email_log(state, to_email, &safe_subject, template_id, EmailDeliveryStatus::Failed, Some("Invalid email address format")).await;
             return false;
         }
     };
@@ -29,13 +41,13 @@ pub async fn send_email(
     let email = match lettre::Message::builder()
         .from(from_addr)
         .to(to_addr)
-        .subject(subject)
+        .subject(&safe_subject)
         .body(body.to_string())
     {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!("Failed to build MIME email: {}", e);
-            let _ = record_email_log(state, to_email, subject, template_id, EmailDeliveryStatus::Failed, Some(&e.to_string())).await;
+            let _ = record_email_log(state, to_email, &safe_subject, template_id, EmailDeliveryStatus::Failed, Some(&e.to_string())).await;
             return false;
         }
     };
@@ -45,21 +57,26 @@ pub async fn send_email(
         Ok(builder) => builder.credentials(creds).build(),
         Err(e) => {
             tracing::warn!("Failed to resolve SMTP relay {}: {}", smtp_host, e);
-            let _ = record_email_log(state, to_email, subject, template_id, EmailDeliveryStatus::Failed, Some(&e.to_string())).await;
+            let _ = record_email_log(state, to_email, &safe_subject, template_id, EmailDeliveryStatus::Failed, Some(&e.to_string())).await;
             return false;
         }
     };
 
-    let res = lettre::Transport::send(&mailer, &email);
+    let res = tokio::task::spawn_blocking(move || lettre::Transport::send(&mailer, &email)).await;
     match res {
-        Ok(_) => {
-            tracing::info!("Dispatched email to {} with subject: {}", to_email, subject);
-            let _ = record_email_log(state, to_email, subject, template_id, EmailDeliveryStatus::Delivered, None).await;
+        Ok(Ok(_)) => {
+            tracing::info!("Dispatched email to {} with subject: {}", to_email, safe_subject);
+            let _ = record_email_log(state, to_email, &safe_subject, template_id, EmailDeliveryStatus::Delivered, None).await;
             true
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!("SMTP transport error sending to {}: {}", to_email, e);
-            let _ = record_email_log(state, to_email, subject, template_id, EmailDeliveryStatus::Failed, Some(&e.to_string())).await;
+            let _ = record_email_log(state, to_email, &safe_subject, template_id, EmailDeliveryStatus::Failed, Some(&e.to_string())).await;
+            false
+        }
+        Err(e) => {
+            tracing::warn!("SMTP dispatch task join error sending to {}: {}", to_email, e);
+            let _ = record_email_log(state, to_email, &safe_subject, template_id, EmailDeliveryStatus::Failed, Some("Email dispatch task failed")).await;
             false
         }
     }
@@ -252,11 +269,8 @@ pub fn spawn_service_welcome_notification(
                 .or_else(|| response_payload.get("raw_response").and_then(|r| r.get("sftpgo_user")).and_then(|u| u.get("username")).and_then(|v| v.as_str()))
                 .unwrap_or("vs_user");
 
-            let password = response_payload.get("raw_response")
-                .and_then(|r| r.get("password"))
-                .and_then(|v| v.as_str())
-                .or_else(|| response_payload.get("password").and_then(|v| v.as_str()))
-                .unwrap_or("[Shown in Dashboard]");
+            // Never transmit plaintext credentials over email; customers retrieve them via the encrypted dashboard endpoint.
+            let password = "[Shown in Encrypted Customer Dashboard]";
 
             let billing_line = if is_trial {
                 format!("Subscription: Free Trial ({} GB - auto-upgrades to full plan on renewal)", quota)
@@ -274,10 +288,8 @@ pub fn spawn_service_welcome_notification(
                 .filter(|s| !s.is_empty())
                 .unwrap_or("Assigned in Dashboard");
 
-            let root_pass = response_payload.get("raw_response")
-                .and_then(|r| r.get("root_password"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("[Available in Dashboard / Configured SSH Key]");
+            // Never transmit plaintext root passwords over email; customers retrieve them via the encrypted dashboard endpoint.
+            let root_pass = "[Shown in Encrypted Customer Dashboard]";
 
             let billing_line = if is_trial {
                 "Subscription: Free Trial".to_string()
