@@ -17,6 +17,8 @@ async fn test_customer_cannot_access_admin_routes() {
         audience: Audience::Storefront,
         iat: chrono::Utc::now().timestamp(),
         exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        auth_version: Some(1),
+        jti: None,
     };
     let token = jwt::sign(&claims, &app_state.config.jwt_secret).unwrap();
     

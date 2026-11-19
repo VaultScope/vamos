@@ -4,7 +4,9 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use super::{Audience, Claims};
 use crate::error::ApiError;
 
-const TOKEN_EXPIRY_HOURS: i64 = 24;
+const DEFAULT_TOKEN_EXPIRY_SECS: i64 = 24 * 3600;
+const MIN_TOKEN_EXPIRY_SECS: i64 = 60;
+const MAX_TOKEN_EXPIRY_SECS: i64 = 30 * 24 * 3600;
 
 pub fn sign(claims: &Claims, secret: &str) -> Result<String, ApiError> {
     encode(
@@ -33,8 +35,45 @@ pub fn verify(token: &str, secret: &str, expected_audience: Audience) -> Result<
     Ok(data.claims)
 }
 
+/// Verify JWT token signature and expiration without restricting to a single audience.
+pub fn verify_any_audience(token: &str, secret: &str) -> Result<Claims, ApiError> {
+    let data = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &Validation::default(),
+    )
+    .map_err(|_| ApiError::Unauthorized)?;
 
+    Ok(data.claims)
+}
+
+pub fn token_expiry_secs() -> i64 {
+    match std::env::var("JWT_EXPIRATION_SECS") {
+        Ok(raw) => match raw.trim().parse::<i64>() {
+            Ok(secs) if (MIN_TOKEN_EXPIRY_SECS..=MAX_TOKEN_EXPIRY_SECS).contains(&secs) => secs,
+            Ok(secs) => {
+                tracing::warn!(
+                    "JWT_EXPIRATION_SECS={} out of bounds ({}..={}), falling back to {}s",
+                    secs,
+                    MIN_TOKEN_EXPIRY_SECS,
+                    MAX_TOKEN_EXPIRY_SECS,
+                    DEFAULT_TOKEN_EXPIRY_SECS
+                );
+                DEFAULT_TOKEN_EXPIRY_SECS
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Invalid JWT_EXPIRATION_SECS='{}', falling back to {}s",
+                    raw,
+                    DEFAULT_TOKEN_EXPIRY_SECS
+                );
+                DEFAULT_TOKEN_EXPIRY_SECS
+            }
+        },
+        Err(_) => DEFAULT_TOKEN_EXPIRY_SECS,
+    }
+}
 
 pub fn new_expiry() -> i64 {
-    (Utc::now() + chrono::Duration::hours(TOKEN_EXPIRY_HOURS)).timestamp()
+    (Utc::now() + chrono::Duration::seconds(token_expiry_secs())).timestamp()
 }

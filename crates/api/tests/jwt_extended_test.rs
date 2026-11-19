@@ -10,6 +10,8 @@ fn test_sign_with_empty_secret() {
         audience: Audience::Admin,
         iat: chrono::Utc::now().timestamp(),
         exp: jwt::new_expiry(),
+        auth_version: Some(1),
+        jti: None,
     };
     let result = jwt::sign(&claims, "");
     assert!(result.is_ok(), "Empty secret should still produce a token");
@@ -24,6 +26,8 @@ fn test_verify_with_wrong_secret() {
         audience: Audience::Admin,
         iat: chrono::Utc::now().timestamp(),
         exp: jwt::new_expiry(),
+        auth_version: Some(1),
+        jti: None,
     };
     let token = jwt::sign(&claims, "correct_secret").unwrap();
     let result = jwt::verify(&token, "wrong_secret", Audience::Admin);
@@ -62,6 +66,8 @@ fn test_claims_preserve_unicode_email() {
         audience: Audience::Storefront,
         iat: chrono::Utc::now().timestamp(),
         exp: jwt::new_expiry(),
+        auth_version: Some(1),
+        jti: None,
     };
     let token = jwt::sign(&claims, secret).unwrap();
     let decoded = jwt::verify(&token, secret, Audience::Storefront).unwrap();
@@ -79,6 +85,8 @@ fn test_audience_serialization_roundtrip() {
             audience: audience.clone(),
             iat: chrono::Utc::now().timestamp(),
             exp: jwt::new_expiry(),
+            auth_version: Some(1),
+            jti: None,
         };
         let token = jwt::sign(&claims, secret).unwrap();
         let decoded = jwt::verify(&token, secret, audience.clone()).unwrap();
@@ -100,6 +108,8 @@ fn test_different_tokens_for_same_claims() {
         audience: Audience::Admin,
         iat,
         exp,
+        auth_version: Some(1),
+        jti: None,
     };
 
     let token1 = jwt::sign(&claims, secret).unwrap();

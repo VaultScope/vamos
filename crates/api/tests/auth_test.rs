@@ -15,6 +15,8 @@ fn test_jwt_audience_separation() {
         audience: Audience::Admin,
         iat: chrono::Utc::now().timestamp(),
         exp: jwt::new_expiry(),
+        auth_version: Some(1),
+        jti: None,
     };
 
     let storefront_claims = Claims {
@@ -24,6 +26,8 @@ fn test_jwt_audience_separation() {
         audience: Audience::Storefront,
         iat: chrono::Utc::now().timestamp(),
         exp: jwt::new_expiry(),
+        auth_version: Some(1),
+        jti: None,
     };
 
     let admin_token = jwt::sign(&admin_claims, secret).expect("sign admin");
@@ -55,6 +59,8 @@ fn test_jwt_expiry() {
         audience: Audience::Admin,
         iat: chrono::Utc::now().timestamp() - 7200,
         exp: chrono::Utc::now().timestamp() - 3600, // expired 1 hour ago
+        auth_version: Some(1),
+        jti: None,
     };
 
     let expired_token = jwt::sign(&expired_claims, secret).expect("sign expired");
@@ -69,6 +75,8 @@ fn test_jwt_expiry() {
         audience: Audience::Admin,
         iat: chrono::Utc::now().timestamp(),
         exp: jwt::new_expiry(),
+        auth_version: Some(1),
+        jti: None,
     };
 
     let valid_token = jwt::sign(&valid_claims, secret).expect("sign valid");
@@ -89,6 +97,8 @@ fn test_jwt_claims_roundtrip() {
         audience: Audience::Admin,
         iat: chrono::Utc::now().timestamp(),
         exp: jwt::new_expiry(),
+        auth_version: Some(1),
+        jti: None,
     };
 
     let token = jwt::sign(&claims, secret).unwrap();

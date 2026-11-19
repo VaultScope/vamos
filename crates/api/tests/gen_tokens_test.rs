@@ -13,6 +13,8 @@ fn print_test_tokens() {
         audience: Audience::Admin,
         iat: now,
         exp: now + 86400,
+        auth_version: Some(1),
+        jti: None,
     };
     let admin_token = jwt::sign(&admin, secret).unwrap();
     println!("ADMIN_TOKEN={}", admin_token);
@@ -24,6 +26,8 @@ fn print_test_tokens() {
         audience: Audience::Storefront,
         iat: now,
         exp: now + 86400,
+        auth_version: Some(1),
+        jti: None,
     };
     let customer_token = jwt::sign(&customer, secret).unwrap();
     println!("CUSTOMER_TOKEN={}", customer_token);

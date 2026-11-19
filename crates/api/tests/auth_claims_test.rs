@@ -11,6 +11,8 @@ fn test_claims_serializes_to_correct_json_fields() {
         audience: Audience::Admin,
         iat: 1000,
         exp: 2000,
+        auth_version: Some(1),
+        jti: None,
     };
     let json = serde_json::to_value(&claims).unwrap();
     assert_eq!(json["sub"], sub.to_string());
@@ -76,6 +78,8 @@ fn test_similar_secrets_fail_verification() {
         audience: Audience::Admin,
         iat: chrono::Utc::now().timestamp(),
         exp: jwt::new_expiry(),
+        auth_version: Some(1),
+        jti: None,
     };
     let token = jwt::sign(&claims, "key1").unwrap();
     let result = jwt::verify(&token, "key1a", Audience::Admin);
@@ -91,6 +95,8 @@ fn test_secret_prefix_fails_verification() {
         audience: Audience::Admin,
         iat: chrono::Utc::now().timestamp(),
         exp: jwt::new_expiry(),
+        auth_version: Some(1),
+        jti: None,
     };
     let token = jwt::sign(&claims, "my_secret_key_long").unwrap();
     let result = jwt::verify(&token, "my_secret_key", Audience::Admin);
