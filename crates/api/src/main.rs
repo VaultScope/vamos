@@ -165,6 +165,7 @@ async fn main() {
         csrf_config: axum_csrf::CsrfConfig::default(),
         redis,
         ticket_bus,
+        sse_tickets: state::new_sse_tickets(),
     };
 
     let app = routes::build_router(state.clone())
@@ -188,7 +189,9 @@ async fn main() {
         pool.clone(),
         Arc::new(registry),
         std::time::Duration::from_secs(config.job_poll_interval_secs),
-    ).with_notifier(Arc::new(ApiJobNotifier {
+    )
+    .with_encryption_key(config.encryption_key_bytes())
+    .with_notifier(Arc::new(ApiJobNotifier {
         state: state.clone(),
     }));
     tokio::spawn(runner.run(shutdown_rx.clone()));
@@ -202,7 +205,10 @@ async fn main() {
     }));
     tokio::spawn(billing_runner.run(shutdown_rx.clone()));
 
-    axum::serve(listener, app)
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
         .with_graceful_shutdown(async move {
             let ctrl_c = async {
                 tokio::signal::ctrl_c()
