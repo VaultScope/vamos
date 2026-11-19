@@ -43,8 +43,8 @@ pub(crate) async fn list(
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<Service>>, ApiError> {
     crate::require_permission!(auth, state, "services.view");
-    let limit = params.limit.unwrap_or(50).min(200);
-    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    let offset = params.offset.unwrap_or(0).max(0);
 
     let services: Vec<Service> = match (params.customer_id, &params.status) {
         (Some(cid), Some(status)) => sqlx::query_as(
@@ -133,7 +133,10 @@ pub async fn create(
     State(state): State<AppState>,
     axum::Json(payload): axum::Json<CreateService>,
 ) -> Result<axum::Json<Service>, ApiError> {
-    crate::require_permission!(auth, state, "services.power");
+    crate::require_permission!(auth, state, "services.manage");
+    if payload.price < rust_decimal::Decimal::ZERO {
+        return Err(ApiError::BadRequest("Service price cannot be negative".into()));
+    }
 
     let product_trial_days: Option<i32> = sqlx::query_scalar("SELECT trial_days FROM products WHERE id = $1")
         .bind(payload.product_id)
@@ -252,14 +255,32 @@ pub async fn terminate(
     Ok(axum::Json(service))
 }
 
+#[derive(Deserialize, Default, ToSchema)]
+pub struct AdminIpmiPayload {
+    pub client_ip: Option<String>,
+}
+
+pub fn validate_optional_client_ip(raw: Option<&str>) -> Result<Option<String>, ApiError> {
+    let Some(ip_str) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed: std::net::IpAddr = ip_str
+        .parse()
+        .map_err(|_| ApiError::BadRequest("Invalid client_ip address".into()))?;
+    Ok(Some(parsed.to_string()))
+}
+
 #[utoipa::path(
     post,
     path = "/{id}/ipmi",
     tag = "Admin Services",
     security(("bearer_auth" = []), ("csrf_token" = [])),
     params(("id" = Uuid, Path, description = "Service ID")),
+    request_body = Option<AdminIpmiPayload>,
     responses(
         (status = 200, description = "IPMI KVM session details", body = serde_json::Value),
+        (status = 400, description = "Invalid client_ip", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 404, description = "Service not found", body = ErrorResponse)
     )
 )]
@@ -267,8 +288,13 @@ pub async fn admin_ipmi(
     auth: AuthAdmin,
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
+    payload: Option<Json<AdminIpmiPayload>>,
 ) -> Result<axum::Json<serde_json::Value>, ApiError> {
-    crate::require_permission!(auth, state, "services.view");
+    crate::require_permission!(auth, state, "services.power");
+    let validated_ip = validate_optional_client_ip(
+        payload.as_ref().and_then(|p| p.0.client_ip.as_deref()),
+    )?;
+
     let service: Service = sqlx::query_as(
         "SELECT * FROM services WHERE id = $1"
     )
@@ -284,8 +310,11 @@ pub async fn admin_ipmi(
     };
 
     let rs = state.config.reliablesite_connector();
+    let effective_ip = validated_ip
+        .as_deref()
+        .unwrap_or("Admin Staff Session");
 
-    let session = rs.request_ipmi_session(&resource_id, Some("Admin Staff Session")).await
+    let session = rs.request_ipmi_session(&resource_id, Some(effective_ip)).await
         .map_err(|e| ApiError::Internal(format!("Failed to generate IPMI session: {e}")))?;
 
     Ok(axum::Json(session))
@@ -299,6 +328,7 @@ pub async fn admin_ipmi(
     params(("id" = Uuid, Path, description = "Service ID")),
     responses(
         (status = 200, description = "IPMI KVM session details", body = serde_json::Value),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 404, description = "Service not found", body = ErrorResponse)
     )
 )]
@@ -307,6 +337,6 @@ pub(crate) async fn admin_ipmi_get(
     state: State<AppState>,
     path: axum::extract::Path<uuid::Uuid>,
 ) -> Result<axum::Json<serde_json::Value>, ApiError> {
-    admin_ipmi(auth, state, path).await
+    admin_ipmi(auth, state, path, None).await
 }
 

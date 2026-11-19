@@ -9,8 +9,57 @@ use crate::auth::AuthAdmin;
 use crate::error::ApiError;
 use crate::openapi::{BinaryFileUpload, ErrorResponse};
 use crate::state::AppState;
-use crate::validation::{validate_email, validate_required_string};
+use crate::validation::{validate_email, validate_required_string, validate_string_length};
 use vaultscope_db::models::{Role, Staff};
+
+/// Prevents RBAC privilege escalation when creating/updating staff or roles.
+/// Non-wildcard callers may never grant `"*"` and may only assign roles whose
+/// permissions are a subset of the caller's own permissions (including `"rbac.manage"`).
+pub fn ensure_role_assignable(
+    caller_perms: &[String],
+    target_perms: &[String],
+) -> Result<(), ApiError> {
+    if caller_perms.iter().any(|p| p == "*") {
+        return Ok(());
+    }
+    for perm in target_perms {
+        if perm == "*" || !caller_perms.iter().any(|cp| cp == perm) {
+            return Err(ApiError::Forbidden);
+        }
+    }
+    Ok(())
+}
+
+async fn fetch_caller_permissions(
+    db: &sqlx::PgPool,
+    staff_id: Uuid,
+) -> Result<Vec<String>, ApiError> {
+    let caller: Staff = sqlx::query_as("SELECT * FROM staff WHERE id = $1")
+        .bind(staff_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+
+    let role: Role = sqlx::query_as("SELECT * FROM roles WHERE id = $1")
+        .bind(caller.role_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or(ApiError::Forbidden)?;
+
+    Ok(role.permissions)
+}
+
+async fn hash_staff_password(pw: String) -> Result<String, ApiError> {
+    if pw.trim().is_empty() || !(8..=72).contains(&pw.len()) {
+        return Err(ApiError::BadRequest(
+            "Password must be between 8 and 72 bytes".into(),
+        ));
+    }
+    tokio::task::spawn_blocking(move || bcrypt::hash(pw, bcrypt::DEFAULT_COST))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Password hashing task failed: {e}")))?
+        .map_err(|e| ApiError::Internal(format!("Password hashing failed: {e}")))
+}
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -166,6 +215,9 @@ pub(crate) async fn create_role(
     Json(payload): Json<CreateRole>,
 ) -> Result<Json<Role>, ApiError> {
     crate::require_permission!(auth, state, "rbac.manage");
+    let caller_perms = fetch_caller_permissions(&state.db, auth.0.sub).await?;
+    ensure_role_assignable(&caller_perms, &payload.permissions)?;
+
     let role: Role = sqlx::query_as(
         r#"INSERT INTO roles (name, permissions, mapped_group)
            VALUES ($1, $2, $3)
@@ -206,6 +258,19 @@ pub(crate) async fn update_role(
     Json(payload): Json<UpdateRole>,
 ) -> Result<Json<Role>, ApiError> {
     crate::require_permission!(auth, state, "rbac.manage");
+    let caller_perms = fetch_caller_permissions(&state.db, auth.0.sub).await?;
+
+    let existing_role: Role = sqlx::query_as("SELECT * FROM roles WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::NotFound("role not found".into()))?;
+    ensure_role_assignable(&caller_perms, &existing_role.permissions)?;
+
+    if let Some(ref new_perms) = payload.permissions {
+        ensure_role_assignable(&caller_perms, new_perms)?;
+    }
+
     let role: Role = sqlx::query_as(
         r#"UPDATE roles
            SET name = COALESCE($1, name),
@@ -287,7 +352,8 @@ pub(crate) struct CreateStaff {
     request_body = CreateStaff,
     responses(
         (status = 200, description = "Staff account created", body = Staff),
-        (status = 400, description = "Invalid input", body = ErrorResponse)
+        (status = 400, description = "Invalid input", body = ErrorResponse),
+        (status = 403, description = "Forbidden role assignment", body = ErrorResponse)
     )
 )]
 pub(crate) async fn create_staff(
@@ -296,17 +362,25 @@ pub(crate) async fn create_staff(
     Json(payload): Json<CreateStaff>,
 ) -> Result<Json<Staff>, ApiError> {
     crate::require_permission!(auth, state, "staff.manage");
+    let caller_perms = fetch_caller_permissions(&state.db, auth.0.sub).await?;
+
+    let target_role: Role = sqlx::query_as("SELECT * FROM roles WHERE id = $1")
+        .bind(payload.role_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("Invalid role_id".into()))?;
+    ensure_role_assignable(&caller_perms, &target_role.permissions)?;
+
     let ext_id = payload
         .external_id
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("local_{}", Uuid::now_v7()));
     validate_required_string(&payload.username, "Username")?;
-    validate_email(&payload.email)?;
+    let email = payload.email.trim().to_string();
+    validate_email(&email)?;
 
     let password_hash = match payload.password {
-        Some(pw) if !pw.trim().is_empty() => {
-            Some(bcrypt::hash(pw, bcrypt::DEFAULT_COST).map_err(|e| ApiError::Internal(e.to_string()))?)
-        }
+        Some(pw) if !pw.is_empty() => Some(hash_staff_password(pw).await?),
         _ => None,
     };
 
@@ -317,10 +391,10 @@ pub(crate) async fn create_staff(
     )
     .bind(Uuid::now_v7())
     .bind(&ext_id)
-    .bind(&payload.first_name)
-    .bind(&payload.last_name)
-    .bind(&payload.username)
-    .bind(&payload.email)
+    .bind(payload.first_name.trim())
+    .bind(payload.last_name.trim())
+    .bind(payload.username.trim())
+    .bind(&email)
     .bind(payload.role_id)
     .bind(password_hash)
     .fetch_one(&state.db)
@@ -348,6 +422,7 @@ pub(crate) struct UpdateStaff {
     request_body = UpdateStaff,
     responses(
         (status = 200, description = "Staff account updated", body = Staff),
+        (status = 403, description = "Forbidden role assignment or self role change", body = ErrorResponse),
         (status = 404, description = "Staff not found", body = ErrorResponse)
     )
 )]
@@ -358,12 +433,57 @@ pub(crate) async fn update_staff(
     Json(payload): Json<UpdateStaff>,
 ) -> Result<Json<Staff>, ApiError> {
     crate::require_permission!(auth, state, "staff.manage");
-    let password_hash = match payload.password {
-        Some(pw) if !pw.trim().is_empty() => {
-            Some(bcrypt::hash(pw, bcrypt::DEFAULT_COST).map_err(|e| ApiError::Internal(e.to_string()))?)
+    let caller_perms = fetch_caller_permissions(&state.db, auth.0.sub).await?;
+
+    let target_staff: Staff = sqlx::query_as("SELECT * FROM staff WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::NotFound("staff not found".into()))?;
+
+    let existing_role: Role = sqlx::query_as("SELECT * FROM roles WHERE id = $1")
+        .bind(target_staff.role_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::Forbidden)?;
+    ensure_role_assignable(&caller_perms, &existing_role.permissions)?;
+
+    if let Some(new_role_id) = payload.role_id {
+        if id == auth.0.sub && new_role_id != target_staff.role_id {
+            return Err(ApiError::Forbidden);
         }
+        let target_role: Role = sqlx::query_as("SELECT * FROM roles WHERE id = $1")
+            .bind(new_role_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("Invalid role_id".into()))?;
+        ensure_role_assignable(&caller_perms, &target_role.permissions)?;
+    }
+
+    let trimmed_username = match payload.username {
+        Some(ref u) => {
+            validate_required_string(u, "Username")?;
+            Some(u.trim().to_string())
+        }
+        None => None,
+    };
+
+    let trimmed_email = match payload.email {
+        Some(ref e) => {
+            let trimmed = e.trim().to_string();
+            validate_email(&trimmed)?;
+            Some(trimmed)
+        }
+        None => None,
+    };
+
+    let password_hash = match payload.password {
+        Some(pw) if !pw.is_empty() => Some(hash_staff_password(pw).await?),
         _ => None,
     };
+
+    let role_changed = payload.role_id.is_some_and(|r| r != target_staff.role_id);
+    let bump_auth = password_hash.is_some() || role_changed;
 
     let staff: Staff = sqlx::query_as(
         r#"UPDATE staff
@@ -371,18 +491,27 @@ pub(crate) async fn update_staff(
                last_name = COALESCE($2, last_name),
                username = COALESCE($3, username),
                email = COALESCE($4, email),
+               email_verified = CASE
+                   WHEN $4 IS NOT NULL AND LOWER($4) IS DISTINCT FROM LOWER(email) THEN false
+                   ELSE email_verified
+               END,
                role_id = COALESCE($5, role_id),
                password_hash = COALESCE($6, password_hash),
+               auth_version = CASE
+                   WHEN $7 THEN auth_version + 1
+                   ELSE auth_version
+               END,
                updated_at = now()
-           WHERE id = $7
+           WHERE id = $8
            RETURNING *"#,
     )
-    .bind(payload.first_name)
-    .bind(payload.last_name)
-    .bind(payload.username)
-    .bind(payload.email)
+    .bind(payload.first_name.map(|s| s.trim().to_string()))
+    .bind(payload.last_name.map(|s| s.trim().to_string()))
+    .bind(trimmed_username)
+    .bind(trimmed_email)
     .bind(payload.role_id)
     .bind(password_hash)
+    .bind(bump_auth)
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -399,6 +528,7 @@ pub(crate) async fn update_staff(
     params(("id" = Uuid, Path, description = "Staff ID")),
     responses(
         (status = 200, description = "Staff account deleted"),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 404, description = "Staff not found", body = ErrorResponse)
     )
 )]
@@ -413,10 +543,23 @@ pub(crate) async fn delete_staff(
         crate::require_permission!(auth, state, "staff.manage");
     }
 
-    let target_staff: Option<Staff> = sqlx::query_as("SELECT * FROM staff WHERE id = $1")
+    if id == auth.0.sub {
+        return Err(ApiError::Forbidden);
+    }
+
+    let caller_perms = fetch_caller_permissions(&state.db, auth.0.sub).await?;
+    let target_staff: Staff = sqlx::query_as("SELECT * FROM staff WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
-        .await?;
+        .await?
+        .ok_or(ApiError::NotFound("staff not found".into()))?;
+
+    let target_role: Role = sqlx::query_as("SELECT * FROM roles WHERE id = $1")
+        .bind(target_staff.role_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::Forbidden)?;
+    ensure_role_assignable(&caller_perms, &target_role.permissions)?;
 
     let result = sqlx::query("DELETE FROM staff WHERE id = $1")
         .bind(id)
@@ -427,18 +570,16 @@ pub(crate) async fn delete_staff(
         return Err(ApiError::NotFound("staff not found".into()));
     }
 
-    if let Some(target) = target_staff {
-        crate::activity::spawn_record(
-            state.db.clone(),
-            Some(auth.0.sub),
-            vaultscope_db::models::ActorType::Staff,
-            auth.0.email.clone(),
-            "staff".to_string(),
-            "deleted_staff_account".to_string(),
-            target.email.clone(),
-            format!("Deleted staff account @{} ({})", target.username, target.email),
-        );
-    }
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(auth.0.sub),
+        vaultscope_db::models::ActorType::Staff,
+        auth.0.email.clone(),
+        "staff".to_string(),
+        "deleted_staff_account".to_string(),
+        target_staff.email.clone(),
+        format!("Deleted staff account @{} ({})", target_staff.username, target_staff.email),
+    );
 
     Ok(Json(()))
 }
@@ -459,6 +600,7 @@ pub(crate) struct UpdateMe {
     request_body = UpdateMe,
     responses(
         (status = 200, description = "Current staff profile updated", body = Staff),
+        (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "Staff not found", body = ErrorResponse)
     )
 )]
@@ -468,20 +610,48 @@ pub(crate) async fn update_me(
     Json(payload): Json<UpdateMe>,
 ) -> Result<Json<Staff>, ApiError> {
     let id = auth.0.sub;
+
+    if let Some(ref f) = payload.first_name {
+        validate_string_length(f, "First name", 255)?;
+    }
+    if let Some(ref l) = payload.last_name {
+        validate_string_length(l, "Last name", 255)?;
+    }
+    let trimmed_username = match payload.username {
+        Some(ref u) => {
+            validate_required_string(u, "Username")?;
+            validate_string_length(u.trim(), "Username", 150)?;
+            Some(u.trim().to_string())
+        }
+        None => None,
+    };
+    let trimmed_email = match payload.email {
+        Some(ref e) => {
+            let trimmed = e.trim().to_string();
+            validate_email(&trimmed)?;
+            Some(trimmed)
+        }
+        None => None,
+    };
+
     let staff: Staff = sqlx::query_as(
         r#"UPDATE staff
            SET first_name = COALESCE($1, first_name),
                last_name = COALESCE($2, last_name),
                username = COALESCE($3, username),
                email = COALESCE($4, email),
+               email_verified = CASE
+                   WHEN $4 IS NOT NULL AND LOWER($4) IS DISTINCT FROM LOWER(email) THEN false
+                   ELSE email_verified
+               END,
                updated_at = now()
            WHERE id = $5
            RETURNING *"#,
     )
-    .bind(payload.first_name)
-    .bind(payload.last_name)
-    .bind(payload.username)
-    .bind(payload.email)
+    .bind(payload.first_name.map(|s| s.trim().to_string()))
+    .bind(payload.last_name.map(|s| s.trim().to_string()))
+    .bind(trimmed_username)
+    .bind(trimmed_email)
     .bind(id)
     .fetch_optional(&state.db)
     .await?
