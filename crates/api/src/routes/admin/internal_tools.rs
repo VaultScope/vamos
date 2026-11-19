@@ -9,7 +9,37 @@ use crate::auth::AuthAdmin;
 use crate::error::ApiError;
 use crate::openapi::ErrorResponse;
 use crate::state::AppState;
+use crate::validation::validate_required_string;
 use vaultscope_db::models::InternalTool;
+
+pub fn validate_tool_url(raw: &str) -> Result<String, ApiError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 2048 {
+        return Err(ApiError::BadRequest(
+            "Tool URL must be between 1 and 2048 characters".into(),
+        ));
+    }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(ApiError::BadRequest(
+            "Tool URL must not contain whitespace or control characters".into(),
+        ));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("https://") && !lower.starts_with("http://") {
+        return Err(ApiError::BadRequest(
+            "Tool URL must use http:// or https:// scheme".into(),
+        ));
+    }
+    let parsed = reqwest::Url::parse(trimmed)
+        .map_err(|_| ApiError::BadRequest("Invalid tool URL format".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.has_host()
+        || parsed.host_str().unwrap_or("").is_empty()
+    {
+        return Err(ApiError::BadRequest("Invalid tool URL host".into()));
+    }
+    Ok(trimmed.to_string())
+}
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -82,14 +112,17 @@ pub(crate) async fn create(
     Json(payload): Json<CreateInternalTool>,
 ) -> Result<Json<InternalTool>, ApiError> {
     crate::require_permission!(auth, state, "internal_tools.manage");
+    validate_required_string(&payload.name, "name")?;
+    let valid_url = validate_tool_url(&payload.url)?;
+
     let tool: InternalTool = sqlx::query_as(
         r#"INSERT INTO internal_tools (name, url, required_permission)
            VALUES ($1, $2, $3)
            RETURNING *"#,
     )
-    .bind(payload.name)
-    .bind(payload.url)
-    .bind(payload.required_permission)
+    .bind(payload.name.trim())
+    .bind(valid_url)
+    .bind(payload.required_permission.trim())
     .fetch_one(&state.db)
     .await?;
 
@@ -122,6 +155,14 @@ pub(crate) async fn update(
     Json(payload): Json<UpdateInternalTool>,
 ) -> Result<Json<InternalTool>, ApiError> {
     crate::require_permission!(auth, state, "internal_tools.manage");
+    if let Some(ref name) = payload.name {
+        validate_required_string(name, "name")?;
+    }
+    let valid_url = match payload.url {
+        Some(ref u) => Some(validate_tool_url(u)?),
+        None => None,
+    };
+
     let tool: InternalTool = sqlx::query_as(
         r#"UPDATE internal_tools
            SET name = COALESCE($1, name),
@@ -130,9 +171,9 @@ pub(crate) async fn update(
            WHERE id = $4
            RETURNING *"#,
     )
-    .bind(payload.name)
-    .bind(payload.url)
-    .bind(payload.required_permission)
+    .bind(payload.name.map(|s| s.trim().to_string()))
+    .bind(valid_url)
+    .bind(payload.required_permission.map(|s| s.trim().to_string()))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
