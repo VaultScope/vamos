@@ -9,7 +9,7 @@ use crate::auth::AuthAdmin;
 use crate::error::ApiError;
 use crate::openapi::{ErrorResponse, OkMessageResponse};
 use crate::state::AppState;
-use vaultscope_db::models::{Customer, CustomerStatus, Staff};
+use vaultscope_db::models::{Customer, CustomerStatus, Role, Staff};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -42,8 +42,8 @@ pub(crate) async fn list(
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<CustomerWithStats>>, ApiError> {
     crate::require_permission!(auth, state, "customers.view");
-    let limit = params.limit.unwrap_or(50).min(200);
-    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    let offset = params.offset.unwrap_or(0).max(0);
 
     let customers: Vec<Customer> = match (&params.status, &params.search) {
         (Some(status), Some(search)) => {
@@ -173,15 +173,6 @@ pub(crate) async fn update(
     Ok(Json(customer))
 }
 
-#[allow(dead_code)]
-#[derive(utoipa::ToSchema)]
-pub(crate) struct ResendVerificationResponse {
-    pub ok: bool,
-    pub message: String,
-    pub verification_token: String,
-    pub verification_link: String,
-}
-
 #[utoipa::path(
     post,
     path = "/{id}/resend-verification",
@@ -189,7 +180,7 @@ pub(crate) struct ResendVerificationResponse {
     security(("bearer_auth" = []), ("csrf_token" = [])),
     params(("id" = Uuid, Path, description = "Customer ID")),
     responses(
-        (status = 200, description = "Verification email resent", body = ResendVerificationResponse),
+        (status = 200, description = "Verification email resent", body = OkMessageResponse),
         (status = 404, description = "Customer not found", body = ErrorResponse)
     )
 )]
@@ -215,9 +206,6 @@ pub(crate) async fn resend_verification_email(
         .execute(&state.db)
         .await?;
 
-    let base = state.config.storefront_url.trim_end_matches('/');
-    let verification_link = format!("{}/verify-email?token={}", base, verification_token);
-
     crate::routes::auth::send_verification_email(
         &state.config,
         Some(state.db.clone()),
@@ -228,9 +216,7 @@ pub(crate) async fn resend_verification_email(
 
     Ok(Json(serde_json::json!({
         "ok": true,
-        "message": format!("Verification email sent to {}", customer.email),
-        "verification_token": verification_token,
-        "verification_link": verification_link
+        "message": format!("Verification email sent to {}", customer.email)
     })))
 }
 
@@ -291,7 +277,8 @@ pub struct PromoteCustomerPayload {
     request_body = PromoteCustomerPayload,
     responses(
         (status = 200, description = "Customer promoted to staff", body = Staff),
-        (status = 400, description = "Invalid role ID", body = ErrorResponse),
+        (status = 400, description = "Invalid role ID or password", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions to assign target role", body = ErrorResponse),
         (status = 404, description = "Customer not found", body = ErrorResponse)
     )
 )]
@@ -303,21 +290,62 @@ pub(crate) async fn promote_to_staff(
 ) -> Result<Json<Staff>, ApiError> {
     crate::require_permission!(auth, state, "staff.manage");
 
-    // 1. Fetch customer
+    // 1. Validate caller's RBAC privilege to assign the target role
+    let caller_staff: Staff = sqlx::query_as("SELECT * FROM staff WHERE id = $1")
+        .bind(auth.0.sub)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    let caller_role: Role = sqlx::query_as("SELECT * FROM roles WHERE id = $1")
+        .bind(caller_staff.role_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::Forbidden)?;
+
+    let target_role: Role = sqlx::query_as("SELECT * FROM roles WHERE id = $1")
+        .bind(payload.role_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("Invalid role_id".into()))?;
+
+    let caller_is_owner = caller_role.permissions.iter().any(|p| p == "*");
+    let caller_has_rbac_manage = caller_role.permissions.iter().any(|p| p == "rbac.manage");
+    let target_is_owner = target_role.permissions.iter().any(|p| p == "*")
+        || target_role.name.eq_ignore_ascii_case("Owner")
+        || target_role.name.eq_ignore_ascii_case("Super Admin");
+
+    if target_is_owner && !caller_is_owner && !caller_has_rbac_manage {
+        return Err(ApiError::Forbidden);
+    }
+    if !caller_is_owner && !caller_has_rbac_manage {
+        let has_all_target_perms = target_role
+            .permissions
+            .iter()
+            .all(|perm| caller_role.permissions.contains(perm));
+        if !has_all_target_perms {
+            return Err(ApiError::Forbidden);
+        }
+    }
+
+    // Validate optional password up front before touching DB state
+    let validated_password = match payload.password {
+        Some(pw) if !pw.is_empty() => {
+            if pw.trim().is_empty() || pw.chars().count() < 8 || pw.len() > 72 {
+                return Err(ApiError::BadRequest(
+                    "Password must be between 8 and 72 characters".into(),
+                ));
+            }
+            Some(pw)
+        }
+        _ => None,
+    };
+
+    // 2. Fetch customer
     let customer: Customer = sqlx::query_as("SELECT * FROM customers WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
-
-    // 2. Validate role
-    let role_exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM roles WHERE id = $1")
-        .bind(payload.role_id)
-        .fetch_optional(&state.db)
-        .await?;
-    if role_exists.is_none() {
-        return Err(ApiError::BadRequest("Invalid role_id".into()));
-    }
 
     // 3. Check if staff already exists with this email
     let existing_staff: Option<Staff> = sqlx::query_as("SELECT * FROM staff WHERE email = $1")
@@ -326,6 +354,21 @@ pub(crate) async fn promote_to_staff(
         .await?;
 
     if let Some(existing) = existing_staff {
+        if !caller_is_owner && !caller_has_rbac_manage {
+            let existing_role: Option<Role> =
+                sqlx::query_as("SELECT * FROM roles WHERE id = $1")
+                    .bind(existing.role_id)
+                    .fetch_optional(&state.db)
+                    .await?;
+            if let Some(ref er) = existing_role {
+                let existing_is_owner = er.permissions.iter().any(|p| p == "*")
+                    || er.name.eq_ignore_ascii_case("Owner")
+                    || er.name.eq_ignore_ascii_case("Super Admin");
+                if existing_is_owner {
+                    return Err(ApiError::Forbidden);
+                }
+            }
+        }
         let updated: Staff = sqlx::query_as(
             "UPDATE staff SET role_id = $1, updated_at = now() WHERE id = $2 RETURNING *"
         )
@@ -355,12 +398,17 @@ pub(crate) async fn promote_to_staff(
     let first_name = parts.next().unwrap_or("").to_string();
     let last_name = parts.collect::<Vec<_>>().join(" ");
 
-    // 6. Handle password hash
-    let password_hash = match payload.password {
-        Some(pw) if !pw.trim().is_empty() => {
-            Some(bcrypt::hash(pw, bcrypt::DEFAULT_COST).map_err(|e| ApiError::Internal(e.to_string()))?)
+    // 6. Handle password hash on blocking threadpool
+    let password_hash = match validated_password {
+        Some(pw) => {
+            let hashed =
+                tokio::task::spawn_blocking(move || bcrypt::hash(pw, bcrypt::DEFAULT_COST))
+                    .await
+                    .map_err(|e| ApiError::Internal(e.to_string()))?
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+            Some(hashed)
         }
-        _ => customer.password_hash,
+        None => customer.password_hash,
     };
 
     // 7. Insert new staff row
@@ -407,63 +455,114 @@ pub(crate) async fn delete_customer(
         crate::require_permission!(auth, state, "customers.manage");
     }
 
+    let mut tx = state.db.begin().await?;
+
     let customer: Customer = sqlx::query_as("SELECT * FROM customers WHERE id = $1")
         .bind(id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
 
-    // Delete secondary billing emails
-    let _ = sqlx::query("DELETE FROM customer_billing_emails WHERE customer_id = $1")
+    // Queue 'delete' provisioning jobs for any provisioned services before removing service rows
+    #[derive(sqlx::FromRow)]
+    struct ProvisionedServiceRow {
+        id: Uuid,
+        provider_resource_id: String,
+        provider: Option<String>,
+    }
+
+    let provisioned_services: Vec<ProvisionedServiceRow> = sqlx::query_as(
+        r#"SELECT s.id, s.provider_resource_id, p.provider
+           FROM services s
+           LEFT JOIN products p ON p.id = s.product_id
+           WHERE s.customer_id = $1 AND btrim(s.provider_resource_id) <> ''"#,
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    for svc in provisioned_services {
+        let target_api = svc
+            .provider
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| "sftpgo".to_string());
+        let delete_payload = serde_json::json!({
+            "resource_id": svc.provider_resource_id
+        });
+        sqlx::query(
+            r#"INSERT INTO jobs (id, task, target_api, customer_id, service_id, request_payload)
+               VALUES ($1, 'delete', $2, $3, $4, $5)"#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(target_api)
         .bind(id)
-        .execute(&state.db)
-        .await;
+        .bind(svc.id)
+        .bind(&delete_payload)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Delete secondary billing emails
+    sqlx::query("DELETE FROM customer_billing_emails WHERE customer_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
 
     // Delete tickets and ticket messages
-    let _ = sqlx::query(
+    sqlx::query(
         "DELETE FROM ticket_messages WHERE ticket_id IN (SELECT id FROM tickets WHERE customer_id = $1)"
     )
     .bind(id)
-    .execute(&state.db)
-    .await;
-    let _ = sqlx::query("DELETE FROM tickets WHERE customer_id = $1")
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM tickets WHERE customer_id = $1")
         .bind(id)
-        .execute(&state.db)
-        .await;
+        .execute(&mut *tx)
+        .await?;
 
-    // Delete invoices and invoice line items
-    let _ = sqlx::query(
-        "DELETE FROM invoice_line_items WHERE invoice_id IN (SELECT id FROM invoices WHERE customer_id = $1)"
+    // Preserve statutory non-draft invoices and their line items; delete only drafts
+    sqlx::query(
+        "DELETE FROM invoice_line_items WHERE invoice_id IN (SELECT id FROM invoices WHERE customer_id = $1 AND status = 'draft'::invoice_status)"
     )
     .bind(id)
-    .execute(&state.db)
-    .await;
-    let _ = sqlx::query("DELETE FROM invoices WHERE customer_id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await;
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM invoices WHERE customer_id = $1 AND status = 'draft'::invoice_status"
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE invoices SET customer_id = NULL, updated_at = now() WHERE customer_id = $1 AND status <> 'draft'::invoice_status"
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
 
-    // Delete services
-    let _ = sqlx::query("DELETE FROM services WHERE customer_id = $1")
+    // Delete services (ON DELETE SET NULL keeps queued deletion jobs and retained line items valid)
+    sqlx::query("DELETE FROM services WHERE customer_id = $1")
         .bind(id)
-        .execute(&state.db)
-        .await;
+        .execute(&mut *tx)
+        .await?;
 
-    // Unlink jobs
-    let _ = sqlx::query("UPDATE jobs SET customer_id = NULL WHERE customer_id = $1")
+    // Unlink jobs from deleted customer while preserving job history and queued delete tasks
+    sqlx::query("UPDATE jobs SET customer_id = NULL WHERE customer_id = $1")
         .bind(id)
-        .execute(&state.db)
-        .await;
+        .execute(&mut *tx)
+        .await?;
 
     // Delete customer
     let res = sqlx::query("DELETE FROM customers WHERE id = $1")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
 
     if res.rows_affected() == 0 {
         return Err(ApiError::NotFound("Customer not found".into()));
     }
+
+    tx.commit().await?;
 
     crate::activity::spawn_record(
         state.db.clone(),
