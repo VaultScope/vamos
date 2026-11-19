@@ -62,7 +62,10 @@ impl ReliableSite {
         inventory_url: String,
         default_payment_method: Option<String>,
     ) -> Self {
-        let client = Client::new();
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         let clean_key = api_key.trim().to_string();
         let order_client =
             OrderApiClient::new(client.clone(), order_api_url.clone(), clean_key.clone());
@@ -144,10 +147,7 @@ impl ReliableSite {
         };
         let ipmi_host = format!("kvm-{}.oob.vaultscope.de", prefix);
         let ipmi_username = format!("kvm_{}", clean_id.chars().take(8).collect::<String>());
-        let ipmi_password = format!(
-            "Vs#Kvm_{}!",
-            clean_id.chars().rev().take(6).collect::<String>()
-        );
+        let ipmi_password = vaultscope_common::crypto::generate_random_secret(16);
         let web_url = format!("https://{}", ipmi_host);
 
         info!(
@@ -674,7 +674,16 @@ mod tests {
         assert_eq!(session["whitelisted_ip"], "198.51.100.42");
         assert!(session["ipmi_host"].as_str().unwrap().contains("oob.vaultscope.de"));
         assert!(session["ipmi_username"].as_str().unwrap().starts_with("kvm_"));
-        assert!(!session["ipmi_password"].as_str().unwrap().is_empty());
+        let pw1 = session["ipmi_password"].as_str().unwrap();
+        assert_eq!(pw1.len(), 16);
+        assert!(pw1.bytes().all(|b| b.is_ascii_alphanumeric()));
+        assert!(!pw1.starts_with("Vs#Kvm_"));
+
+        let session2 = rs
+            .request_ipmi_session("ds-mia-88219", Some("198.51.100.42"))
+            .await
+            .expect("second IPMI session generation failed");
+        assert_ne!(pw1, session2["ipmi_password"].as_str().unwrap());
         assert!(session["expires_at"].as_str().is_some());
     }
 

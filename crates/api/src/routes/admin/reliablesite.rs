@@ -163,7 +163,10 @@ pub(crate) async fn get_payment_methods(
         .order_api()
         .get_payment_methods(query.product_id)
         .await
-        .map_err(|e| ApiError::Internal(format!("ReliableSite PaymentMethods failed: {e}")))?;
+        .map_err(|e| {
+            tracing::error!("ReliableSite PaymentMethods failed: {e}");
+            ApiError::Internal("Failed to retrieve ReliableSite payment methods".into())
+        })?;
     Ok(Json(methods))
 }
 
@@ -201,6 +204,9 @@ pub(crate) async fn get_promo_codes(
         .order_api()
         .get_reseller_promo_codes(query.configuration_id)
         .await
-        .map_err(|e| ApiError::Internal(format!("ReliableSite Reseller PromoCodes failed: {e}")))?;
+        .map_err(|e| {
+            tracing::error!("ReliableSite Reseller PromoCodes failed: {e}");
+            ApiError::Internal("Failed to retrieve ReliableSite promo codes".into())
+        })?;
     Ok(Json(promos))
 }

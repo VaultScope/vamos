@@ -32,6 +32,8 @@ fn make_token(sub: Uuid, email: &str, role: &str, audience: Audience, secret: &s
         audience,
         iat: chrono::Utc::now().timestamp(),
         exp: jwt::new_expiry(),
+        auth_version: Some(1),
+        jti: None,
     };
     jwt::sign(&claims, secret).unwrap()
 }
@@ -169,8 +171,8 @@ async fn test_storefront_reliablesite_options_quote_and_validation() {
     )
     .bind(cust_id)
     .bind(format!("cust_{}", cust_id.simple()))
-    .bind(format!("rsbuyer_{}", &cust_id.to_string()[..8]))
-    .bind(format!("rsbuyer_{}@test.local", &cust_id.to_string()[..8]))
+    .bind(format!("rsbuyer_{}", &cust_id.simple().to_string()[20..]))
+    .bind(format!("rsbuyer_{}@test.local", &cust_id.simple().to_string()[20..]))
     .execute(&state.db)
     .await
     .unwrap();
@@ -419,8 +421,8 @@ async fn test_orders_out_of_stock_and_sftp_regression_and_admin_sync() {
     )
     .bind(cust_id)
     .bind(format!("cust_reg_{}", cust_id.simple()))
-    .bind(format!("reg_{}", &cust_id.to_string()[..8]))
-    .bind(format!("reg_{}@test.local", &cust_id.to_string()[..8]))
+    .bind(format!("reg_{}", &cust_id.simple().to_string()[20..]))
+    .bind(format!("reg_{}@test.local", &cust_id.simple().to_string()[20..]))
     .execute(&state.db)
     .await
     .unwrap();
@@ -436,8 +438,8 @@ async fn test_orders_out_of_stock_and_sftp_regression_and_admin_sync() {
     )
     .bind(staff_id)
     .bind(format!("ext_{}", staff_id.simple()))
-    .bind(format!("adm_{}", &staff_id.to_string()[..8]))
-    .bind(format!("adm_{}@test.local", &staff_id.to_string()[..8]))
+    .bind(format!("adm_{}", &staff_id.simple().to_string()[20..]))
+    .bind(format!("adm_{}@test.local", &staff_id.simple().to_string()[20..]))
     .bind(role_id)
     .execute(&state.db)
     .await

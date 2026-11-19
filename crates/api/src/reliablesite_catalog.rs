@@ -488,12 +488,22 @@ pub fn sanitize_service_for_storefront(mut service: Service) -> Service {
     if let Some(obj) = service.config.as_object_mut() {
         obj.remove("provider");
         obj.remove("reliablesite_product_id");
+        obj.remove("password");
+        obj.remove("root_password");
         if let Some(raw_obj) = obj.get_mut("raw_response").and_then(|v| v.as_object_mut()) {
             raw_obj.remove("provider");
             raw_obj.remove("paymentMethod");
             raw_obj.remove("productId");
             raw_obj.remove("replayed");
             raw_obj.remove("idempotencyKey");
+            raw_obj.remove("password");
+            raw_obj.remove("root_password");
+            if let Some(sftp_obj) = raw_obj
+                .get_mut("sftpgo_user")
+                .and_then(|v| v.as_object_mut())
+            {
+                sftp_obj.remove("password");
+            }
             if let Some(rid) = raw_obj
                 .get("resource_id")
                 .and_then(|v| v.as_str())
