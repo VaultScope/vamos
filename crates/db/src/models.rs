@@ -151,6 +151,7 @@ pub struct Staff {
     pub last_login_ip: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing)]
     pub password_hash: Option<String>,
 }
 
@@ -175,9 +176,11 @@ pub struct Customer {
     pub created_at: DateTime<Utc>,
     pub last_login: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing)]
     pub password_hash: Option<String>,
+    #[serde(default, skip_serializing)]
     pub verification_token: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub totp_secret: Option<String>,
     #[serde(default)]
     pub vat_verified: bool,
@@ -426,6 +429,7 @@ pub struct Mailbox {
     pub host: String,
     pub port: i32,
     pub user_name: String,
+    #[serde(default, skip_serializing)]
     pub password: String,
     pub is_default: bool,
     pub created_at: DateTime<Utc>,
@@ -504,6 +508,7 @@ pub struct CustomerBillingEmail {
     pub customer_id: Uuid,
     pub email: String,
     pub verified: bool,
+    #[serde(default, skip_serializing)]
     pub verification_token: Option<String>,
     pub created_at: DateTime<Utc>,
     pub verified_at: Option<DateTime<Utc>>,
