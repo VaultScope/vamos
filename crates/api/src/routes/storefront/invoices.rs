@@ -10,6 +10,7 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use super::orders::{is_unique_violation, stripe_http_client, validate_stripe_payment_intent_id};
 use crate::auth::AuthCustomer;
 use crate::error::ApiError;
 use crate::openapi::ErrorResponse;
@@ -22,6 +23,62 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(download_pdf))
         .routes(routes!(create_invoice_payment_intent))
         .routes(routes!(pay_invoice))
+}
+
+/// Verifies a Stripe PaymentIntent JSON response against an invoice's expected
+/// currency, metadata (`invoice_id`, `customer_id`, optional `purpose`), and amount.
+pub fn verify_invoice_stripe_pi_response(
+    pi_data: &Value,
+    expected_invoice_id: Uuid,
+    expected_customer_id: Uuid,
+    expected_min_cents: i64,
+) -> Result<(), ApiError> {
+    let status = pi_data["status"].as_str().unwrap_or("");
+    if status != "succeeded" {
+        return Err(ApiError::BadRequest(format!(
+            "Payment has not succeeded yet (status: {status})"
+        )));
+    }
+
+    let currency_ok = pi_data["currency"]
+        .as_str()
+        .is_some_and(|c| c.eq_ignore_ascii_case("eur"));
+    if !currency_ok {
+        return Err(ApiError::BadRequest(
+            "Payment currency must be EUR".into(),
+        ));
+    }
+
+    if let Some(purpose) = pi_data["metadata"]["purpose"].as_str() {
+        if purpose != "invoice" {
+            return Err(ApiError::BadRequest(
+                "Payment intent is not valid for invoice payments".into(),
+            ));
+        }
+    }
+
+    let expected_inv_str = expected_invoice_id.to_string();
+    if pi_data["metadata"]["invoice_id"].as_str() != Some(expected_inv_str.as_str()) {
+        return Err(ApiError::BadRequest(
+            "Payment intent does not belong to this invoice".into(),
+        ));
+    }
+
+    let expected_cust_str = expected_customer_id.to_string();
+    if pi_data["metadata"]["customer_id"].as_str() != Some(expected_cust_str.as_str()) {
+        return Err(ApiError::BadRequest(
+            "Payment intent does not belong to this customer".into(),
+        ));
+    }
+
+    let amount_received = pi_data["amount_received"].as_i64().unwrap_or(0);
+    if amount_received < expected_min_cents {
+        return Err(ApiError::BadRequest(format!(
+            "Payment amount insufficient (received {amount_received}, expected at least {expected_min_cents})"
+        )));
+    }
+
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -104,7 +161,7 @@ pub(crate) async fn create_invoice_payment_intent(
     let invoice_id_str = invoice.id.to_string();
     let customer_id_str = auth.0.sub.to_string();
 
-    let client = reqwest::Client::new();
+    let client = stripe_http_client()?;
     let resp = client
         .post("https://api.stripe.com/v1/payment_intents")
         .basic_auth(stripe_secret, Option::<&str>::None)
@@ -113,38 +170,60 @@ pub(crate) async fn create_invoice_payment_intent(
             ("currency", "eur".to_string()),
             ("automatic_payment_methods[enabled]", "true".to_string()),
             ("description", description),
+            ("metadata[purpose]", "invoice".to_string()),
             ("metadata[invoice_id]", invoice_id_str),
             ("metadata[invoice_number]", invoice.invoice_number.clone()),
             ("metadata[customer_id]", customer_id_str),
         ])
         .send()
         .await
-        .map_err(|e| ApiError::Internal(format!("Stripe request failed: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(invoice_id = %invoice.id, "Stripe create payment intent request failed: {e}");
+            ApiError::Internal("Payment provider unavailable".into())
+        })?;
 
     if !resp.status().is_success() {
+        let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(ApiError::Internal(format!("Stripe error: {body}")));
+        tracing::error!(invoice_id = %invoice.id, %status, stripe_body = %body, "Stripe create invoice payment intent error");
+        return Err(ApiError::Internal("Failed to initialize payment".into()));
     }
 
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| ApiError::Internal(format!("Stripe parse error: {e}")))?;
+    let body: Value = resp.json().await.map_err(|e| {
+        tracing::error!(invoice_id = %invoice.id, "Failed to parse Stripe invoice payment intent response: {e}");
+        ApiError::Internal("Invalid response from payment provider".into())
+    })?;
 
-    let client_secret = body["client_secret"]
-        .as_str()
-        .ok_or(ApiError::Internal("Missing client_secret from Stripe".into()))?;
-    let payment_intent_id = body["id"]
-        .as_str()
-        .ok_or(ApiError::Internal("Missing id from Stripe".into()))?;
+    let client_secret = body["client_secret"].as_str().ok_or_else(|| {
+        tracing::error!(invoice_id = %invoice.id, "Missing client_secret in Stripe invoice payment intent response");
+        ApiError::Internal("Invalid response from payment provider".into())
+    })?;
+    let payment_intent_id = body["id"].as_str().ok_or_else(|| {
+        tracing::error!(invoice_id = %invoice.id, "Missing id in Stripe invoice payment intent response");
+        ApiError::Internal("Invalid response from payment provider".into())
+    })?;
 
-    sqlx::query(
-        "UPDATE invoices SET stripe_payment_intent_id = $1, updated_at = now() WHERE id = $2",
+    let update_res = sqlx::query(
+        "UPDATE invoices SET stripe_payment_intent_id = $1, updated_at = now() WHERE id = $2 AND customer_id = $3 AND status IN ('pending'::invoice_status, 'overdue'::invoice_status)",
     )
     .bind(payment_intent_id)
     .bind(invoice.id)
+    .bind(auth.0.sub)
     .execute(&state.db)
-    .await?;
+    .await
+    .map_err(|e| {
+        if is_unique_violation(&e) {
+            ApiError::BadRequest("This payment intent has already been used".into())
+        } else {
+            ApiError::from(e)
+        }
+    })?;
+
+    if update_res.rows_affected() != 1 {
+        return Err(ApiError::BadRequest(
+            "Only pending or overdue invoices can be paid".into(),
+        ));
+    }
 
     Ok(Json(json!({
         "client_secret": client_secret,
@@ -178,10 +257,7 @@ pub(crate) async fn pay_invoice(
     Path(id): Path<Uuid>,
     Json(payload): Json<PayInvoicePayload>,
 ) -> Result<Json<Invoice>, ApiError> {
-    let pi_id = payload.payment_intent_id.trim();
-    if pi_id.is_empty() {
-        return Err(ApiError::BadRequest("payment_intent_id is required".into()));
-    }
+    let pi_id = validate_stripe_payment_intent_id(&payload.payment_intent_id)?;
 
     let invoice: Invoice = sqlx::query_as(
         "SELECT * FROM invoices WHERE id = $1 AND customer_id = $2",
@@ -193,12 +269,40 @@ pub(crate) async fn pay_invoice(
     .ok_or(ApiError::NotFound("invoice not found".into()))?;
 
     if invoice.status == InvoiceStatus::Paid {
-        return Ok(Json(invoice));
+        if invoice.stripe_payment_intent_id.as_deref() == Some(pi_id) {
+            return Ok(Json(invoice));
+        }
+        return Err(ApiError::BadRequest("Invoice is already paid".into()));
     }
 
     if invoice.status != InvoiceStatus::Pending && invoice.status != InvoiceStatus::Overdue {
         return Err(ApiError::BadRequest(
             "Only pending or overdue invoices can be paid".into(),
+        ));
+    }
+
+    // Fast-fail replay check across both services and other invoices
+    let used_in_services: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM services WHERE stripe_payment_intent_id = $1")
+            .bind(pi_id)
+            .fetch_optional(&state.db)
+            .await?;
+    if used_in_services.is_some() {
+        return Err(ApiError::BadRequest(
+            "This payment intent has already been used".into(),
+        ));
+    }
+
+    let used_in_other_invoice: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM invoices WHERE stripe_payment_intent_id = $1 AND id != $2",
+    )
+    .bind(pi_id)
+    .bind(invoice.id)
+    .fetch_optional(&state.db)
+    .await?;
+    if used_in_other_invoice.is_some() {
+        return Err(ApiError::BadRequest(
+            "This payment intent has already been used".into(),
         ));
     }
 
@@ -214,44 +318,82 @@ pub(crate) async fn pay_invoice(
         .unwrap_or(0)
         .max(50);
 
-    let client = reqwest::Client::new();
+    let client = stripe_http_client()?;
     let resp = client
         .get(format!("https://api.stripe.com/v1/payment_intents/{}", pi_id))
         .basic_auth(stripe_secret, Option::<&str>::None)
         .send()
         .await
-        .map_err(|e| ApiError::Internal(format!("Stripe verification failed: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(invoice_id = %invoice.id, pi_id = %pi_id, "Stripe verification request failed: {e}");
+            ApiError::Internal("Payment verification failed".into())
+        })?;
 
     if !resp.status().is_success() {
+        let status = resp.status();
         let err_text = resp.text().await.unwrap_or_default();
-        return Err(ApiError::BadRequest(format!("Invalid payment intent: {err_text}")));
+        tracing::error!(invoice_id = %invoice.id, pi_id = %pi_id, %status, stripe_body = %err_text, "Stripe verification error");
+        return Err(ApiError::BadRequest(
+            "Invalid or unverified payment intent".into(),
+        ));
     }
 
-    let pi_data: Value = resp
-        .json()
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to parse Stripe response: {e}")))?;
+    let pi_data: Value = resp.json().await.map_err(|e| {
+        tracing::error!(invoice_id = %invoice.id, pi_id = %pi_id, "Failed to parse Stripe verification response: {e}");
+        ApiError::Internal("Invalid response from payment provider".into())
+    })?;
 
-    let status = pi_data["status"].as_str().unwrap_or("");
-    if status != "succeeded" {
-        return Err(ApiError::BadRequest(format!(
-            "Payment has not succeeded yet (status: {status})"
-        )));
-    }
+    verify_invoice_stripe_pi_response(&pi_data, invoice.id, auth.0.sub, expected_cents)?;
 
-    if let Some(meta_inv_id) = pi_data["metadata"]["invoice_id"].as_str() {
-        if meta_inv_id != invoice.id.to_string() {
-            return Err(ApiError::BadRequest(
-                "Payment intent does not belong to this invoice".into(),
-            ));
+    let mut tx = state.db.begin().await?;
+
+    let locked_invoice: Invoice = sqlx::query_as(
+        "SELECT * FROM invoices WHERE id = $1 AND customer_id = $2 FOR UPDATE",
+    )
+    .bind(invoice.id)
+    .bind(auth.0.sub)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound("invoice not found".into()))?;
+
+    if locked_invoice.status == InvoiceStatus::Paid {
+        if locked_invoice.stripe_payment_intent_id.as_deref() == Some(pi_id) {
+            tx.commit().await?;
+            return Ok(Json(locked_invoice));
         }
+        return Err(ApiError::BadRequest("Invoice is already paid".into()));
     }
 
-    let amount_received = pi_data["amount_received"].as_i64().unwrap_or(0);
-    if amount_received < expected_cents {
-        return Err(ApiError::BadRequest(format!(
-            "Payment amount insufficient (received {amount_received}, expected at least {expected_cents})"
-        )));
+    if locked_invoice.status != InvoiceStatus::Pending
+        && locked_invoice.status != InvoiceStatus::Overdue
+    {
+        return Err(ApiError::BadRequest(
+            "Only pending or overdue invoices can be paid".into(),
+        ));
+    }
+
+    let used_in_services_tx: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM services WHERE stripe_payment_intent_id = $1")
+            .bind(pi_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if used_in_services_tx.is_some() {
+        return Err(ApiError::BadRequest(
+            "This payment intent has already been used".into(),
+        ));
+    }
+
+    let used_in_other_invoice_tx: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM invoices WHERE stripe_payment_intent_id = $1 AND id != $2",
+    )
+    .bind(pi_id)
+    .bind(locked_invoice.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if used_in_other_invoice_tx.is_some() {
+        return Err(ApiError::BadRequest(
+            "This payment intent has already been used".into(),
+        ));
     }
 
     let updated: Invoice = sqlx::query_as(
@@ -260,14 +402,25 @@ pub(crate) async fn pay_invoice(
                paid_at = now(),
                stripe_payment_intent_id = $1,
                updated_at = now()
-           WHERE id = $2 AND customer_id = $3
+           WHERE id = $2
+             AND customer_id = $3
+             AND status IN ('pending'::invoice_status, 'overdue'::invoice_status)
            RETURNING *"#,
     )
     .bind(pi_id)
-    .bind(invoice.id)
+    .bind(locked_invoice.id)
     .bind(auth.0.sub)
-    .fetch_one(&state.db)
-    .await?;
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        if is_unique_violation(&e) {
+            ApiError::BadRequest("This payment intent has already been used".into())
+        } else {
+            ApiError::from(e)
+        }
+    })?;
+
+    tx.commit().await?;
 
     crate::activity::spawn_record(
         state.db.clone(),
