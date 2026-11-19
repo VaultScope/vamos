@@ -14,9 +14,10 @@ use crate::error::ApiError;
 use crate::openapi::ErrorResponse;
 use crate::state::AppState;
 use crate::validation::{
-    validate_greater_than_zero, validate_percentage, validate_positive, validate_required_string,
-    validate_string_length, MAX_SHORT_STRING_LENGTH, MAX_STRING_LENGTH,
+    validate_greater_than_zero, validate_required_string, validate_string_length,
+    MAX_SHORT_STRING_LENGTH, MAX_STRING_LENGTH,
 };
+use rust_decimal::Decimal;
 use vaultscope_db::models::{Customer, Invoice, InvoiceLineItem, InvoiceStatus};
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -53,8 +54,8 @@ pub(crate) async fn list(
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<Invoice>>, ApiError> {
     crate::require_permission!(auth, state, "invoices.view");
-    let limit = params.limit.unwrap_or(50).min(200);
-    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    let offset = params.offset.unwrap_or(0).max(0);
 
     let invoices: Vec<Invoice> = match (params.customer_id, params.status) {
         (Some(cid), Some(status)) => {
@@ -131,7 +132,7 @@ pub(crate) async fn get_one(
 pub(crate) struct LineItemInput {
     description: String,
     quantity: i32,
-    unit_price: f64,
+    unit_price: Decimal,
     service_id: Option<Uuid>,
 }
 
@@ -139,7 +140,7 @@ pub(crate) struct LineItemInput {
 pub(crate) struct CreateInvoice {
     customer_id: Uuid,
     due_date: NaiveDate,
-    tax_rate: f64,
+    tax_rate: Decimal,
     notes: Option<String>,
     line_items: Vec<LineItemInput>,
 }
@@ -154,7 +155,7 @@ pub(crate) struct CreateInvoice {
         (status = 200, description = "Draft invoice created", body = Invoice),
         (status = 400, description = "Invalid input", body = ErrorResponse)
     )
-)]
+ )]
 pub(crate) async fn create(
     auth: AuthAdmin,
     State(state): State<AppState>,
@@ -172,28 +173,52 @@ pub(crate) async fn create(
         validate_required_string(&item.description, "Description")?;
         validate_string_length(&item.description, "Description", MAX_SHORT_STRING_LENGTH)?;
         validate_greater_than_zero(item.quantity, "Quantity")?;
-        validate_positive(item.unit_price, "Unit price")?;
+        if item.unit_price < Decimal::ZERO {
+            return Err(ApiError::BadRequest("Unit price must be positive".into()));
+        }
     }
 
-    validate_percentage(payload.tax_rate, "Tax rate")?;
+    if payload.tax_rate < Decimal::ZERO || payload.tax_rate > Decimal::from(100) {
+        return Err(ApiError::BadRequest(
+            "Tax rate must be between 0 and 100".into(),
+        ));
+    }
 
     if let Some(ref notes) = payload.notes {
         validate_string_length(notes, "Notes", MAX_STRING_LENGTH)?;
     }
 
+    let mut subtotal = Decimal::ZERO;
+    let mut normalized_items: Vec<(String, i32, Decimal, Decimal, Option<Uuid>)> =
+        Vec::with_capacity(payload.line_items.len());
+    for item in &payload.line_items {
+        let unit_price = item.unit_price.round_dp(2);
+        let item_total = (Decimal::from(item.quantity) * unit_price).round_dp(2);
+        subtotal += item_total;
+        normalized_items.push((
+            item.description.clone(),
+            item.quantity,
+            unit_price,
+            item_total,
+            item.service_id,
+        ));
+    }
+    subtotal = subtotal.round_dp(2);
+
+    let tax_rate_pct = payload.tax_rate.round_dp(2);
+    let tax_amount = (subtotal * (tax_rate_pct / Decimal::from(100))).round_dp(2);
+    let total = (subtotal + tax_amount).round_dp(2);
+
+    let mut tx = state.db.begin().await?;
+
+    let seq_num: i64 = sqlx::query_scalar("SELECT nextval('invoice_number_seq')")
+        .fetch_one(&mut *tx)
+        .await?;
     let invoice_number = format!(
-        "INV-{}",
-        Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext)).to_string()[..8].to_uppercase()
+        "INV-{}-{:06}",
+        chrono::Utc::now().format("%Y%m"),
+        seq_num
     );
-
-    let subtotal: f64 = payload
-        .line_items
-        .iter()
-        .map(|item| item.quantity as f64 * item.unit_price)
-        .sum();
-
-    let tax_amount = subtotal * (payload.tax_rate / 100.0);
-    let total = subtotal + tax_amount;
 
     let invoice: Invoice = sqlx::query_as(
         r#"INSERT INTO invoices (invoice_number, customer_id, status, subtotal, tax_rate, tax_amount, total, issue_date, due_date, notes)
@@ -203,31 +228,34 @@ pub(crate) async fn create(
     .bind(&invoice_number)
     .bind(payload.customer_id)
     .bind(InvoiceStatus::Draft)
-    .bind(rust_decimal::Decimal::from_f64_retain(subtotal).unwrap_or_default())
-    .bind(rust_decimal::Decimal::from_f64_retain(payload.tax_rate).unwrap_or_default())
-    .bind(rust_decimal::Decimal::from_f64_retain(tax_amount).unwrap_or_default())
-    .bind(rust_decimal::Decimal::from_f64_retain(total).unwrap_or_default())
+    .bind(subtotal)
+    .bind(tax_rate_pct)
+    .bind(tax_amount)
+    .bind(total)
     .bind(payload.due_date)
     .bind(payload.notes.unwrap_or_default())
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
 
-    for (idx, item) in payload.line_items.iter().enumerate() {
-        let item_total = item.quantity as f64 * item.unit_price;
+    for (idx, (description, quantity, unit_price, item_total, service_id)) in
+        normalized_items.into_iter().enumerate()
+    {
         sqlx::query(
             r#"INSERT INTO invoice_line_items (invoice_id, description, quantity, unit_price, total, service_id, sort_order)
                VALUES ($1, $2, $3, $4, $5, $6, $7)"#
         )
         .bind(invoice.id)
-        .bind(&item.description)
-        .bind(item.quantity)
-        .bind(rust_decimal::Decimal::from_f64_retain(item.unit_price).unwrap_or_default())
-        .bind(rust_decimal::Decimal::from_f64_retain(item_total).unwrap_or_default())
-        .bind(item.service_id)
+        .bind(description)
+        .bind(quantity)
+        .bind(unit_price)
+        .bind(item_total)
+        .bind(service_id)
         .bind(idx as i32)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
     }
+
+    tx.commit().await?;
 
     Ok(Json(invoice))
 }
@@ -258,13 +286,29 @@ pub(crate) async fn update(
     Json(payload): Json<UpdateInvoice>,
 ) -> Result<Json<Invoice>, ApiError> {
     crate::require_permission!(auth, state, "invoices.edit");
+    if let Some(ref notes) = payload.notes {
+        validate_string_length(notes, "Notes", MAX_STRING_LENGTH)?;
+    }
+
+    let existing: Invoice = sqlx::query_as("SELECT * FROM invoices WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::NotFound("invoice not found".into()))?;
+
+    if existing.status != InvoiceStatus::Draft {
+        return Err(ApiError::BadRequest(
+            "Only draft invoices can be updated".into(),
+        ));
+    }
+
     let invoice: Invoice = sqlx::query_as(
         r#"UPDATE invoices
            SET status = COALESCE($1::invoice_status, status),
                due_date = COALESCE($2, due_date),
                notes = COALESCE($3, notes),
                updated_at = now()
-           WHERE id = $4
+           WHERE id = $4 AND status = 'draft'::invoice_status
            RETURNING *"#,
     )
     .bind(payload.status)
@@ -273,7 +317,7 @@ pub(crate) async fn update(
     .bind(id)
     .fetch_optional(&state.db)
     .await?
-    .ok_or(ApiError::NotFound("invoice not found".into()))?;
+    .ok_or(ApiError::BadRequest("Only draft invoices can be updated".into()))?;
 
     Ok(Json(invoice))
 }
@@ -380,7 +424,7 @@ async fn dispatch_invoice_email(
         "{}/dashboard/profile/billing",
         state.config.storefront_url.trim_end_matches('/')
     );
-    let subject = format!("Invoice {} from VaultScope", invoice.invoice_number);
+    let subject = crate::mailer::sanitize_email_header(&format!("Invoice {} from VaultScope", invoice.invoice_number));
     let body = format!(
 "Hello {},
 
@@ -435,10 +479,17 @@ The VaultScope Billing Team",
         }
     };
 
-    if let Err(e) = lettre::Transport::send(&mailer, &email) {
-        tracing::error!("Could not send invoice email (primary: {}, CCs: {:?}): {:?}", customer_email, cc_emails, e);
-    } else {
-        tracing::info!("Invoice email sent successfully to {} with CCs: {:?}", customer_email, cc_emails);
+    let send_res = tokio::task::spawn_blocking(move || lettre::Transport::send(&mailer, &email)).await;
+    match send_res {
+        Ok(Ok(_)) => {
+            tracing::info!("Invoice email sent successfully to {} with CCs: {:?}", customer_email, cc_emails);
+        }
+        Ok(Err(e)) => {
+            tracing::error!("Could not send invoice email (primary: {}, CCs: {:?}): {:?}", customer_email, cc_emails, e);
+        }
+        Err(e) => {
+            tracing::error!("Invoice email dispatch task failed (primary: {}): {:?}", customer_email, e);
+        }
     }
 
     Ok(())
@@ -450,7 +501,11 @@ The VaultScope Billing Team",
     tag = "Admin Invoices",
     security(("bearer_auth" = []), ("csrf_token" = [])),
     params(("id" = Uuid, Path, description = "Invoice ID")),
-    responses((status = 200, description = "Invoice marked paid", body = Invoice))
+    responses(
+        (status = 200, description = "Invoice marked paid", body = Invoice),
+        (status = 400, description = "Voided invoice cannot be marked paid", body = ErrorResponse),
+        (status = 404, description = "Invoice not found", body = ErrorResponse)
+    )
 )]
 pub(crate) async fn mark_paid(
     auth: AuthAdmin,
@@ -458,17 +513,30 @@ pub(crate) async fn mark_paid(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Invoice>, ApiError> {
     crate::require_permission!(auth, state, "invoices.edit");
+    let existing: Invoice = sqlx::query_as("SELECT * FROM invoices WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::NotFound("invoice not found".into()))?;
+
+    if existing.status == InvoiceStatus::Void {
+        return Err(ApiError::BadRequest(
+            "Cannot mark a voided invoice as paid".into(),
+        ));
+    }
+
     let invoice: Invoice = sqlx::query_as(
         r#"UPDATE invoices
            SET status = 'paid'::invoice_status,
-               paid_at = now(),
+               paid_at = COALESCE(paid_at, now()),
                updated_at = now()
-           WHERE id = $1
+           WHERE id = $1 AND status != 'void'::invoice_status
            RETURNING *"#,
     )
     .bind(id)
-    .fetch_one(&state.db)
-    .await?;
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(ApiError::NotFound("invoice not found".into()))?;
 
     Ok(Json(invoice))
 }
@@ -611,18 +679,22 @@ pub(crate) async fn get_comprehensive_stats(
     .await
     {
         if let Some(key) = key_val.as_str() {
-            let client = reqwest::Client::new();
-            if let Ok(resp) = client
-                .get("https://api.stripe.com/v1/balance")
-                .bearer_auth(key)
-                .send()
-                .await
+            if let Ok(client) = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
             {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(available) = json.get("available").and_then(|a| a.as_array()) {
-                        if let Some(first) = available.first() {
-                            if let Some(amount) = first.get("amount").and_then(|a| a.as_i64()) {
-                                stripe_balance = rust_decimal::Decimal::new(amount, 2);
+                if let Ok(resp) = client
+                    .get("https://api.stripe.com/v1/balance")
+                    .bearer_auth(key)
+                    .send()
+                    .await
+                {
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        if let Some(available) = json.get("available").and_then(|a| a.as_array()) {
+                            if let Some(first) = available.first() {
+                                if let Some(amount) = first.get("amount").and_then(|a| a.as_i64()) {
+                                    stripe_balance = rust_decimal::Decimal::new(amount, 2);
+                                }
                             }
                         }
                     }

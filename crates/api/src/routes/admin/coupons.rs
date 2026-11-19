@@ -103,6 +103,21 @@ async fn get_stripe_key(state: &AppState) -> Result<String, ApiError> {
     Ok(stripe_key)
 }
 
+pub fn validate_coupon_code(raw: &str) -> Result<String, ApiError> {
+    validate_required_string(raw, "Code")?;
+    let trimmed = raw.trim();
+    validate_string_length(trimmed, "Code", MAX_CODE_LENGTH)?;
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(ApiError::BadRequest(
+            "Coupon code may only contain ASCII letters, digits, underscores, and hyphens".into(),
+        ));
+    }
+    Ok(trimmed.to_uppercase())
+}
+
 #[utoipa::path(
     post,
     path = "/",
@@ -121,8 +136,7 @@ pub(crate) async fn create(
 ) -> Result<Json<Coupon>, ApiError> {
     crate::require_permission!(auth, state, "coupons.manage");
     // Validate inputs
-    validate_required_string(&payload.code, "Code")?;
-    validate_string_length(&payload.code, "Code", MAX_CODE_LENGTH)?;
+    let uppercase_code = validate_coupon_code(&payload.code)?;
 
     validate_positive(payload.discount_value, "Discount value")?;
     match payload.discount_type {
@@ -146,11 +160,15 @@ pub(crate) async fn create(
         }
     }
 
-    let uppercase_code = payload.code.to_uppercase();
-
     // Create in Stripe first
     let stripe_key = get_stripe_key(&state).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| {
+            tracing::error!("Failed to build Stripe HTTP client: {}", e);
+            ApiError::Internal("Payment provider unavailable".into())
+        })?;
 
     let mut form = vec![("id", uppercase_code.clone())];
 
@@ -159,10 +177,10 @@ pub(crate) async fn create(
         dv_string = payload.discount_value.to_string();
         form.push(("percent_off", dv_string.clone()));
     } else {
-        // Stripe fixed amount is in cents
+        // Stripe fixed amount is in euro cents
         dv_string = (payload.discount_value * 100.0).round().to_string();
         form.push(("amount_off", dv_string.clone()));
-        form.push(("currency", "usd".to_string()));
+        form.push(("currency", "eur".to_string()));
     }
 
     let ul_string;
@@ -183,15 +201,21 @@ pub(crate) async fn create(
         .form(&form)
         .send()
         .await
-        .map_err(|e| ApiError::Internal(format!("Stripe error: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!("Stripe coupon create request error: {}", e);
+            ApiError::Internal("Failed to communicate with payment provider".into())
+        })?;
 
     if !res.status().is_success() {
+        let status = res.status();
         let err_text = res.text().await.unwrap_or_default();
-        return Err(ApiError::Internal(format!(
-            "Stripe coupon creation failed: {}",
-            err_text
-        )));
+        tracing::error!(%status, stripe_body = %err_text, "Stripe coupon creation failed");
+        return Err(ApiError::Internal("Stripe coupon creation failed".into()));
     }
+
+    let discount_decimal = rust_decimal::Decimal::try_from(payload.discount_value)
+        .map(|d| d.round_dp(2))
+        .unwrap_or_default();
 
     let coupon: Coupon = sqlx::query_as(
         r#"INSERT INTO coupons (code, discount_type, discount_value, usage_limit, expires_at)
@@ -200,7 +224,7 @@ pub(crate) async fn create(
     )
     .bind(&uppercase_code)
     .bind(payload.discount_type)
-    .bind(rust_decimal::Decimal::from_f64_retain(payload.discount_value).unwrap_or_default())
+    .bind(discount_decimal)
     .bind(payload.usage_limit)
     .bind(payload.expires_at)
     .fetch_one(&state.db)
@@ -244,35 +268,53 @@ pub(crate) async fn update(
         .await?;
 
     let existing = existing_coupon.ok_or(ApiError::NotFound("coupon not found".into()))?;
+    let safe_code = validate_coupon_code(&existing.code)?;
+
+    if let Some(val) = payload.discount_value {
+        validate_positive(val, "Discount value")?;
+        if existing.discount_type == CouponDiscountType::Percentage {
+            validate_percentage(val, "Discount percentage")?;
+        }
+    }
+    if let Some(limit) = payload.usage_limit {
+        if limit <= 0 {
+            return Err(ApiError::BadRequest(
+                "Usage limit must be greater than zero".into(),
+            ));
+        }
+    }
 
     // Update in Stripe
-    // For update, the prompt says "make a direct HTTP POST request to https://api.stripe.com/v1/coupons"
-    // Wait, updating a coupon in stripe means we hit POST /v1/coupons/{id}
     let stripe_key = get_stripe_key(&state).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| {
+            tracing::error!("Failed to build Stripe HTTP client: {}", e);
+            ApiError::Internal("Payment provider unavailable".into())
+        })?;
 
     let stripe_payload: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    // we can update metadata or name in Stripe, but since we are mirroring we just make a dummy request to ensure it syncs or if we want to change status we can disable it in stripe?
-    // "When a coupon is created or updated in the DB, the Rust backend must make a direct HTTP POST request to `https://api.stripe.com/v1/coupons` to mirror the coupon in Stripe."
-    // Maybe they meant `POST /v1/coupons/{id}`. Let's do that if it's an update, though Stripe's API is strict about what can be updated on a coupon.
 
     let res = client
         .post(format!(
             "https://api.stripe.com/v1/coupons/{}",
-            existing.code
+            safe_code
         ))
         .basic_auth(&stripe_key, Some(""))
         .form(&stripe_payload)
         .send()
         .await
-        .map_err(|e| ApiError::Internal(format!("Stripe error: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!("Stripe coupon update request error: {}", e);
+            ApiError::Internal("Failed to communicate with payment provider".into())
+        })?;
 
     if !res.status().is_success() {
+        let status = res.status();
         let err_text = res.text().await.unwrap_or_default();
-        return Err(ApiError::Internal(format!(
-            "Stripe coupon update failed: {}",
-            err_text
-        )));
+        tracing::error!(%status, stripe_body = %err_text, "Stripe coupon update failed");
+        return Err(ApiError::Internal("Stripe coupon update failed".into()));
     }
 
     let coupon: Coupon = sqlx::query_as(
@@ -288,7 +330,8 @@ pub(crate) async fn update(
     .bind(
         payload
             .discount_value
-            .map(|v| rust_decimal::Decimal::from_f64_retain(v).unwrap_or_default()),
+            .and_then(|v| rust_decimal::Decimal::try_from(v).ok())
+            .map(|d| d.round_dp(2)),
     )
     .bind(payload.usage_limit)
     .bind(payload.expires_at)
@@ -335,13 +378,19 @@ pub(crate) async fn delete(
 
     // Also delete in stripe
     if let Some(coupon) = existing_coupon {
-        if let Ok(stripe_key) = get_stripe_key(&state).await {
-            let client = reqwest::Client::new();
-            let _ = client
-                .delete(format!("https://api.stripe.com/v1/coupons/{}", coupon.code))
-                .basic_auth(&stripe_key, Some(""))
-                .send()
-                .await;
+        if let Ok(safe_code) = validate_coupon_code(&coupon.code) {
+            if let Ok(stripe_key) = get_stripe_key(&state).await {
+                if let Ok(client) = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()
+                {
+                    let _ = client
+                        .delete(format!("https://api.stripe.com/v1/coupons/{}", safe_code))
+                        .basic_auth(&stripe_key, Some(""))
+                        .send()
+                        .await;
+                }
+            }
         }
     }
 

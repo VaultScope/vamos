@@ -35,45 +35,90 @@ pub fn generate_invoice_pdf(
     content.push_str("0.8 0.8 0.8 RG 0.5 w 45 738 m 300 738 l S\n"); // Thin separator line
 
     // --- Customer Address Block ---
+    let snapshot = invoice.billing_snapshot.as_ref().map(|s| &s.0);
+    let bill_company = snapshot
+        .map(|s| s.company.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(&customer.company);
+    let bill_name = snapshot
+        .map(|s| s.name.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(&customer.name);
+    let bill_address = snapshot
+        .map(|s| s.address_line1.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(&customer.address);
+    let bill_postal = snapshot
+        .map(|s| s.postal_code.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(&customer.postal_code);
+    let bill_city = snapshot
+        .map(|s| s.city.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(&customer.city);
+    let bill_postal_city = format!("{} {}", bill_postal.trim(), bill_city.trim())
+        .trim()
+        .to_string();
+    let bill_country = snapshot
+        .map(|s| s.country.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(if customer.country.trim().is_empty() {
+            "Deutschland"
+        } else {
+            &customer.country
+        });
+    let bill_vat_id = snapshot
+        .map(|s| s.vat_id.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(&customer.vat_id);
+
     content.push_str("0.1 0.1 0.1 rg\n");
     let mut cur_y = 720;
-    if !customer.company.is_empty() {
+    if !bill_company.trim().is_empty() {
         content.push_str(&format!(
             "BT /F2 10 Tf 45 {} Td ({}) Tj ET\n",
             cur_y,
-            encode_pdf_text(&customer.company)
+            encode_pdf_text(bill_company)
         ));
         cur_y -= 14;
     }
     content.push_str(&format!(
         "BT /F1 10 Tf 45 {} Td ({}) Tj ET\n",
         cur_y,
-        encode_pdf_text(&customer.name)
+        encode_pdf_text(bill_name)
     ));
     cur_y -= 14;
 
-    if !customer.address.is_empty() {
+    if !bill_address.trim().is_empty() {
         content.push_str(&format!(
             "BT /F1 9.5 Tf 45 {} Td ({}) Tj ET\n",
             cur_y,
-            encode_pdf_text(&customer.address)
+            encode_pdf_text(bill_address)
         ));
         cur_y -= 14;
     }
 
-    let country_str = if customer.country.is_empty() { "Deutschland" } else { &customer.country };
+    if !bill_postal_city.is_empty() {
+        content.push_str(&format!(
+            "BT /F1 9.5 Tf 45 {} Td ({}) Tj ET\n",
+            cur_y,
+            encode_pdf_text(&bill_postal_city)
+        ));
+        cur_y -= 14;
+    }
+
     content.push_str(&format!(
         "BT /F1 9.5 Tf 45 {} Td ({}) Tj ET\n",
         cur_y,
-        encode_pdf_text(country_str)
+        encode_pdf_text(bill_country)
     ));
     cur_y -= 14;
 
-    if !customer.vat_id.is_empty() {
+    if !bill_vat_id.trim().is_empty() {
         content.push_str(&format!(
             "BT /F1 8.5 Tf 45 {} Td (USt-IdNr.: {}) Tj ET\n",
             cur_y,
-            encode_pdf_text(&customer.vat_id)
+            encode_pdf_text(bill_vat_id)
         ));
     }
 
@@ -208,8 +253,9 @@ pub fn generate_invoice_pdf(
     content.push_str("0.4 0.4 0.4 rg\n");
     content.push_str(&format!("BT /F1 8.5 Tf 340 {} Td (Nettobetrag / Subtotal:) Tj ET\n", totals_y + 24));
     content.push_str(&format!(
-        "BT /F1 8.5 Tf 340 {} Td (zzgl. 19% USt. / VAT:) Tj ET\n",
-        totals_y + 10
+        "BT /F1 8.5 Tf 340 {} Td (zzgl. {} USt. / VAT:) Tj ET\n",
+        totals_y + 10,
+        format_tax_rate_percent(invoice.tax_rate)
     ));
 
     content.push_str("0.1 0.1 0.1 rg\n");
@@ -374,6 +420,15 @@ fn build_pdf_document(content_stream: &str) -> Vec<u8> {
     pdf.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", num_objects, xref_offset).as_bytes());
 
     pdf
+}
+
+fn format_tax_rate_percent(tax_rate: rust_decimal::Decimal) -> String {
+    let pct = if tax_rate > rust_decimal::Decimal::ZERO && tax_rate < rust_decimal::Decimal::ONE {
+        (tax_rate * rust_decimal::Decimal::from(100)).normalize()
+    } else {
+        tax_rate.normalize()
+    };
+    format!("{}%", pct)
 }
 
 fn encode_pdf_text(s: &str) -> String {
