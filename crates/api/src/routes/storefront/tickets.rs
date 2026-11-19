@@ -161,6 +161,9 @@ pub(crate) async fn create_ticket(
             .unwrap_or(None);
     let mailbox = default_mailbox.unwrap_or_default();
 
+    let initial_attachments =
+        crate::media::validate_ticket_attachments(payload.attachments.as_ref())?;
+
     let ticket_id = Uuid::now_v7();
     let id_str = ticket_id.to_string();
     let ticket_number = format!("TKT-{}", id_str[24..36].to_uppercase());
@@ -184,8 +187,6 @@ pub(crate) async fn create_ticket(
     .bind("127.0.0.1")
     .fetch_one(&mut *tx)
     .await?;
-
-    let initial_attachments = payload.attachments.unwrap_or_else(|| serde_json::json!([]));
 
     sqlx::query(
         "INSERT INTO ticket_messages (id, ticket_id, author_id, author_type, content, internal, attachments)
@@ -221,8 +222,6 @@ pub struct AttachmentResponse {
     pub size: usize,
     pub content_type: String,
 }
-
-const MAX_ATTACHMENT_SIZE: usize = 10 * 1024 * 1024; // 10MB limit
 
 #[utoipa::path(
     post,
@@ -261,56 +260,19 @@ pub(crate) async fn upload_attachment(
         .map_err(|e| ApiError::BadRequest(e.to_string()))?
     {
         let raw_filename = field.file_name().unwrap_or("image.png").to_string();
-        let ext = raw_filename
-            .rsplit('.')
-            .next()
-            .unwrap_or("")
-            .to_lowercase();
-
-        // 1. Only images accepted (extension check)
-        if !["png", "jpg", "jpeg", "webp", "gif"].contains(&ext.as_str()) {
-            return Err(ApiError::BadRequest(
-                "Only image files (PNG, JPEG, WebP, GIF) are accepted.".into(),
-            ));
-        }
-
-        let content_type = field.content_type().unwrap_or("image/png").to_string();
-        if !content_type.starts_with("image/") {
-            return Err(ApiError::BadRequest("Only image files are accepted.".into()));
-        }
+        let content_type = field.content_type().map(|s| s.to_string());
 
         let data = field
             .bytes()
             .await
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-        // 2. Limit attachment size to 10MB
-        if data.len() > MAX_ATTACHMENT_SIZE {
-            return Err(ApiError::BadRequest(
-                "Image file exceeds the 10MB size limit.".into(),
-            ));
-        }
-
-        if data.is_empty() {
-            return Err(ApiError::BadRequest("File is empty.".into()));
-        }
-
-        // 3. Verify magic bytes for real image integrity
-        let is_valid_image = match ext.as_str() {
-            "png" => data.starts_with(&[0x89, 0x50, 0x4E, 0x47]),
-            "jpg" | "jpeg" => data.starts_with(&[0xFF, 0xD8, 0xFF]),
-            "gif" => data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a"),
-            "webp" => data.starts_with(b"RIFF") && data.len() > 12 && &data[8..12] == b"WEBP",
-            _ => false,
-        };
-
-        if !is_valid_image {
-            return Err(ApiError::BadRequest(
-                "File content does not match a valid image format.".into(),
-            ));
-        }
-
-        let processed = crate::media::save_optimized_image(&data, "tickets", 2048).await?;
+        let processed = crate::media::validate_and_save_ticket_attachment(
+            &raw_filename,
+            content_type.as_deref(),
+            &data,
+        )
+        .await?;
 
         return Ok(Json(AttachmentResponse {
             id: processed.id,
@@ -344,6 +306,7 @@ pub(crate) async fn add_message(
 ) -> Result<Json<TicketMessage>, ApiError> {
     validate_required_string(&payload.content, "Content")?;
     validate_string_length(&payload.content, "Content", MAX_STRING_LENGTH)?;
+    let attachments = crate::media::validate_ticket_attachments(payload.attachments.as_ref())?;
 
     // verify ownership
     let ticket_exists: Option<Uuid> =
@@ -358,8 +321,6 @@ pub(crate) async fn add_message(
     }
 
     let mut tx = state.db.begin().await?;
-
-    let attachments = payload.attachments.unwrap_or_else(|| serde_json::json!([]));
 
     let message: TicketMessage = sqlx::query_as(
         "INSERT INTO ticket_messages (id, ticket_id, author_id, author_type, content, internal, attachments)

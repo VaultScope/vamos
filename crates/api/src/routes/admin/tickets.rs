@@ -2,6 +2,7 @@ use std::convert::Infallible;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -55,8 +56,8 @@ pub(crate) async fn list(
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<Ticket>>, ApiError> {
     crate::require_permission!(auth, state, "tickets.view");
-    let limit = params.limit.unwrap_or(50).min(200);
-    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    let offset = params.offset.unwrap_or(0).max(0);
 
     let tickets: Vec<Ticket> = match (params.customer_id, &params.status) {
         (Some(cid), Some(status)) => sqlx::query_as(
@@ -132,6 +133,8 @@ pub(crate) struct CreateTicket {
     mailbox: String,
     related_service_id: Option<Uuid>,
     ip: Option<String>,
+    #[serde(default)]
+    attachments: Option<serde_json::Value>,
 }
 
 #[utoipa::path(
@@ -154,9 +157,13 @@ pub(crate) async fn create(
     // Validate inputs
     validate_required_string(&payload.subject, "Subject")?;
     validate_string_length(&payload.subject, "Subject", MAX_SHORT_STRING_LENGTH)?;
+    if payload.attachments.is_some() {
+        crate::media::validate_ticket_attachments(payload.attachments.as_ref())?;
+    }
 
-    let random_id = Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext));
-    let ticket_number = format!("TKT-{}", random_id.to_string()[..8].to_uppercase());
+    let mut suffix = [0u8; 6];
+    rand::rngs::OsRng.fill_bytes(&mut suffix);
+    let ticket_number = format!("TKT-{}", hex::encode_upper(suffix));
 
     let ticket: Ticket = sqlx::query_as(
         r#"INSERT INTO tickets (ticket_number, customer_id, category, subject, priority, assignee_id, mailbox, related_service_id, ip)
@@ -257,8 +264,12 @@ pub(crate) async fn list_messages(
 #[derive(Deserialize, ToSchema)]
 #[schema(as = AdminCreateTicketMessage)]
 pub(crate) struct CreateTicketMessage {
-    author_id: Uuid,
-    author_type: ActorType,
+    #[serde(default)]
+    #[allow(dead_code)]
+    author_id: Option<Uuid>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    author_type: Option<ActorType>,
     content: String,
     internal: Option<bool>,
     attachments: Option<serde_json::Value>,
@@ -273,8 +284,6 @@ pub struct AttachmentResponse {
     pub size: usize,
     pub content_type: String,
 }
-
-const MAX_ATTACHMENT_SIZE: usize = 10 * 1024 * 1024; // 10MB limit
 
 #[utoipa::path(
     post,
@@ -313,56 +322,19 @@ pub(crate) async fn upload_attachment(
         .map_err(|e| ApiError::BadRequest(e.to_string()))?
     {
         let raw_filename = field.file_name().unwrap_or("image.png").to_string();
-        let ext = raw_filename
-            .rsplit('.')
-            .next()
-            .unwrap_or("")
-            .to_lowercase();
-
-        // 1. Only images accepted
-        if !["png", "jpg", "jpeg", "webp", "gif"].contains(&ext.as_str()) {
-            return Err(ApiError::BadRequest(
-                "Only image files (PNG, JPEG, WebP, GIF) are accepted.".into(),
-            ));
-        }
-
-        let content_type = field.content_type().unwrap_or("image/png").to_string();
-        if !content_type.starts_with("image/") {
-            return Err(ApiError::BadRequest("Only image files are accepted.".into()));
-        }
+        let content_type = field.content_type().map(|s| s.to_string());
 
         let data = field
             .bytes()
             .await
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-        // 2. Limit attachment size to 10MB
-        if data.len() > MAX_ATTACHMENT_SIZE {
-            return Err(ApiError::BadRequest(
-                "Image file exceeds the 10MB size limit.".into(),
-            ));
-        }
-
-        if data.is_empty() {
-            return Err(ApiError::BadRequest("File is empty.".into()));
-        }
-
-        // 3. Verify magic bytes for real image integrity
-        let is_valid_image = match ext.as_str() {
-            "png" => data.starts_with(&[0x89, 0x50, 0x4E, 0x47]),
-            "jpg" | "jpeg" => data.starts_with(&[0xFF, 0xD8, 0xFF]),
-            "gif" => data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a"),
-            "webp" => data.starts_with(b"RIFF") && data.len() > 12 && &data[8..12] == b"WEBP",
-            _ => false,
-        };
-
-        if !is_valid_image {
-            return Err(ApiError::BadRequest(
-                "File content does not match a valid image format.".into(),
-            ));
-        }
-
-        let processed = crate::media::save_optimized_image(&data, "tickets", 2048).await?;
+        let processed = crate::media::validate_and_save_ticket_attachment(
+            &raw_filename,
+            content_type.as_deref(),
+            &data,
+        )
+        .await?;
 
         return Ok(Json(AttachmentResponse {
             id: processed.id,
@@ -385,7 +357,8 @@ pub(crate) async fn upload_attachment(
     request_body = CreateTicketMessage,
     responses(
         (status = 200, description = "Ticket message posted", body = TicketMessage),
-        (status = 400, description = "Invalid message content", body = ErrorResponse)
+        (status = 400, description = "Invalid message content", body = ErrorResponse),
+        (status = 404, description = "Ticket not found", body = ErrorResponse)
     )
 )]
 pub(crate) async fn create_message(
@@ -398,17 +371,26 @@ pub(crate) async fn create_message(
     // Validate inputs
     validate_required_string(&payload.content, "Content")?;
     validate_string_length(&payload.content, "Content", MAX_STRING_LENGTH)?;
+    let attachments = crate::media::validate_ticket_attachments(payload.attachments.as_ref())?;
 
-    let attachments = payload.attachments.unwrap_or_else(|| serde_json::json!([]));
+    let ticket_exists: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM tickets WHERE id = $1")
+            .bind(ticket_id)
+            .fetch_optional(&state.db)
+            .await?;
+    if ticket_exists.is_none() {
+        return Err(ApiError::NotFound("ticket not found".into()));
+    }
 
+    // Always bind server-authenticated staff identity; ignore any client-supplied author_id/author_type
     let message: TicketMessage = sqlx::query_as(
         r#"INSERT INTO ticket_messages (ticket_id, author_id, author_type, content, internal, attachments)
            VALUES ($1, $2, $3::actor_type, $4, $5, $6)
            RETURNING *"#,
     )
     .bind(ticket_id)
-    .bind(payload.author_id)
-    .bind(payload.author_type)
+    .bind(auth.0.sub)
+    .bind(ActorType::Staff)
     .bind(&payload.content)
     .bind(payload.internal.unwrap_or(false))
     .bind(attachments)

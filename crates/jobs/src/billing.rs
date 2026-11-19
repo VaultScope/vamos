@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -240,28 +241,43 @@ impl BillingRunner {
         Ok(())
     }
 
-    async fn process_renewals(&self) -> Result<(), sqlx::Error> {
-        let rows: Vec<RenewalRow> = sqlx::query_as(
-            r#"
-            SELECT 
-                s.id, s.customer_id, s.price, s.name, s.provider_resource_id, s.cancel_at_period_end,
-                s.is_trial, s.partner_id, s.config,
-                p.category as product_category, p.provider, p.price as product_price,
-                p.quota_gb as product_quota_gb,
-                part.quota_gb_override as partner_quota_gb_override
-            FROM services s
-            JOIN products p ON s.product_id = p.id
-            LEFT JOIN partners part ON s.partner_id = part.id
-            WHERE s.status = 'running' AND s.next_due <= now()
-            FOR UPDATE OF s SKIP LOCKED
-            "#
-        )
-        .fetch_all(&self.pool)
-        .await?;
+    pub async fn process_renewals(&self) -> Result<(), sqlx::Error> {
+        let mut seen_ids: HashSet<Uuid> = HashSet::new();
 
-        for row in rows {
-            info!("processing renewal for service {}", row.id);
+        loop {
             let mut tx = self.pool.begin().await?;
+            let skip_ids: Vec<Uuid> = seen_ids.iter().copied().collect();
+
+            let row: Option<RenewalRow> = sqlx::query_as(
+                r#"
+                SELECT 
+                    s.id, s.customer_id, s.price, s.name, s.provider_resource_id, s.cancel_at_period_end,
+                    s.is_trial, s.partner_id, s.config,
+                    p.category as product_category, p.provider, p.price as product_price,
+                    p.quota_gb as product_quota_gb,
+                    part.quota_gb_override as partner_quota_gb_override
+                FROM services s
+                JOIN products p ON s.product_id = p.id
+                LEFT JOIN partners part ON s.partner_id = part.id
+                WHERE s.status = 'running'
+                  AND s.next_due <= now()
+                  AND NOT (s.id = ANY($1))
+                ORDER BY s.next_due ASC, s.id ASC
+                LIMIT 1
+                FOR UPDATE OF s SKIP LOCKED
+                "#,
+            )
+            .bind(&skip_ids)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let Some(row) = row else {
+                let _ = tx.rollback().await;
+                break;
+            };
+            seen_ids.insert(row.id);
+
+            info!("processing renewal for service {}", row.id);
 
             if row.cancel_at_period_end {
                 info!("service {} is marked for cancellation at period end; terminating", row.id);
@@ -301,7 +317,11 @@ impl BillingRunner {
 
             if row.is_trial {
                 if row.product_category == "sftp" {
-                    price = rust_decimal::Decimal::new(1200, 2);
+                    price = if row.product_price > rust_decimal::Decimal::ZERO {
+                        row.product_price
+                    } else {
+                        rust_decimal::Decimal::new(1200, 2)
+                    };
                     sftp_upgrade = true;
                     info!("service {} (sftp trial) upgrading to paid plan", row.id);
                 } else if price <= rust_decimal::Decimal::ZERO && row.product_price > rust_decimal::Decimal::ZERO {
@@ -310,9 +330,13 @@ impl BillingRunner {
                 } else {
                     info!("service {} trial period completed", row.id);
                 }
-            } else if row.product_category == "sftp" && price == rust_decimal::Decimal::new(0, 0) {
-                // Legacy fallback: SFTP trial expired, renew for 12.00 EUR
-                price = rust_decimal::Decimal::new(1200, 2);
+            } else if row.product_category == "sftp" && price == rust_decimal::Decimal::ZERO {
+                // Legacy fallback: SFTP trial expired, renew at product price or 12.00 EUR
+                price = if row.product_price > rust_decimal::Decimal::ZERO {
+                    row.product_price
+                } else {
+                    rust_decimal::Decimal::new(1200, 2)
+                };
                 sftp_upgrade = true;
                 info!("service {} (sftp trial) upgrading to paid plan", row.id);
             }
@@ -320,14 +344,21 @@ impl BillingRunner {
             let mut created_invoice_id: Option<Uuid> = None;
             if price > rust_decimal::Decimal::ZERO {
                 let quantity: i32 = 1;
-                let subtotal = price * rust_decimal::Decimal::from(quantity);
+                let subtotal = (price * rust_decimal::Decimal::from(quantity)).round_dp(2);
                 // 19% VAT
-                let tax_rate = rust_decimal::Decimal::new(19, 2); 
-                let tax_amount = subtotal * tax_rate;
-                let total = subtotal + tax_amount;
+                let tax_rate = rust_decimal::Decimal::new(19, 2);
+                let tax_amount = (subtotal * tax_rate).round_dp(2);
+                let total = (subtotal + tax_amount).round_dp(2);
 
                 let invoice_id = Uuid::now_v7();
-                let invoice_number = format!("INV-{}", invoice_id.to_string()[..8].to_uppercase());
+                let seq_num: i64 = sqlx::query_scalar("SELECT nextval('invoice_number_seq')")
+                    .fetch_one(&mut *tx)
+                    .await?;
+                let invoice_number = format!(
+                    "INV-{}-{:06}",
+                    Utc::now().format("%Y%m"),
+                    seq_num
+                );
                 let issue_date = Utc::now().naive_utc().date();
                 let due_date = issue_date + chrono::Days::new(14); // 14 days due
 
