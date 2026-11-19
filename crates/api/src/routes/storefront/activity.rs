@@ -76,22 +76,15 @@ pub(crate) async fn list_mine(
 ) -> Result<Json<Value>, ApiError> {
     let customer_id = auth.0.sub;
     let customer_id_str = customer_id.to_string();
-    let email_pattern = format!("%{}%", auth.0.email);
-    let id_pattern = format!("%{}%", customer_id_str);
 
     let mut entries: Vec<ActivityEntry> = sqlx::query_as(
         r#"SELECT id, category, action, target, detail, created_at FROM activity_log
            WHERE (actor_id = $1 AND actor_type = 'customer'::actor_type)
               OR target = $2
-              OR target ILIKE $3
-              OR detail ILIKE $3
-              OR detail ILIKE $4
            ORDER BY created_at DESC LIMIT 1000"#,
     )
     .bind(customer_id)
     .bind(&customer_id_str)
-    .bind(&email_pattern)
-    .bind(&id_pattern)
     .fetch_all(&state.db)
     .await?;
 

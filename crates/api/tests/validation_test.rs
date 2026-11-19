@@ -56,4 +56,16 @@ fn test_validate_email() {
     // Too long emails should fail
     let long_email = format!("{}@example.com", "a".repeat(320));
     assert!(validate_email(&long_email).is_err());
+    // Reject SQL wildcards, control chars, whitespace, and malformed domains
+    assert!(validate_email("%@%.%").is_err());
+    assert!(validate_email("user%@example.com").is_err());
+    assert!(validate_email("user_name@example.com").is_err());
+    assert!(validate_email("user@foo..com").is_err());
+    assert!(validate_email("user@.example.com").is_err());
+    assert!(validate_email("user@example.com.").is_err());
+    assert!(validate_email(" user@example.com").is_err());
+    assert!(validate_email("user@example.com ").is_err());
+    assert!(validate_email("user\n@example.com").is_err());
+    assert!(validate_email("user\\@example.com").is_err());
+    assert!(validate_email("a@b@example.com").is_err());
 }

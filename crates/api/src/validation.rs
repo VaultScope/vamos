@@ -55,11 +55,62 @@ pub fn validate_percentage(value: f64, field: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Validate email format (basic check)
+/// Validate email format strictly (rejects SQL wildcards, control chars, whitespace, and malformed domains)
 pub fn validate_email(email: &str) -> Result<(), ApiError> {
     validate_string_length(email, "Email", MAX_EMAIL_LENGTH)?;
 
-    if !email.contains('@') || !email.contains('.') {
+    if email.is_empty() || email != email.trim() {
+        return Err(ApiError::BadRequest("Invalid email format".into()));
+    }
+
+    if email
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '%' | '_' | '\\'))
+    {
+        return Err(ApiError::BadRequest("Invalid email format".into()));
+    }
+
+    let mut parts = email.split('@');
+    let local = parts.next().unwrap_or("");
+    let domain = match parts.next() {
+        Some(d) => d,
+        None => return Err(ApiError::BadRequest("Invalid email format".into())),
+    };
+    if parts.next().is_some() {
+        return Err(ApiError::BadRequest("Invalid email format".into()));
+    }
+
+    if local.is_empty()
+        || local.len() > 64
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+    {
+        return Err(ApiError::BadRequest("Invalid email format".into()));
+    }
+
+    if domain.is_empty()
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.contains("..")
+        || !domain.contains('.')
+    {
+        return Err(ApiError::BadRequest("Invalid email format".into()));
+    }
+
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 2
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+        || !labels
+            .last()
+            .is_some_and(|tld| tld.chars().any(|c| c.is_ascii_alphabetic()))
+    {
         return Err(ApiError::BadRequest("Invalid email format".into()));
     }
 

@@ -50,6 +50,60 @@ fn test_validate_email_only_dot() {
 }
 
 #[test]
+fn test_validate_email_rejects_wildcards_whitespace_and_bad_domains() {
+    for invalid in [
+        "%@%.%",
+        "%@example.com",
+        "user%@example.com",
+        "_@example.com",
+        "user_name@example.com",
+        "user@foo..com",
+        "user@.example.com",
+        "user@example.com.",
+        ".user@example.com",
+        "user.@example.com",
+        "user..name@example.com",
+        " user@example.com",
+        "user@example.com ",
+        "us er@example.com",
+        "user\t@example.com",
+        "user\n@example.com",
+        "user\r@example.com",
+        "user\\@example.com",
+        "a@b@example.com",
+        "@example.com",
+        "user@",
+        "user@-example.com",
+        "user@example-.com",
+        "user@127.0.0.1",
+    ] {
+        assert!(
+            validate_email(invalid).is_err(),
+            "Expected validate_email({:?}) to fail",
+            invalid
+        );
+    }
+}
+
+#[test]
+fn test_validate_email_accepts_valid_formats() {
+    for valid in [
+        "user@example.com",
+        "admin@vaultscope.net",
+        "user+tag@example.com",
+        "admin@mail.vaultscope.net",
+        "first.last@sub.domain.de",
+        "admin1@test.local",
+    ] {
+        assert!(
+            validate_email(valid).is_ok(),
+            "Expected validate_email({:?}) to succeed",
+            valid
+        );
+    }
+}
+
+#[test]
 fn test_validate_string_length_empty_string() {
     assert!(validate_string_length("", "Field", 0).is_ok());
     assert!(validate_string_length("", "Field", 10).is_ok());
