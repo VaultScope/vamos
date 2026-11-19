@@ -22,14 +22,36 @@ pub fn routes() -> OpenApiRouter<AppState> {
     request_body(content = BinaryFileUpload, content_type = "multipart/form-data"),
     responses(
         (status = 200, description = "Optimized uploaded media metadata", body = ProcessedImage),
-        (status = 400, description = "Missing or invalid image file", body = ErrorResponse)
+        (status = 400, description = "Missing or invalid image file", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse)
     )
 )]
 pub(crate) async fn upload_media(
-    _auth: AuthAdmin,
-    State(_state): State<AppState>,
+    auth: AuthAdmin,
+    State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<ProcessedImage>, ApiError> {
+    let mut authorized = false;
+    for perm in [
+        "media.manage",
+        "blog.write",
+        "blog.edit",
+        "products.create",
+        "products.edit",
+    ] {
+        match crate::middleware::rbac::check_permission(&auth, &state, perm).await {
+            Ok(()) => {
+                authorized = true;
+                break;
+            }
+            Err(ApiError::Forbidden) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    if !authorized {
+        return Err(ApiError::Forbidden);
+    }
+
     let mut file_data: Option<Vec<u8>> = None;
     let mut subfolder = "media".to_string();
 
