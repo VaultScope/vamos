@@ -75,5 +75,6 @@ pub async fn test_app_state() -> AppState {
         csrf_config: axum_csrf::CsrfConfig::default(),
         redis: None,
         ticket_bus,
+        sse_tickets: vaultscope_api::state::new_sse_tickets(),
     }
 }
