@@ -185,10 +185,10 @@ pub(crate) async fn create(
 ) -> Result<Json<BlogPostResp>, ApiError> {
     check_permission(&auth, &state, "blog.write").await?;
 
-    validate_required_string("title", &payload.title)?;
-    validate_required_string("slug", &payload.slug)?;
-    validate_required_string("excerpt", &payload.excerpt)?;
-    validate_required_string("content", &payload.content)?;
+    validate_required_string(&payload.title, "title")?;
+    validate_required_string(&payload.slug, "slug")?;
+    validate_required_string(&payload.excerpt, "excerpt")?;
+    validate_required_string(&payload.content, "content")?;
     validate_string_length(&payload.slug, "slug", 255)?;
     
     let status = payload.status.unwrap_or_else(|| "draft".to_string());
@@ -272,10 +272,11 @@ pub(crate) async fn update(
 ) -> Result<Json<BlogPostResp>, ApiError> {
     check_permission(&auth, &state, "blog.edit").await?;
 
-    validate_required_string("title", &payload.title)?;
-    validate_required_string("slug", &payload.slug)?;
-    validate_required_string("excerpt", &payload.excerpt)?;
-    validate_required_string("content", &payload.content)?;
+    validate_required_string(&payload.title, "title")?;
+    validate_required_string(&payload.slug, "slug")?;
+    validate_required_string(&payload.excerpt, "excerpt")?;
+    validate_required_string(&payload.content, "content")?;
+    validate_string_length(&payload.slug, "slug", 255)?;
     
     let status = payload.status.unwrap_or_else(|| "draft".to_string());
     

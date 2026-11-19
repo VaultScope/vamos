@@ -61,20 +61,20 @@ pub(crate) async fn get_by_slug(
 
     let partner = partner.ok_or_else(|| ApiError::NotFound("partner campaign not found".into()))?;
 
-    // 2. Increment clicks in background / async
-    let _ = sqlx::query("UPDATE partners SET clicks = clicks + 1 WHERE id = $1")
-        .bind(partner.id)
-        .execute(&state.db)
-        .await;
-
-    // 3. Fetch linked product
+    // 2. Fetch linked visible product before counting click
     let mut product: Product = sqlx::query_as(
-        "SELECT * FROM products WHERE id = $1"
+        "SELECT * FROM products WHERE id = $1 AND hidden = false"
     )
     .bind(partner.product_id)
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| ApiError::NotFound("campaign product not available".into()))?;
+
+    // 3. Increment clicks
+    let _ = sqlx::query("UPDATE partners SET clicks = clicks + 1 WHERE id = $1")
+        .bind(partner.id)
+        .execute(&state.db)
+        .await;
 
     // 4. If partner has custom trial overrides, apply them
     let effective_trial_days = partner.trial_days_override.or(product.trial_days);
@@ -84,6 +84,8 @@ pub(crate) async fn get_by_slug(
     product.trial_days = effective_trial_days;
     product.trial_quota_gb = effective_trial_quota;
     product.quota_gb = effective_quota;
+
+    let product = crate::reliablesite_catalog::sanitize_product_for_storefront(product);
 
     Ok(Json(PartnerResponse {
         partner: PartnerInfo {

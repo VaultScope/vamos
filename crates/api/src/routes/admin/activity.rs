@@ -43,7 +43,7 @@ pub(crate) async fn list(
     {
         crate::require_permission!(auth, state, "settings.manage");
     }
-    let limit = params.limit.unwrap_or(100).min(500);
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
 
     let logs = match (params.customer_id, params.category) {
         (Some(cid), Some(category)) => {
