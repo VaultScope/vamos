@@ -2,28 +2,34 @@ services:
   api:
     build: .
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     env_file:
       - .env
     environment:
-      - DATABASE_URL=postgres://vaultscope:vaultscope_dev@postgres:5432/vaultscope
+      - DATABASE_URL=postgres://${POSTGRES_USER:-vaultscope}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/${POSTGRES_DB:-vaultscope}
     depends_on:
       postgres:
         condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     restart: unless-stopped
 
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: vaultscope
-      POSTGRES_PASSWORD: vaultscope_dev
-      POSTGRES_DB: vaultscope
+      POSTGRES_USER: ${POSTGRES_USER:-vaultscope}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-vaultscope}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U vaultscope"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vaultscope}"]
       interval: 5s
       timeout: 5s
       retries: 5
