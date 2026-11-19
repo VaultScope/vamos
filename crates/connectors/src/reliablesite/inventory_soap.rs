@@ -11,7 +11,7 @@ use super::types::{
     InventoryAddon, InventoryAddonGroup, InventoryPricing, InventoryServer,
 };
 
-pub const DEFAULT_INVENTORY_URL: &str = "http://api.reliablesite.net/Inventory.svc/Inventory";
+pub const DEFAULT_INVENTORY_URL: &str = "https://api.reliablesite.net/Inventory.svc/Inventory";
 const SOAP_ACTION_PREFIX: &str = "http://tempuri.org/IInventoryService";
 
 /// Client for the ReliableSite WCF SOAP Inventory API.
@@ -52,9 +52,18 @@ impl InventorySoapClient {
             .header("Content-Type", "text/xml; charset=utf-8")
             .header("SOAPAction", soap_action)
             .header("User-Agent", "VaultScope/1.0")
+            .timeout(std::time::Duration::from_secs(20))
             .body(envelope)
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    status = ?e.status(),
+                    is_timeout = e.is_timeout(),
+                    "ReliableSite Inventory SOAP transport error"
+                );
+                ConnectorError::Api("ReliableSite Inventory SOAP request failed".into())
+            })?;
 
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();

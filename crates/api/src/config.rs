@@ -1,6 +1,7 @@
 use std::env;
+use std::fmt;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub database_url: String,
     pub db_max_connections: u32,
@@ -37,8 +38,59 @@ pub struct Config {
     pub storefront_url: String,
 }
 
+fn redact_opt(v: &Option<String>) -> Option<&'static str> {
+    v.as_ref().map(|_| "[REDACTED]")
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("database_url", &"[REDACTED]")
+            .field("db_max_connections", &self.db_max_connections)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("jwt_secret", &"[REDACTED]")
+            .field("encryption_key", &"[REDACTED]")
+            .field("authentik_enabled", &self.authentik_enabled)
+            .field("authentik_issuer", &self.authentik_issuer)
+            .field("authentik_client_id_admin", &self.authentik_client_id_admin)
+            .field(
+                "authentik_client_id_storefront",
+                &self.authentik_client_id_storefront,
+            )
+            .field("authentik_client_secret_admin", &"[REDACTED]")
+            .field("authentik_client_secret_storefront", &"[REDACTED]")
+            .field("authentik_api_token", &redact_opt(&self.authentik_api_token))
+            .field("stripe_secret_key", &redact_opt(&self.stripe_secret_key))
+            .field("cors_origins", &self.cors_origins)
+            .field("job_poll_interval_secs", &self.job_poll_interval_secs)
+            .field("redis_url", &"[REDACTED]")
+            .field("hetzner_api_token", &redact_opt(&self.hetzner_api_token))
+            .field("reliablesite_api_key", &redact_opt(&self.reliablesite_api_key))
+            .field("reliablesite_api_url", &self.reliablesite_api_url)
+            .field("reliablesite_order_api_url", &self.reliablesite_order_api_url)
+            .field("reliablesite_inventory_url", &self.reliablesite_inventory_url)
+            .field("reliablesite_payment_method", &self.reliablesite_payment_method)
+            .field("sftpgo_url", &self.sftpgo_url)
+            .field("sftpgo_user", &self.sftpgo_user)
+            .field("sftpgo_pass", &redact_opt(&self.sftpgo_pass))
+            .field("stripe_webhook_secret", &redact_opt(&self.stripe_webhook_secret))
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_username", &self.smtp_username)
+            .field("smtp_password", &redact_opt(&self.smtp_password))
+            .field("smtp_from", &self.smtp_from)
+            .field("dev_mode", &self.dev_mode)
+            .field("storefront_url", &self.storefront_url)
+            .finish()
+    }
+}
+
 impl Config {
     pub fn from_env() -> Self {
+        let dev_mode = env::var("DEV_MODE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
         let encryption_key = required("ENCRYPTION_KEY");
         validate_encryption_key(&encryption_key);
 
@@ -49,6 +101,44 @@ impl Config {
         let authentik_enabled = env::var("AUTHENTIK_ENABLED")
             .map(|v| v == "true" || v == "1")
             .unwrap_or_else(|_| env::var("AUTHENTIK_ISSUER").is_ok() && auth_mode != "local");
+
+        let authentik_client_secret_admin = required_oidc_secret(
+            "AUTHENTIK_CLIENT_SECRET_ADMIN",
+            authentik_enabled,
+            dev_mode,
+        );
+        let authentik_client_secret_storefront = required_oidc_secret(
+            "AUTHENTIK_CLIENT_SECRET_STOREFRONT",
+            authentik_enabled,
+            dev_mode,
+        );
+
+        let storefront_url = env::var("STOREFRONT_URL").unwrap_or_else(|_| {
+            if dev_mode {
+                "http://localhost:5173".to_string()
+            } else {
+                "https://vaultscope.de".to_string()
+            }
+        });
+
+        let cors_origins = match env::var("CORS_ORIGINS") {
+            Ok(raw) => raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            Err(_) if dev_mode => vec![
+                "http://localhost:5173".to_string(),
+                "http://localhost:5174".to_string(),
+            ],
+            Err(_) => {
+                tracing::warn!(
+                    "CORS_ORIGINS is not set in non-dev mode; defaulting strictly to STOREFRONT_URL ({})",
+                    storefront_url
+                );
+                vec![storefront_url.clone()]
+            }
+        };
 
         Self {
             database_url: required("DATABASE_URL"),
@@ -67,15 +157,11 @@ impl Config {
             authentik_issuer: env::var("AUTHENTIK_ISSUER").unwrap_or_else(|_| "http://localhost:9000".to_string()),
             authentik_client_id_admin: env::var("AUTHENTIK_CLIENT_ID_ADMIN").unwrap_or_else(|_| "vaultscope-admin".to_string()),
             authentik_client_id_storefront: env::var("AUTHENTIK_CLIENT_ID_STOREFRONT").unwrap_or_else(|_| "vaultscope-storefront".to_string()),
-            authentik_client_secret_admin: env::var("AUTHENTIK_CLIENT_SECRET_ADMIN").unwrap_or_else(|_| "dev_admin_secret_32_bytes_minimum_padding!".to_string()),
-            authentik_client_secret_storefront: env::var("AUTHENTIK_CLIENT_SECRET_STOREFRONT").unwrap_or_else(|_| "dev_storefront_secret_32_bytes_min!".to_string()),
+            authentik_client_secret_admin,
+            authentik_client_secret_storefront,
             authentik_api_token: env::var("AUTHENTIK_API_TOKEN").ok(),
             stripe_secret_key: env::var("STRIPE_SECRET_KEY").ok(),
-            cors_origins: env::var("CORS_ORIGINS")
-                .unwrap_or_else(|_| "http://localhost:5173,http://localhost:5174".to_string())
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect(),
+            cors_origins,
             job_poll_interval_secs: env::var("JOB_POLL_INTERVAL_SECS")
                 .unwrap_or_else(|_| "5".to_string())
                 .parse()
@@ -96,26 +182,27 @@ impl Config {
             smtp_username: env::var("SMTP_USERNAME").ok(),
             smtp_password: env::var("SMTP_PASSWORD").ok(),
             smtp_from: env::var("SMTP_FROM").ok(),
-            dev_mode: env::var("DEV_MODE")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
-            storefront_url: env::var("STOREFRONT_URL")
-                .unwrap_or_else(|_| {
-                    if env::var("DEV_MODE").map(|v| v == "true" || v == "1").unwrap_or(false) {
-                        "http://localhost:5173".to_string()
-                    } else {
-                        "https://vaultscope.de".to_string()
-                    }
-                }),
+            dev_mode,
+            storefront_url,
         }
     }
 
     pub fn encryption_key_bytes(&self) -> [u8; 32] {
+        let trimmed = self.encryption_key.trim();
+        if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if let Ok(decoded) = hex::decode(trimmed) {
+                if decoded.len() == 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&decoded);
+                    return key;
+                }
+            }
+        }
+
         let bytes = self.encryption_key.as_bytes();
         let mut key = [0u8; 32];
 
         // Since we validated the key is at least 32 bytes, we can safely take first 32
-        // If you want to support hex-encoded keys, decode them first
         let len = bytes.len().min(32);
         key[..len].copy_from_slice(&bytes[..len]);
 
@@ -167,6 +254,14 @@ impl Config {
 
 fn required(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("{} must be set", name))
+}
+
+fn required_oidc_secret(name: &str, authentik_enabled: bool, dev_mode: bool) -> String {
+    let val = env::var(name).unwrap_or_default();
+    if authentik_enabled && !dev_mode && val.trim().is_empty() {
+        panic!("{} must be set when AUTHENTIK_ENABLED is true in non-dev mode", name);
+    }
+    val
 }
 
 /// SEC-002 FIX: Validate encryption key strength
@@ -228,7 +323,11 @@ fn validate_encryption_key(key: &str) {
 }
 
 /// SEC-002 FIX: Validate JWT secret strength
-fn validate_jwt_secret(secret: &str) {
+pub fn validate_jwt_secret(secret: &str) {
+    validate_jwt_secret_with_mode(secret, cfg!(not(debug_assertions)));
+}
+
+pub fn validate_jwt_secret_with_mode(secret: &str, release_mode: bool) {
     if secret.len() < 32 {
         panic!(
             "JWT_SECRET must be at least 32 characters long (got {} chars). \
@@ -248,6 +347,35 @@ fn validate_jwt_secret(secret: &str) {
                  Generate one with: openssl rand -hex 32",
                 weak
             );
+        }
+    }
+
+    let unique_chars: std::collections::HashSet<char> = secret.chars().collect();
+    if unique_chars.len() < 12 {
+        panic!(
+            "JWT_SECRET has insufficient entropy (only {} unique characters, minimum 12). \
+             Use a cryptographically secure random secret. \
+             Generate one with: openssl rand -hex 32",
+            unique_chars.len()
+        );
+    }
+
+    if release_mode {
+        if secret.len() < 64 {
+            panic!(
+                "JWT_SECRET must be at least 64 characters in release mode (got {} chars). \
+                 Generate a secure secret with: openssl rand -hex 32",
+                secret.len()
+            );
+        }
+        for placeholder in ["change-me", "changeme", "dev-secret", "replace-me"] {
+            if secret_lower.contains(placeholder) {
+                panic!(
+                    "JWT_SECRET contains placeholder substring '{}'. \
+                     Use a cryptographically secure random secret.",
+                    placeholder
+                );
+            }
         }
     }
 }

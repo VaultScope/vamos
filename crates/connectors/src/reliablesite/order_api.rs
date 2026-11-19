@@ -60,8 +60,10 @@ impl OrderApiClient {
             .post(&url)
             .query(&[("apiKey", &self.api_key)])
             .header("User-Agent", "VaultScope/1.0")
+            .timeout(std::time::Duration::from_secs(20))
             .send()
-            .await?;
+            .await
+            .map_err(map_transport_err)?;
 
         let status = resp.status();
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
@@ -109,8 +111,10 @@ impl OrderApiClient {
             .get(&url)
             .bearer_auth(&token)
             .header("User-Agent", "VaultScope/1.0")
+            .timeout(std::time::Duration::from_secs(20))
             .send()
-            .await?;
+            .await
+            .map_err(map_transport_err)?;
 
         if resp.status() == StatusCode::UNAUTHORIZED {
             *self.cached_token.write().await = None;
@@ -184,7 +188,11 @@ impl OrderApiClient {
                 req = req.json(body);
             }
 
-            let resp = req.send().await?;
+            let resp = req
+                .timeout(std::time::Duration::from_secs(20))
+                .send()
+                .await
+                .map_err(map_transport_err)?;
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
 
@@ -263,6 +271,15 @@ impl OrderApiClient {
         serde_json::from_str(&text)
             .map_err(|e| ConnectorError::Api(format!("Invalid CreateOrder JSON: {}", e)))
     }
+}
+
+fn map_transport_err(e: reqwest::Error) -> ConnectorError {
+    tracing::warn!(
+        status = ?e.status(),
+        is_timeout = e.is_timeout(),
+        "ReliableSite Order API transport error"
+    );
+    ConnectorError::Api("ReliableSite Order API request failed".into())
 }
 
 fn handle_status(status: StatusCode, body: &str, op: &str) -> ConnectorResult<()> {

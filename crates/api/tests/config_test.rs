@@ -34,8 +34,24 @@ fn test_encryption_key_bytes_short_key_padded() {
 #[test]
 fn test_encryption_key_bytes_long_key_truncated() {
     let mut config = test_config();
-    config.encryption_key = "a".repeat(64);
+    config.encryption_key = "z".repeat(64);
     let key = config.encryption_key_bytes();
     assert_eq!(key.len(), 32);
-    assert!(key.iter().all(|&b| b == b'a'));
+    assert!(key.iter().all(|&b| b == b'z'));
+}
+
+#[test]
+fn test_encryption_key_bytes_64_hex_decoded() {
+    let mut config = test_config();
+    config.encryption_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+    let key = config.encryption_key_bytes();
+    assert_eq!(
+        key,
+        [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+        ]
+    );
 }

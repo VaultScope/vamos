@@ -22,12 +22,27 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_string()),
-            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
+            ApiError::Internal(msg) => {
+                tracing::error!("internal error: {}", msg);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error".to_string(),
+                )
+            }
             ApiError::Database(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "database error".to_string(),
             ),
-            ApiError::Connector(e) => (StatusCode::BAD_GATEWAY, e.to_string()),
+            ApiError::Connector(e) => match e {
+                vaultscope_connectors::ConnectorError::Request(req_err) => {
+                    tracing::error!("connector HTTP request error: {}", req_err);
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "upstream provider communication error".to_string(),
+                    )
+                }
+                _ => (StatusCode::BAD_GATEWAY, e.to_string()),
+            },
         };
 
         let body = json!({ "error": message });
