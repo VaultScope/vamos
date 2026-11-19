@@ -1,3 +1,6 @@
+use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
+
 use axum::extract::{Path, State};
 use axum::Json;
 use lettre::transport::smtp::authentication::Credentials;
@@ -13,6 +16,188 @@ use crate::error::ApiError;
 use crate::openapi::{ErrorResponse, OkMessageResponse, OkResponse};
 use crate::state::AppState;
 use vaultscope_db::models::Mailbox;
+
+/// Returns `true` if the IPv4 address belongs to loopback, private RFC1918,
+/// link-local/metadata, unspecified, CGNAT, or other non-public ranges.
+fn is_forbidden_smtp_v4(v4: Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || o[0] == 0
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || v4.is_documentation()
+        // CGNAT 100.64.0.0/10
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        // IETF Protocol Assignments 192.0.0.0/24
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        // Benchmarking 198.18.0.0/15
+        || (o[0] == 198 && (18..=19).contains(&o[1]))
+        // Reserved 240.0.0.0/4
+        || o[0] >= 240
+}
+
+/// Returns `true` if the IP address is non-public or disallowed for outbound SMTP connections.
+pub fn is_forbidden_smtp_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_forbidden_smtp_v4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return is_forbidden_smtp_v4(mapped_v4);
+            }
+            let seg = v6.segments();
+            // Deprecated IPv4-compatible ::/96 (check after :: and ::1)
+            if seg[..6] == [0, 0, 0, 0, 0, 0] && !(seg[6] == 0 && seg[7] <= 1) {
+                let embedded = Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    seg[6] as u8,
+                    (seg[7] >> 8) as u8,
+                    seg[7] as u8,
+                );
+                return is_forbidden_smtp_v4(embedded);
+            }
+            // NAT64 well-known prefix 64:ff9b::/96
+            if seg[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+                let embedded = Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    seg[6] as u8,
+                    (seg[7] >> 8) as u8,
+                    seg[7] as u8,
+                );
+                return is_forbidden_smtp_v4(embedded);
+            }
+
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // ULA fc00::/7
+                || (seg[0] & 0xfe00) == 0xfc00
+                // Link-local fe80::/10
+                || (seg[0] & 0xffc0) == 0xfe80
+                // Site-local fec0::/10
+                || (seg[0] & 0xffc0) == 0xfec0
+                // Documentation 2001:db8::/32
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8)
+        }
+    }
+}
+
+/// Validates that a raw port value falls in the valid TCP port range `1..=65535`.
+pub fn validate_smtp_port(raw_port: i64) -> Result<u16, ApiError> {
+    if !(1..=65535).contains(&raw_port) {
+        return Err(ApiError::BadRequest("Invalid SMTP port".into()));
+    }
+    Ok(raw_port as u16)
+}
+
+/// Validates an SMTP host against SSRF rules (rejecting loopback, RFC1918, link-local/metadata,
+/// ULA, CGNAT, unspecified IPs, internal hostnames, and DNS resolutions to disallowed IPs),
+/// allowing only explicit `mailpit` when `dev_mode` is enabled.
+pub async fn validate_smtp_host(host: &str, port: u16, dev_mode: bool) -> Result<(), ApiError> {
+    let trimmed = host.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '@' | '/' | '\\' | '?' | '#')
+        })
+    {
+        return Err(ApiError::BadRequest("Invalid SMTP host".into()));
+    }
+
+    if dev_mode && trimmed.eq_ignore_ascii_case("mailpit") {
+        return Ok(());
+    }
+
+    // Handle bracketed IPv6 literals like `[::1]`
+    if trimmed.starts_with('[') || trimmed.ends_with(']') {
+        if !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+            return Err(ApiError::BadRequest("Invalid SMTP host".into()));
+        }
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let ipv6: std::net::Ipv6Addr = inner
+            .parse()
+            .map_err(|_| ApiError::BadRequest("Invalid SMTP host".into()))?;
+        if is_forbidden_smtp_ip(IpAddr::V6(ipv6)) {
+            return Err(ApiError::BadRequest("SMTP host is not allowed".into()));
+        }
+        return Ok(());
+    }
+
+    // Direct IPv4 / IPv6 literal
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        if is_forbidden_smtp_ip(ip) {
+            return Err(ApiError::BadRequest("SMTP host is not allowed".into()));
+        }
+        return Ok(());
+    }
+
+    // Reject embedded ports or colons in hostnames
+    if trimmed.contains(':') {
+        return Err(ApiError::BadRequest("Invalid SMTP host".into()));
+    }
+
+    let dns_host = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    let lower = dns_host.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+        || lower.ends_with(".localdomain")
+        || lower.ends_with(".arpa")
+    {
+        return Err(ApiError::BadRequest("SMTP host is not allowed".into()));
+    }
+
+    let labels: Vec<&str> = dns_host.split('.').collect();
+    if labels.len() < 2
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+        || !labels
+            .last()
+            .is_some_and(|tld| tld.chars().any(|c| c.is_ascii_alphabetic()))
+    {
+        return Err(ApiError::BadRequest("Invalid SMTP host".into()));
+    }
+
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((dns_host, port)),
+    )
+    .await
+    .map_err(|_| {
+        tracing::error!("DNS lookup timed out for SMTP host {}", dns_host);
+        ApiError::BadRequest("Failed to resolve SMTP host".into())
+    })?
+    .map_err(|e| {
+        tracing::error!("DNS lookup failed for SMTP host {}: {}", dns_host, e);
+        ApiError::BadRequest("Failed to resolve SMTP host".into())
+    })?;
+
+    let mut resolved_count = 0usize;
+    for addr in resolved {
+        resolved_count += 1;
+        if is_forbidden_smtp_ip(addr.ip()) {
+            tracing::warn!(
+                "Blocked SSRF SMTP test for host {} resolving to forbidden IP {}",
+                dns_host,
+                addr.ip()
+            );
+            return Err(ApiError::BadRequest("SMTP host is not allowed".into()));
+        }
+    }
+
+    if resolved_count == 0 {
+        return Err(ApiError::BadRequest("Failed to resolve SMTP host".into()));
+    }
+
+    Ok(())
+}
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -90,6 +275,7 @@ pub(crate) async fn create(
     Json(payload): Json<CreateMailbox>,
 ) -> Result<Json<Mailbox>, ApiError> {
     crate::require_permission!(auth, state, "mail.manage");
+    let _ = validate_smtp_port(payload.port as i64)?;
     let is_default = payload.is_default.unwrap_or(false);
 
     // If this is set to default, maybe we should unset other defaults, but simple implementation is fine for now
@@ -125,7 +311,10 @@ pub(crate) struct UpdateMailbox {
     security(("bearer_auth" = []), ("csrf_token" = [])),
     params(("id" = Uuid, Path, description = "Mailbox ID")),
     request_body = UpdateMailbox,
-    responses((status = 200, description = "Mailbox updated", body = OkResponse))
+    responses(
+        (status = 200, description = "Mailbox updated", body = OkResponse),
+        (status = 404, description = "Mailbox not found", body = ErrorResponse)
+    )
 )]
 pub(crate) async fn update(
     auth: AuthAdmin,
@@ -135,48 +324,38 @@ pub(crate) async fn update(
 ) -> Result<Json<Value>, ApiError> {
     crate::require_permission!(auth, state, "mail.manage");
 
-    // Simplistic update one by one like in email_templates
-    if let Some(name) = &payload.name {
-        sqlx::query("UPDATE mailboxes SET name = $1 WHERE id = $2")
-            .bind(name)
-            .bind(id)
-            .execute(&state.db)
-            .await?;
+    if let Some(p) = payload.port {
+        let _ = validate_smtp_port(p as i64)?;
     }
-    if let Some(host) = &payload.host {
-        sqlx::query("UPDATE mailboxes SET host = $1 WHERE id = $2")
-            .bind(host)
-            .bind(id)
-            .execute(&state.db)
-            .await?;
-    }
-    if let Some(port) = payload.port {
-        sqlx::query("UPDATE mailboxes SET port = $1 WHERE id = $2")
-            .bind(port)
-            .bind(id)
-            .execute(&state.db)
-            .await?;
-    }
-    if let Some(user_name) = &payload.user_name {
-        sqlx::query("UPDATE mailboxes SET user_name = $1 WHERE id = $2")
-            .bind(user_name)
-            .bind(id)
-            .execute(&state.db)
-            .await?;
-    }
-    if let Some(password) = &payload.password {
-        sqlx::query("UPDATE mailboxes SET password = $1 WHERE id = $2")
-            .bind(password)
-            .bind(id)
-            .execute(&state.db)
-            .await?;
-    }
-    if let Some(is_default) = payload.is_default {
-        sqlx::query("UPDATE mailboxes SET is_default = $1 WHERE id = $2")
-            .bind(is_default)
-            .bind(id)
-            .execute(&state.db)
-            .await?;
+
+    // Preserve existing DB password when password is omitted or empty
+    let password = payload
+        .password
+        .as_deref()
+        .filter(|p| !p.trim().is_empty());
+
+    let res = sqlx::query(
+        r#"UPDATE mailboxes
+           SET name = COALESCE($1, name),
+               host = COALESCE($2, host),
+               port = COALESCE($3, port),
+               user_name = COALESCE($4, user_name),
+               password = COALESCE($5, password),
+               is_default = COALESCE($6, is_default)
+           WHERE id = $7"#,
+    )
+    .bind(payload.name.as_deref())
+    .bind(payload.host.as_deref())
+    .bind(payload.port)
+    .bind(payload.user_name.as_deref())
+    .bind(password)
+    .bind(payload.is_default)
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError::NotFound("mailbox not found".into()));
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -214,6 +393,79 @@ pub(crate) struct TestMailboxPayload {
     send_test_email: Option<String>,
 }
 
+async fn execute_smtp_test(
+    state: &AppState,
+    host: &str,
+    raw_port: i64,
+    user: &str,
+    pass: &str,
+    from_addr: &str,
+    recipient: Option<&str>,
+    body_text: &str,
+    connect_success_msg: &str,
+    connect_rejected_msg: &str,
+) -> Result<Json<Value>, ApiError> {
+    let port = validate_smtp_port(raw_port)?;
+    validate_smtp_host(host, port, state.config.dev_mode).await?;
+
+    let trimmed_host = host.trim();
+    let relay_host = if trimmed_host.starts_with('[') && trimmed_host.ends_with(']') {
+        &trimmed_host[1..trimmed_host.len() - 1]
+    } else {
+        trimmed_host
+    };
+
+    let creds = Credentials::new(user.to_string(), pass.to_string());
+    let mailer: AsyncSmtpTransport<Tokio1Executor> =
+        AsyncSmtpTransport::<Tokio1Executor>::relay(relay_host)
+            .map_err(|e| {
+                tracing::error!("SMTP relay configuration error for host {}: {}", relay_host, e);
+                ApiError::Internal("Failed to configure SMTP transport".into())
+            })?
+            .port(port)
+            .credentials(creds)
+            .build();
+
+    if let Some(to_addr) = recipient.map(str::trim).filter(|s| !s.is_empty()) {
+        let email = Message::builder()
+            .from(from_addr.parse().map_err(|e: lettre::address::AddressError| {
+                tracing::warn!("Invalid SMTP sender address '{}': {}", from_addr, e);
+                ApiError::BadRequest("Invalid sender email address".into())
+            })?)
+            .to(to_addr.parse().map_err(|e: lettre::address::AddressError| {
+                tracing::warn!("Invalid SMTP recipient address '{}': {}", to_addr, e);
+                ApiError::BadRequest("Invalid recipient email address".into())
+            })?)
+            .subject("VaultScope Mailbox Test")
+            .body(body_text.to_string())
+            .map_err(|e| {
+                tracing::error!("Failed to build SMTP test message: {}", e);
+                ApiError::Internal("Failed to construct test email".into())
+            })?;
+
+        mailer.send(email).await.map_err(|e| {
+            tracing::error!("SMTP test email send failed via {}: {}", relay_host, e);
+            ApiError::Internal("Failed to send test email".into())
+        })?;
+
+        Ok(Json(
+            json!({ "ok": true, "message": "Test email sent successfully" }),
+        ))
+    } else {
+        let ok = mailer.test_connection().await.map_err(|e| {
+            tracing::error!("SMTP test_connection failed for {}: {}", relay_host, e);
+            ApiError::Internal("Failed to connect to SMTP server".into())
+        })?;
+        if ok {
+            Ok(Json(
+                json!({ "ok": true, "message": connect_success_msg }),
+            ))
+        } else {
+            Err(ApiError::Internal(connect_rejected_msg.into()))
+        }
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/{id}/test",
@@ -223,6 +475,7 @@ pub(crate) struct TestMailboxPayload {
     request_body = TestMailboxPayload,
     responses(
         (status = 200, description = "Mailbox connection or test email result", body = OkMessageResponse),
+        (status = 400, description = "Invalid or disallowed SMTP configuration", body = ErrorResponse),
         (status = 404, description = "Mailbox not found", body = ErrorResponse)
     )
 )]
@@ -239,63 +492,28 @@ pub(crate) async fn test_mailbox(
         .await?
         .ok_or(ApiError::NotFound("mailbox not found".into()))?;
 
-    let creds = Credentials::new(mailbox.user_name.clone(), mailbox.password.clone());
-
-    // We try to connect
-    let mailer: AsyncSmtpTransport<Tokio1Executor> =
-        AsyncSmtpTransport::<Tokio1Executor>::relay(&mailbox.host)
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-            .port(mailbox.port as u16)
-            .credentials(creds)
-            .build();
-
-    if let Some(recipient) = payload.send_test_email {
-        let email = Message::builder()
-            .from(
-                mailbox
-                    .user_name
-                    .parse()
-                    .map_err(|e: lettre::address::AddressError| {
-                        ApiError::Internal(e.to_string())
-                    })?,
-            )
-            .to(recipient
-                .parse()
-                .map_err(|e: lettre::address::AddressError| ApiError::Internal(e.to_string()))?)
-            .subject("VaultScope Mailbox Test")
-            .body(String::from(
-                "This is a test email to verify mailbox settings.",
-            ))
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-        mailer
-            .send(email)
-            .await
-            .map_err(|e| ApiError::Internal(format!("Failed to send email: {}", e)))?;
-        Ok(Json(
-            json!({ "ok": true, "message": "Test email sent successfully" }),
-        ))
-    } else {
-        let test_conn = mailer
-            .test_connection()
-            .await
-            .map_err(|e| ApiError::Internal(format!("Connection failed: {}", e)))?;
-        if !test_conn {
-            return Err(ApiError::Internal(
-                "Failed to connect to SMTP server".into(),
-            ));
-        }
-        Ok(Json(
-            json!({ "ok": true, "message": "Connection successful" }),
-        ))
-    }
+    execute_smtp_test(
+        &state,
+        &mailbox.host,
+        mailbox.port as i64,
+        &mailbox.user_name,
+        &mailbox.password,
+        &mailbox.user_name,
+        payload.send_test_email.as_deref(),
+        "This is a test email to verify mailbox settings.",
+        "Connection successful",
+        "Failed to connect to SMTP server",
+    )
+    .await
 }
 
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct TestSmtpPayload {
     smtp_host: String,
     smtp_port: Option<i64>,
+    #[serde(default)]
     smtp_user: String,
+    #[serde(default)]
     smtp_pass: String,
     email: Option<String>,
     test_to: Option<String>,
@@ -307,7 +525,10 @@ pub(crate) struct TestSmtpPayload {
     tag = "Admin Mailboxes",
     security(("bearer_auth" = []), ("csrf_token" = [])),
     request_body = TestSmtpPayload,
-    responses((status = 200, description = "SMTP test result", body = OkMessageResponse))
+    responses(
+        (status = 200, description = "SMTP test result", body = OkMessageResponse),
+        (status = 400, description = "Invalid or disallowed SMTP configuration", body = ErrorResponse)
+    )
 )]
 pub(crate) async fn test_smtp_credentials(
     auth: AuthAdmin,
@@ -316,58 +537,22 @@ pub(crate) async fn test_smtp_credentials(
 ) -> Result<Json<Value>, ApiError> {
     crate::require_permission!(auth, state, "mail.manage");
 
-    let port = payload.smtp_port.unwrap_or(587) as u16;
-    let creds = Credentials::new(payload.smtp_user.clone(), payload.smtp_pass.clone());
+    let port = payload.smtp_port.unwrap_or(587);
+    let from_addr = payload.email.as_deref().unwrap_or(&payload.smtp_user);
 
-    let mailer: AsyncSmtpTransport<Tokio1Executor> =
-        AsyncSmtpTransport::<Tokio1Executor>::relay(&payload.smtp_host)
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-            .port(port)
-            .credentials(creds)
-            .build();
-
-    if let Some(recipient) = payload.test_to.filter(|s| !s.is_empty()) {
-        let from_addr = payload.email.as_deref().unwrap_or(&payload.smtp_user);
-        let email = Message::builder()
-            .from(
-                from_addr
-                    .parse()
-                    .map_err(|e: lettre::address::AddressError| {
-                        ApiError::Internal(e.to_string())
-                    })?,
-            )
-            .to(recipient
-                .parse()
-                .map_err(|e: lettre::address::AddressError| ApiError::Internal(e.to_string()))?)
-            .subject("VaultScope Mailbox Test")
-            .body(String::from(
-                "This is a test email to verify your mailbox settings in VaultScope.",
-            ))
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-        mailer
-            .send(email)
-            .await
-            .map_err(|e| ApiError::Internal(format!("Failed to send test email: {}", e)))?;
-
-        Ok(Json(
-            json!({ "ok": true, "message": "Test email sent successfully" }),
-        ))
-    } else {
-        let ok = mailer
-            .test_connection()
-            .await
-            .map_err(|e| ApiError::Internal(format!("Connection failed: {}", e)))?;
-        if ok {
-            Ok(Json(
-                json!({ "ok": true, "message": "SMTP connection successful" }),
-            ))
-        } else {
-            Err(ApiError::Internal(
-                "SMTP server rejected the connection".into(),
-            ))
-        }
-    }
+    execute_smtp_test(
+        &state,
+        &payload.smtp_host,
+        port,
+        &payload.smtp_user,
+        &payload.smtp_pass,
+        from_addr,
+        payload.test_to.as_deref(),
+        "This is a test email to verify your mailbox settings in VaultScope.",
+        "SMTP connection successful",
+        "SMTP server rejected the connection",
+    )
+    .await
 }
 
 #[utoipa::path(
@@ -376,7 +561,10 @@ pub(crate) async fn test_smtp_credentials(
     tag = "Admin Mailboxes",
     security(("bearer_auth" = []), ("csrf_token" = [])),
     params(("id" = Uuid, Path, description = "Mailbox ID")),
-    responses((status = 200, description = "Default mailbox updated", body = OkResponse))
+    responses(
+        (status = 200, description = "Default mailbox updated", body = OkResponse),
+        (status = 404, description = "Mailbox not found", body = ErrorResponse)
+    )
 )]
 pub(crate) async fn set_default(
     auth: AuthAdmin,
@@ -384,13 +572,26 @@ pub(crate) async fn set_default(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     crate::require_permission!(auth, state, "mail.manage");
-    // Unset all, then set this one
-    sqlx::query("UPDATE mailboxes SET is_default = false")
-        .execute(&state.db)
+
+    let mut tx = state.db.begin().await?;
+
+    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM mailboxes WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if exists.is_none() {
+        return Err(ApiError::NotFound("mailbox not found".into()));
+    }
+
+    sqlx::query("UPDATE mailboxes SET is_default = false WHERE is_default = true")
+        .execute(&mut *tx)
         .await?;
     sqlx::query("UPDATE mailboxes SET is_default = true WHERE id = $1")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+
+    tx.commit().await?;
+
     Ok(Json(json!({ "ok": true })))
 }

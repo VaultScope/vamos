@@ -1,4 +1,6 @@
 use axum::extract::{Path, State};
+use axum::http::header;
+use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -17,6 +19,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(list_mine))
         .routes(routes!(get_one, delete_service))
+        .routes(routes!(get_credentials))
         .routes(routes!(power_start))
         .routes(routes!(power_stop))
         .routes(routes!(power_restart))
@@ -25,6 +28,12 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(ipmi_access, ipmi_access_get))
         .routes(routes!(cancel_service))
         .routes(routes!(uncancel_service))
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ServiceCredentialsResponse {
+    pub username: String,
+    pub password: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -86,6 +95,69 @@ pub(crate) async fn get_one(
             .ok_or(ApiError::NotFound("service not found".into()))?;
     Ok(Json(
         crate::reliablesite_catalog::sanitize_service_for_storefront(service),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/{id}/credentials",
+    tag = "Storefront Services",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "Decrypted service credentials", body = ServiceCredentialsResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_credentials(
+    auth: AuthCustomer,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (provider_resource_id, config, encrypted_password): (
+        String,
+        Value,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT provider_resource_id, config, encrypted_password FROM services WHERE id = $1 AND customer_id = $2",
+    )
+    .bind(id)
+    .bind(auth.0.sub)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(ApiError::NotFound("service not found".into()))?;
+
+    let password = match encrypted_password.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(enc) => {
+            let key = state.config.encryption_key_bytes();
+            let decrypted = vaultscope_common::crypto::decrypt_secret_string(&key, enc).map_err(|e| {
+                tracing::error!(service_id = %id, "Failed to decrypt service credentials: {}", e);
+                ApiError::Internal("Failed to decrypt service credentials".into())
+            })?;
+            Some(decrypted)
+        }
+        None => config
+            .get("raw_response")
+            .and_then(|r| r.get("password"))
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                config
+                    .get("raw_response")
+                    .and_then(|r| r.get("root_password"))
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| config.get("password").and_then(|v| v.as_str()))
+            .or_else(|| config.get("root_password").and_then(|v| v.as_str()))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    };
+
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(ServiceCredentialsResponse {
+            username: provider_resource_id,
+            password,
+        }),
     ))
 }
 
@@ -462,7 +534,7 @@ async fn send_cancellation_email(state: &AppState, email_to: &str, service_name:
     let smtp_pass = state.config.smtp_password.clone().unwrap_or_else(|| "".to_string());
     let smtp_from = state.config.smtp_from.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
 
-    let subject = format!("Cancellation Confirmation: {}", service_name);
+    let subject = crate::mailer::sanitize_email_header(&format!("Cancellation Confirmation: {}", service_name));
     let body = format!(
         "Hello,\n\nWe have received your cancellation request for '{}'.\n\nEffective cancellation: {}\n\nIf this was done in error or you have any questions, you can undo this directly in your dashboard or contact our support team.\n\nBest regards,\nVaultScope Team",
         service_name, effective_date
@@ -478,7 +550,7 @@ async fn send_cancellation_email(state: &AppState, email_to: &str, service_name:
             let creds = lettre::transport::smtp::authentication::Credentials::new(smtp_user, smtp_pass);
             if let Ok(mailer) = lettre::SmtpTransport::relay(&smtp_host) {
                 let mailer = mailer.credentials(creds).build();
-                let _ = lettre::Transport::send(&mailer, &email);
+                let _ = tokio::task::spawn_blocking(move || lettre::Transport::send(&mailer, &email)).await;
             }
         }
     }
