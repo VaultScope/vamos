@@ -1,26 +1,167 @@
-use axum::extract::State;
+use std::net::IpAddr;
+use std::sync::LazyLock;
+
+use axum::extract::{ConnectInfo, FromRequestParts, State};
+use axum::http::request::Parts;
+use axum::http::HeaderMap;
 use axum::Json;
+use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::Utc;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use totp_rs::{Algorithm, Secret, TOTP};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use crate::auth::{jwt, Audience, Claims};
+use crate::auth::{authenticate_any_bearer, jwt, Audience, AuthAdmin, Claims};
 use crate::error::ApiError;
-use crate::openapi::{ErrorResponse, OkMessageResponse};
-use crate::state::AppState;
+use crate::middleware::rate_limit::{extract_trusted_client_ip, rate_limit_middleware, RateLimiter};
+use crate::openapi::{ErrorResponse, OkMessageResponse, OkResponse};
+use crate::state::{AppState, SseTicketEntry};
 use crate::validation::{validate_email, validate_required_string, validate_string_length};
-use bcrypt::{hash, verify, DEFAULT_COST};
-use sha2::{Digest, Sha256};
+
+const ENCRYPTED_TOTP_PREFIX: &str = "enc:v1:";
+const MAX_LOCAL_SSE_TICKETS: usize = 50_000;
+
+static DUMMY_BCRYPT_HASH: LazyLock<String> = LazyLock::new(|| {
+    hash("vaultscope-constant-time-dummy-password", DEFAULT_COST)
+        .expect("dummy bcrypt hash generation")
+});
+
+/// Optional peer TCP address extractor that gracefully yields `None` in `oneshot` unit tests
+/// where `ConnectInfo<SocketAddr>` is absent.
+pub(crate) struct OptionalPeerIp(pub Option<IpAddr>);
+
+impl<S> FromRequestParts<S> for OptionalPeerIp
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let ip = parts
+            .extensions
+            .get::<ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip());
+        Ok(OptionalPeerIp(ip))
+    }
+}
 
 pub fn routes(_state: &AppState) -> OpenApiRouter<AppState> {
-    OpenApiRouter::new()
+    let strict_auth_limiter = RateLimiter::new(20, 60);
+
+    let strict_routes = OpenApiRouter::new()
         .routes(routes!(login))
         .routes(routes!(register))
         .routes(routes!(verify_email))
         .routes(routes!(resend_verification))
+        .routes(routes!(admin_mfa_setup))
+        .routes(routes!(admin_mfa_enable))
+        .routes(routes!(admin_mfa_disable))
+        .layer(axum::middleware::from_fn(rate_limit_middleware))
+        .layer(axum::extract::Extension(strict_auth_limiter));
+
+    OpenApiRouter::new()
+        .merge(strict_routes)
+        .routes(routes!(logout))
+        .routes(routes!(create_sse_ticket))
+}
+
+pub(crate) fn encrypt_totp_secret(key: &[u8; 32], secret_base32: &str) -> Result<String, ApiError> {
+    let encrypted = vaultscope_common::crypto::encrypt(key, secret_base32.as_bytes())
+        .map_err(|e| ApiError::Internal(format!("Failed to encrypt TOTP secret: {e}")))?;
+    Ok(format!("{ENCRYPTED_TOTP_PREFIX}{}", hex::encode(encrypted)))
+}
+
+pub(crate) fn decrypt_totp_secret(key: &[u8; 32], stored: &str) -> Result<String, ApiError> {
+    if let Some(hex_ct) = stored.strip_prefix(ENCRYPTED_TOTP_PREFIX) {
+        let bytes = hex::decode(hex_ct)
+            .map_err(|_| ApiError::Internal("Corrupt encrypted TOTP secret".into()))?;
+        let plaintext = vaultscope_common::crypto::decrypt(key, &bytes)
+            .map_err(|_| ApiError::Internal("Failed to decrypt TOTP secret".into()))?;
+        String::from_utf8(plaintext)
+            .map_err(|_| ApiError::Internal("Invalid UTF-8 in TOTP secret".into()))
+    } else {
+        // Legacy plaintext Base32 row fallback.
+        Ok(stored.to_string())
+    }
+}
+
+pub(crate) fn verify_totp_code(
+    secret_base32: &str,
+    email: &str,
+    raw_code: &str,
+) -> Result<Option<String>, ApiError> {
+    let secret_bytes = Secret::Encoded(secret_base32.to_string())
+        .to_bytes()
+        .map_err(|e| ApiError::Internal(format!("Secret parse error: {e}")))?;
+    let totp = TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret_bytes,
+        Some("VaultScope".to_string()),
+        email.to_string(),
+    )
+    .map_err(|e| ApiError::Internal(format!("TOTP init error: {e}")))?;
+
+    let clean_code = raw_code.trim().replace(' ', "");
+    if totp.check_current(&clean_code).unwrap_or(false) {
+        Ok(Some(clean_code))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) async fn check_and_mark_totp_used(
+    state: &AppState,
+    subject_id: Uuid,
+    clean_code: &str,
+) -> bool {
+    let Some(mut conn) = state.redis.clone() else {
+        return true;
+    };
+    let key = format!("vs:totp_used:{}:{}", subject_id, clean_code);
+    let res: redis::RedisResult<Option<String>> = redis::cmd("SET")
+        .arg(&key)
+        .arg("1")
+        .arg("NX")
+        .arg("EX")
+        .arg(90)
+        .query_async(&mut conn)
+        .await;
+    match res {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!("Redis TOTP anti-replay check failed: {}", e);
+            true
+        }
+    }
+}
+
+async fn verify_password_constant_time(
+    password: &str,
+    stored_hash: Option<&str>,
+) -> Result<bool, ApiError> {
+    if password.len() > 72 {
+        return Ok(false);
+    }
+    let pw = password.to_string();
+    let had_real_hash = stored_hash.is_some();
+    let target_hash = stored_hash
+        .map(str::to_string)
+        .unwrap_or_else(|| DUMMY_BCRYPT_HASH.clone());
+
+    let verified = tokio::task::spawn_blocking(move || verify(&pw, &target_hash).unwrap_or(false))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Password verification task failed: {e}")))?;
+
+    Ok(had_real_hash && verified)
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -67,12 +208,14 @@ pub enum LoginOutcome {
     request_body = LoginPayload,
     responses(
         (status = 200, description = "JWT session or 2FA challenge required", body = LoginOutcome),
-        (status = 400, description = "Validation or invalid 2FA/recovery code", body = ErrorResponse),
+        (status = 400, description = "Validation, unverified email, or invalid 2FA/recovery code", body = ErrorResponse),
         (status = 401, description = "Invalid credentials", body = ErrorResponse)
     )
 )]
 pub(crate) async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    OptionalPeerIp(peer_ip): OptionalPeerIp,
     Json(payload): Json<LoginPayload>,
 ) -> Result<Json<Value>, ApiError> {
     let identifier = if !payload.email.trim().is_empty() {
@@ -90,30 +233,69 @@ pub(crate) async fn login(
 
     if is_admin {
         validate_email(&identifier)?;
-        let staff: Option<(Uuid, String, String, Option<String>, bool)> = sqlx::query_as(
-            "SELECT s.id, s.email, r.name, s.password_hash, s.email_verified FROM staff s JOIN roles r ON s.role_id = r.id WHERE s.email = $1 LIMIT 1"
-        )
-        .bind(&identifier)
-        .fetch_optional(&state.db)
-        .await?;
+        let staff: Option<(Uuid, String, String, Option<String>, bool, bool, Option<String>, i64)> =
+            sqlx::query_as(
+                "SELECT s.id, s.email, r.name, s.password_hash, s.email_verified, s.mfa_enabled, s.totp_secret, s.auth_version
+                 FROM staff s
+                 JOIN roles r ON s.role_id = r.id
+                 WHERE LOWER(s.email) = LOWER($1)
+                 LIMIT 1",
+            )
+            .bind(&identifier)
+            .fetch_optional(&state.db)
+            .await?;
 
-        let (staff_id, email, role_name, password_hash, email_verified) = staff.ok_or_else(|| {
-            ApiError::Unauthorized
-        })?;
-
-        let hash_str = password_hash.ok_or_else(|| {
-            tracing::warn!("Staff {} has no password hash", email);
-            ApiError::Unauthorized
-        })?;
-
-        if !verify(&payload.password, &hash_str).unwrap_or(false) {
+        let stored_hash = staff
+            .as_ref()
+            .and_then(|row| row.3.as_deref());
+        if !verify_password_constant_time(&payload.password, stored_hash).await? {
             return Err(ApiError::Unauthorized);
         }
 
-        sqlx::query("UPDATE staff SET last_login = now() WHERE id = $1")
-            .bind(staff_id)
-            .execute(&state.db)
-            .await?;
+        let (staff_id, email, role_name, _, email_verified, mfa_enabled, totp_secret, auth_version) =
+            staff.ok_or(ApiError::Unauthorized)?;
+
+        if mfa_enabled {
+            if let Some(ref secret_stored) = totp_secret.filter(|s| !s.trim().is_empty()) {
+                let provided_code = payload
+                    .totp_code
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+
+                let Some(raw_code) = provided_code else {
+                    return Ok(Json(json!({
+                        "mfa_required": true,
+                        "email": email,
+                        "message": "Two-factor authentication code required"
+                    })));
+                };
+
+                let secret_base32 =
+                    decrypt_totp_secret(&state.config.encryption_key_bytes(), secret_stored)?;
+                let valid_clean = verify_totp_code(&secret_base32, &email, raw_code)?;
+                let mut mfa_ok = false;
+                if let Some(clean_code) = valid_clean {
+                    if check_and_mark_totp_used(&state, staff_id, &clean_code).await {
+                        mfa_ok = true;
+                    }
+                }
+                if !mfa_ok {
+                    return Err(ApiError::BadRequest(
+                        "Invalid two-factor authentication code".into(),
+                    ));
+                }
+            }
+        }
+
+        let client_ip = extract_trusted_client_ip(&headers, peer_ip).unwrap_or_default();
+        sqlx::query(
+            "UPDATE staff SET last_login = now(), last_login_ip = COALESCE(NULLIF($2, ''), last_login_ip) WHERE id = $1",
+        )
+        .bind(staff_id)
+        .bind(&client_ip)
+        .execute(&state.db)
+        .await?;
 
         let claims = Claims {
             sub: staff_id,
@@ -122,6 +304,8 @@ pub(crate) async fn login(
             audience: Audience::Admin,
             iat: Utc::now().timestamp(),
             exp: jwt::new_expiry(),
+            auth_version: Some(auth_version),
+            jti: Some(Uuid::now_v7().to_string()),
         };
 
         let token = jwt::sign(&claims, &state.config.jwt_secret)?;
@@ -142,24 +326,59 @@ pub(crate) async fn login(
         if identifier.contains('@') {
             validate_email(&identifier)?;
         }
-        let customer: Option<(Uuid, String, String, String, Option<String>, bool, bool, Option<String>)> = sqlx::query_as(
-            "SELECT id, COALESCE(username, '') as username, name, email, password_hash, email_verified, two_factor_enabled, totp_secret FROM customers WHERE (LOWER(email) = LOWER($1) OR (username <> '' AND LOWER(username) = LOWER($1))) AND status = 'active' LIMIT 1"
+        let customer: Option<(
+            Uuid,
+            String,
+            String,
+            String,
+            Option<String>,
+            bool,
+            bool,
+            Option<String>,
+            String,
+            String,
+            i64,
+        )> = sqlx::query_as(
+            "SELECT id, COALESCE(username, '') as username, name, email, password_hash,
+                    email_verified, two_factor_enabled, totp_secret, status::text,
+                    lifecycle_state, auth_version
+             FROM customers
+             WHERE (LOWER(email) = LOWER($1) OR (username <> '' AND LOWER(username) = LOWER($1)))
+             LIMIT 1",
         )
         .bind(&identifier)
         .fetch_optional(&state.db)
         .await?;
 
-        let (customer_id, username, name, email, password_hash, email_verified, two_factor_enabled, totp_secret) = customer.ok_or_else(|| {
-            ApiError::Unauthorized
-        })?;
-
-        let hash_str = password_hash.ok_or_else(|| {
-            tracing::warn!("Customer {} has no password hash", email);
-            ApiError::Unauthorized
-        })?;
-
-        if !verify(&payload.password, &hash_str).unwrap_or(false) {
+        let stored_hash = customer
+            .as_ref()
+            .and_then(|row| row.4.as_deref());
+        if !verify_password_constant_time(&payload.password, stored_hash).await? {
             return Err(ApiError::Unauthorized);
+        }
+
+        let (
+            customer_id,
+            username,
+            name,
+            email,
+            _,
+            email_verified,
+            two_factor_enabled,
+            totp_secret,
+            status,
+            lifecycle_state,
+            auth_version,
+        ) = customer.ok_or(ApiError::Unauthorized)?;
+
+        if status != "active" || lifecycle_state != "active" {
+            return Err(ApiError::Unauthorized);
+        }
+
+        if !email_verified {
+            return Err(ApiError::BadRequest(
+                "Please verify your email address before signing in.".into(),
+            ));
         }
 
         if two_factor_enabled {
@@ -172,19 +391,14 @@ pub(crate) async fn login(
             if let Some(raw_code) = provided_code {
                 let mut mfa_ok = false;
 
-                if let Some(ref secret_str) = totp_secret {
-                    if let Ok(bytes) = totp_rs::Secret::Encoded(secret_str.clone()).to_bytes() {
-                        if let Ok(totp) = totp_rs::TOTP::new(
-                            totp_rs::Algorithm::SHA1,
-                            6,
-                            1,
-                            30,
-                            bytes,
-                            Some("VaultScope".to_string()),
-                            email.clone(),
-                        ) {
-                            let clean_code = raw_code.replace(' ', "");
-                            if totp.check_current(&clean_code).unwrap_or(false) {
+                if let Some(ref secret_stored) = totp_secret {
+                    if let Ok(secret_base32) =
+                        decrypt_totp_secret(&state.config.encryption_key_bytes(), secret_stored)
+                    {
+                        if let Ok(Some(clean_code)) =
+                            verify_totp_code(&secret_base32, &email, raw_code)
+                        {
+                            if check_and_mark_totp_used(&state, customer_id, &clean_code).await {
                                 mfa_ok = true;
                             }
                         }
@@ -253,6 +467,8 @@ pub(crate) async fn login(
             audience: Audience::Storefront,
             iat: Utc::now().timestamp(),
             exp: jwt::new_expiry(),
+            auth_version: Some(auth_version),
+            jti: Some(Uuid::now_v7().to_string()),
         };
 
         let token = jwt::sign(&claims, &state.config.jwt_secret)?;
@@ -276,6 +492,333 @@ pub(crate) async fn login(
             "email_verified": email_verified
         })))
     }
+}
+
+#[utoipa::path(
+    post,
+    path = "/logout",
+    tag = "Auth",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Session revoked by bumping auth_version", body = OkResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let claims = authenticate_any_bearer(&headers, &state).await?;
+
+    let rows_affected = match claims.audience {
+        Audience::Admin => {
+            sqlx::query("UPDATE staff SET auth_version = auth_version + 1, updated_at = now() WHERE id = $1")
+                .bind(claims.sub)
+                .execute(&state.db)
+                .await?
+                .rows_affected()
+        }
+        Audience::Storefront => {
+            sqlx::query("UPDATE customers SET auth_version = auth_version + 1, updated_at = now() WHERE id = $1")
+                .bind(claims.sub)
+                .execute(&state.db)
+                .await?
+                .rows_affected()
+        }
+    };
+
+    if rows_affected == 0 {
+        return Err(ApiError::Unauthorized);
+    }
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct SseTicketResponse {
+    pub ticket: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/sse-ticket",
+    tag = "Auth",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Short-lived single-use SSE ticket", body = SseTicketResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create_sse_ticket(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let claims = authenticate_any_bearer(&headers, &state).await?;
+
+    let mut ticket_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut ticket_bytes);
+    let ticket = hex::encode(ticket_bytes);
+    let now = Utc::now().timestamp();
+    let entry = SseTicketEntry {
+        sub: claims.sub,
+        email: claims.email,
+        role: claims.role,
+        audience: claims.audience,
+        auth_version: claims.auth_version,
+        expires_at: now + 30,
+    };
+
+    let mut stored_in_redis = false;
+    if let Some(mut conn) = state.redis.clone() {
+        if let Ok(serialized) = serde_json::to_string(&entry) {
+            let key = format!("vs:sse:{}", ticket);
+            let res: redis::RedisResult<()> = redis::cmd("SET")
+                .arg(&key)
+                .arg(&serialized)
+                .arg("EX")
+                .arg(30)
+                .query_async(&mut conn)
+                .await;
+            match res {
+                Ok(()) => stored_in_redis = true,
+                Err(e) => {
+                    tracing::warn!("Failed to store SSE ticket in Redis, falling back to memory: {}", e);
+                }
+            }
+        }
+    }
+
+    if !stored_in_redis {
+        let mut store = state.sse_tickets.write().await;
+        store.retain(|_, v| v.expires_at >= now);
+        if store.len() >= MAX_LOCAL_SSE_TICKETS {
+            if let Some(oldest_key) = store
+                .iter()
+                .min_by_key(|(_, v)| v.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                store.remove(&oldest_key);
+            }
+        }
+        store.insert(ticket.clone(), entry);
+    }
+
+    Ok(Json(json!({ "ticket": ticket })))
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct AdminMfaCodePayload {
+    code: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct AdminMfaDisablePayload {
+    code: String,
+    password: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/admin/mfa/setup",
+    tag = "Auth",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Generated admin TOTP secret and QR payload", body = Value),
+        (status = 400, description = "2FA already enabled", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn admin_mfa_setup(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let row: Option<(String, bool)> =
+        sqlx::query_as("SELECT email, mfa_enabled FROM staff WHERE id = $1")
+            .bind(auth.0.sub)
+            .fetch_optional(&state.db)
+            .await?;
+
+    let (email, mfa_enabled) = row.ok_or_else(|| ApiError::NotFound("Staff account not found".into()))?;
+    if mfa_enabled {
+        return Err(ApiError::BadRequest(
+            "Two-factor authentication is already enabled. Disable it first before reconfiguring.".into(),
+        ));
+    }
+
+    let secret = Secret::generate_secret();
+    let secret_base32 = secret.to_encoded().to_string();
+    let secret_bytes = secret
+        .to_bytes()
+        .map_err(|e| ApiError::Internal(format!("Secret generation error: {e}")))?;
+
+    let totp = TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret_bytes,
+        Some("VaultScope Admin".to_string()),
+        email,
+    )
+    .map_err(|e| ApiError::Internal(format!("TOTP init error: {e}")))?;
+
+    let qr_base64 = totp
+        .get_qr_base64()
+        .map_err(|e| ApiError::Internal(format!("QR generation error: {e}")))?;
+    let qr_url = format!("data:image/png;base64,{}", qr_base64);
+    let url = totp.get_url();
+
+    let encrypted_secret = encrypt_totp_secret(&state.config.encryption_key_bytes(), &secret_base32)?;
+    sqlx::query("UPDATE staff SET totp_secret = $1, updated_at = now() WHERE id = $2")
+        .bind(&encrypted_secret)
+        .bind(auth.0.sub)
+        .execute(&state.db)
+        .await?;
+
+    Ok(Json(json!({
+        "secret": secret_base32,
+        "qr_url": qr_url,
+        "qr_base64": qr_base64,
+        "url": url,
+    })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/admin/mfa/enable",
+    tag = "Auth",
+    security(("bearer_auth" = [])),
+    request_body = AdminMfaCodePayload,
+    responses(
+        (status = 200, description = "Admin 2FA enabled", body = OkMessageResponse),
+        (status = 400, description = "Invalid TOTP code or setup not initiated", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn admin_mfa_enable(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<AdminMfaCodePayload>,
+) -> Result<Json<Value>, ApiError> {
+    let row: Option<(String, bool, Option<String>)> =
+        sqlx::query_as("SELECT email, mfa_enabled, totp_secret FROM staff WHERE id = $1")
+            .bind(auth.0.sub)
+            .fetch_optional(&state.db)
+            .await?;
+
+    let (email, mfa_enabled, totp_secret) =
+        row.ok_or_else(|| ApiError::NotFound("Staff account not found".into()))?;
+    if mfa_enabled {
+        return Err(ApiError::BadRequest(
+            "Two-factor authentication is already enabled.".into(),
+        ));
+    }
+
+    let secret_stored = totp_secret.ok_or_else(|| {
+        ApiError::BadRequest("MFA setup was not initiated. Please generate a setup key first.".into())
+    })?;
+    let secret_base32 = decrypt_totp_secret(&state.config.encryption_key_bytes(), &secret_stored)?;
+    let encrypted_secret = encrypt_totp_secret(&state.config.encryption_key_bytes(), &secret_base32)?;
+
+    let Some(clean_code) = verify_totp_code(&secret_base32, &email, &payload.code)? else {
+        return Err(ApiError::BadRequest(
+            "Invalid 6-digit verification code. Please check your authenticator app and system clock.".into(),
+        ));
+    };
+
+    if !check_and_mark_totp_used(&state, auth.0.sub, &clean_code).await {
+        return Err(ApiError::BadRequest(
+            "This verification code was already used. Please wait for the next 30-second code.".into(),
+        ));
+    }
+
+    sqlx::query(
+        "UPDATE staff SET mfa_enabled = true, totp_secret = $2, auth_version = auth_version + 1, updated_at = now() WHERE id = $1",
+    )
+    .bind(auth.0.sub)
+    .bind(&encrypted_secret)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": "Admin two-factor authentication successfully activated."
+    })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/admin/mfa/disable",
+    tag = "Auth",
+    security(("bearer_auth" = [])),
+    request_body = AdminMfaDisablePayload,
+    responses(
+        (status = 200, description = "Admin 2FA disabled", body = OkMessageResponse),
+        (status = 400, description = "Invalid password or TOTP code", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn admin_mfa_disable(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<AdminMfaDisablePayload>,
+) -> Result<Json<Value>, ApiError> {
+    let row: Option<(String, bool, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT email, mfa_enabled, totp_secret, password_hash FROM staff WHERE id = $1",
+    )
+    .bind(auth.0.sub)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (email, mfa_enabled, totp_secret, password_hash) =
+        row.ok_or_else(|| ApiError::NotFound("Staff account not found".into()))?;
+    if !mfa_enabled {
+        return Err(ApiError::BadRequest(
+            "Two-factor authentication is not currently enabled.".into(),
+        ));
+    }
+
+    if let Some(ref hash_str) = password_hash {
+        let pw = payload
+            .password
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ApiError::BadRequest(
+                    "Current password and a valid 2FA code are required to disable two-factor authentication.".into(),
+                )
+            })?;
+        if !verify_password_constant_time(pw, Some(hash_str)).await? {
+            return Err(ApiError::BadRequest(
+                "Invalid current password or 2FA code to disable two-factor authentication.".into(),
+            ));
+        }
+    }
+
+    let secret_stored = totp_secret.ok_or_else(|| {
+        ApiError::BadRequest("No TOTP secret configured on account.".into())
+    })?;
+    let secret_base32 = decrypt_totp_secret(&state.config.encryption_key_bytes(), &secret_stored)?;
+    let Some(clean_code) = verify_totp_code(&secret_base32, &email, &payload.code)? else {
+        return Err(ApiError::BadRequest(
+            "Invalid 2FA code to disable two-factor authentication.".into(),
+        ));
+    };
+
+    if !check_and_mark_totp_used(&state, auth.0.sub, &clean_code).await {
+        return Err(ApiError::BadRequest(
+            "This verification code was already used. Please wait for the next 30-second code.".into(),
+        ));
+    }
+
+    sqlx::query(
+        "UPDATE staff SET mfa_enabled = false, totp_secret = NULL, auth_version = auth_version + 1, updated_at = now() WHERE id = $1",
+    )
+    .bind(auth.0.sub)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": "Admin two-factor authentication has been disabled."
+    })))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -332,6 +875,9 @@ pub(crate) async fn register(
     if payload.password.len() < 8 {
         return Err(ApiError::BadRequest("Password must be at least 8 characters".into()));
     }
+    if payload.password.len() > 72 {
+        return Err(ApiError::BadRequest("Password must be at most 72 bytes".into()));
+    }
 
     let existing: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM customers WHERE LOWER(email) = LOWER($1) OR (username <> '' AND LOWER(username) = LOWER($2))"
@@ -348,15 +894,21 @@ pub(crate) async fn register(
     tracing::info!("Registering customer directly: {}", payload.email);
     let customer_id = Uuid::now_v7();
     let external_id = format!("local_{}", customer_id);
-    let password_hash = hash(&payload.password, DEFAULT_COST).map_err(|_| ApiError::Internal("Failed to hash password".into()))?;
+
+    let pw_owned = payload.password.clone();
+    let password_hash = tokio::task::spawn_blocking(move || hash(&pw_owned, DEFAULT_COST))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Password hashing task failed: {e}")))?
+        .map_err(|_| ApiError::Internal("Failed to hash password".into()))?;
 
     let postal_code = payload.postal_code.as_deref().unwrap_or("").trim();
-    let token_bytes: [u8; 32] = rand::random();
+    let mut token_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut token_bytes);
     let verification_token = hex::encode(token_bytes);
 
     sqlx::query(
-        r#"INSERT INTO customers (id, external_id, username, name, email, phone, company, address, postal_code, city, country, vat_id, status, email_verified, password_hash, verification_token)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'active', false, $13, $14)"#
+        r#"INSERT INTO customers (id, external_id, username, name, email, phone, company, address, postal_code, city, country, vat_id, status, email_verified, password_hash, verification_token, verification_token_expires_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'active', false, $13, $14, now() + interval '24 hours')"#
     )
     .bind(customer_id)
     .bind(external_id)
@@ -400,6 +952,111 @@ pub(crate) async fn register(
     })))
 }
 
+fn dispatch_plain_email(
+    config: &crate::config::Config,
+    db: Option<sqlx::PgPool>,
+    to_email: String,
+    subject: String,
+    body: String,
+) {
+    let smtp_host = config
+        .smtp_host
+        .clone()
+        .unwrap_or_else(|| "mail.vaultscope.de".to_string());
+    let smtp_user = config
+        .smtp_username
+        .clone()
+        .unwrap_or_else(|| "system@vaultscope.de".to_string());
+    let smtp_pass = config.smtp_password.clone().unwrap_or_default();
+    let smtp_from = config
+        .smtp_from
+        .clone()
+        .unwrap_or_else(|| "system@vaultscope.de".to_string());
+
+    let from_mailbox = match smtp_from.parse() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("Invalid smtp_from address: {:?}", e);
+            return;
+        }
+    };
+    let to_mailbox = match to_email.parse() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("Invalid to_email address: {:?}", e);
+            return;
+        }
+    };
+
+    let email = match lettre::Message::builder()
+        .from(from_mailbox)
+        .to(to_mailbox)
+        .subject(subject.clone())
+        .body(body)
+    {
+        Ok(msg) => msg,
+        Err(e) => {
+            tracing::error!("Failed to build verification email: {:?}", e);
+            return;
+        }
+    };
+
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let recipient_log = to_email.clone();
+        let send_res = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let creds =
+                lettre::transport::smtp::authentication::Credentials::new(smtp_user, smtp_pass);
+            let mailer = lettre::SmtpTransport::relay(&smtp_host)
+                .map_err(|e| format!("Failed to create SMTP relay transport: {e:?}"))?
+                .credentials(creds)
+                .build();
+            lettre::Transport::send(&mailer, &email).map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await;
+
+        let (success, err_msg) = match send_res {
+            Ok(Ok(())) => {
+                tracing::info!("Verification email sent successfully to {}", recipient_log);
+                (true, None)
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Could not send verification email to {}: {}", recipient_log, e);
+                (false, Some(e))
+            }
+            Err(e) => {
+                tracing::error!("Verification email task panicked for {}: {}", recipient_log, e);
+                (false, Some(e.to_string()))
+            }
+        };
+
+        if let Some(pool) = db {
+            let status = if success {
+                vaultscope_db::models::EmailDeliveryStatus::Delivered
+            } else {
+                vaultscope_db::models::EmailDeliveryStatus::Failed
+            };
+            let _ = sqlx::query(
+                r#"INSERT INTO email_log (id, recipient, subject, template_id, status, error, sent_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+            )
+            .bind(Uuid::now_v7())
+            .bind(to_email)
+            .bind(subject)
+            .bind(None::<Uuid>)
+            .bind(status)
+            .bind(err_msg)
+            .bind(Utc::now())
+            .execute(&pool)
+            .await;
+        }
+    });
+}
+
 pub fn send_verification_email(
     config: &crate::config::Config,
     db: Option<sqlx::PgPool>,
@@ -407,14 +1064,9 @@ pub fn send_verification_email(
     to_name: &str,
     token: &str,
 ) {
-    let smtp_host = config.smtp_host.clone().unwrap_or_else(|| "mail.vaultscope.de".to_string());
-    let smtp_user = config.smtp_username.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
-    let smtp_pass = config.smtp_password.clone().unwrap_or_else(|| "".to_string());
-    let smtp_from = config.smtp_from.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
-
     let base = config.storefront_url.trim_end_matches('/');
     let verify_link = format!("{}/verify-email?token={}", base, token);
-    tracing::info!("Verification link for {}: {}", to_email, verify_link);
+    tracing::info!("Dispatching verification email to {}", to_email);
 
     let body = format!(
 "Hello {},
@@ -433,78 +1085,13 @@ The VaultScope Team",
         to_name, verify_link
     );
 
-    let from_mailbox = match smtp_from.parse() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!("Invalid smtp_from address: {:?}", e);
-            return;
-        }
-    };
-    let to_mailbox = match to_email.parse() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!("Invalid to_email address: {:?}", e);
-            return;
-        }
-    };
-
-    let email = match lettre::Message::builder()
-        .from(from_mailbox)
-        .to(to_mailbox)
-        .subject("Verify your VaultScope email address")
-        .body(body)
-    {
-        Ok(msg) => msg,
-        Err(e) => {
-            tracing::error!("Failed to build verification email: {:?}", e);
-            return;
-        }
-    };
-
-    let creds = lettre::transport::smtp::authentication::Credentials::new(smtp_user, smtp_pass);
-    let mailer = match lettre::SmtpTransport::relay(&smtp_host) {
-        Ok(b) => b.credentials(creds).build(),
-        Err(e) => {
-            tracing::error!("Failed to create SMTP relay transport: {:?}", e);
-            return;
-        }
-    };
-
-    let send_res = lettre::Transport::send(&mailer, &email);
-    let (success, err_msg) = match send_res {
-        Ok(_) => {
-            tracing::info!("Verification email sent successfully to {}", to_email);
-            (true, None)
-        }
-        Err(e) => {
-            tracing::error!("Could not send verification email to {}: {:?}", to_email, e);
-            (false, Some(e.to_string()))
-        }
-    };
-
-    if let Some(pool) = db {
-        let recipient = to_email.to_string();
-        tokio::spawn(async move {
-            let status = if success {
-                vaultscope_db::models::EmailDeliveryStatus::Delivered
-            } else {
-                vaultscope_db::models::EmailDeliveryStatus::Failed
-            };
-            let _ = sqlx::query(
-                r#"INSERT INTO email_log (id, recipient, subject, template_id, status, error, sent_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
-            )
-            .bind(uuid::Uuid::now_v7())
-            .bind(recipient)
-            .bind("Verify your VaultScope email address")
-            .bind(None::<uuid::Uuid>)
-            .bind(status)
-            .bind(err_msg)
-            .bind(chrono::Utc::now())
-            .execute(&pool)
-            .await;
-        });
-    }
+    dispatch_plain_email(
+        config,
+        db,
+        to_email.to_string(),
+        "Verify your VaultScope email address".to_string(),
+        body,
+    );
 }
 
 pub fn send_billing_email_verification(
@@ -514,14 +1101,9 @@ pub fn send_billing_email_verification(
     company_name: &str,
     token: &str,
 ) {
-    let smtp_host = config.smtp_host.clone().unwrap_or_else(|| "mail.vaultscope.de".to_string());
-    let smtp_user = config.smtp_username.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
-    let smtp_pass = config.smtp_password.clone().unwrap_or_else(|| "".to_string());
-    let smtp_from = config.smtp_from.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
-
     let base = config.storefront_url.trim_end_matches('/');
     let verify_link = format!("{}/verify-email?token={}&type=billing", base, token);
-    tracing::info!("Billing email verification link for {}: {}", to_email, verify_link);
+    tracing::info!("Dispatching billing email verification to {}", to_email);
 
     let body = format!(
 "Hello,
@@ -540,79 +1122,13 @@ The VaultScope Team",
         company_name, verify_link
     );
 
-    let from_mailbox = match smtp_from.parse() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!("Invalid smtp_from address: {:?}", e);
-            return;
-        }
-    };
-    let to_mailbox = match to_email.parse() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!("Invalid to_email address: {:?}", e);
-            return;
-        }
-    };
-
-    let email = match lettre::Message::builder()
-        .from(from_mailbox)
-        .to(to_mailbox)
-        .subject(format!("Confirm Billing CC Email for {} - VaultScope", company_name))
-        .body(body)
-    {
-        Ok(msg) => msg,
-        Err(e) => {
-            tracing::error!("Failed to build billing verification email: {:?}", e);
-            return;
-        }
-    };
-
-    let creds = lettre::transport::smtp::authentication::Credentials::new(smtp_user, smtp_pass);
-    let mailer = match lettre::SmtpTransport::relay(&smtp_host) {
-        Ok(b) => b.credentials(creds).build(),
-        Err(e) => {
-            tracing::error!("Failed to create SMTP relay transport: {:?}", e);
-            return;
-        }
-    };
-
-    let send_res = lettre::Transport::send(&mailer, &email);
-    let (success, err_msg) = match send_res {
-        Ok(_) => {
-            tracing::info!("Billing verification email sent successfully to {}", to_email);
-            (true, None)
-        }
-        Err(e) => {
-            tracing::error!("Could not send billing verification email to {}: {:?}", to_email, e);
-            (false, Some(e.to_string()))
-        }
-    };
-
-    if let Some(pool) = db {
-        let recipient = to_email.to_string();
-        let subject = format!("Confirm Billing CC Email for {} - VaultScope", company_name);
-        tokio::spawn(async move {
-            let status = if success {
-                vaultscope_db::models::EmailDeliveryStatus::Delivered
-            } else {
-                vaultscope_db::models::EmailDeliveryStatus::Failed
-            };
-            let _ = sqlx::query(
-                r#"INSERT INTO email_log (id, recipient, subject, template_id, status, error, sent_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
-            )
-            .bind(uuid::Uuid::now_v7())
-            .bind(recipient)
-            .bind(subject)
-            .bind(None::<uuid::Uuid>)
-            .bind(status)
-            .bind(err_msg)
-            .bind(chrono::Utc::now())
-            .execute(&pool)
-            .await;
-        });
-    }
+    dispatch_plain_email(
+        config,
+        db,
+        to_email.to_string(),
+        format!("Confirm Billing CC Email for {} - VaultScope", company_name),
+        body,
+    );
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -638,16 +1154,22 @@ pub(crate) async fn verify_email(
     let token = payload.token.trim();
 
     // 1. Check primary customer verification token
-    let customer: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, email FROM customers WHERE verification_token = $1 LIMIT 1"
+    let customer: Option<(Uuid, String, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT id, email, verification_token_expires_at FROM customers WHERE verification_token = $1 LIMIT 1",
     )
     .bind(token)
     .fetch_optional(&state.db)
     .await?;
 
-    if let Some((customer_id, email)) = customer {
+    if let Some((customer_id, email, expires_at)) = customer {
+        if expires_at.is_some_and(|exp| exp < Utc::now()) {
+            return Err(ApiError::BadRequest(
+                "Invalid or expired verification token.".into(),
+            ));
+        }
+
         sqlx::query(
-            "UPDATE customers SET email_verified = true, verification_token = NULL, updated_at = now() WHERE id = $1"
+            "UPDATE customers SET email_verified = true, verification_token = NULL, verification_token_expires_at = NULL, updated_at = now() WHERE id = $1",
         )
         .bind(customer_id)
         .execute(&state.db)
@@ -662,16 +1184,22 @@ pub(crate) async fn verify_email(
     }
 
     // 2. Check billing CC verification token
-    let billing_email: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, email FROM customer_billing_emails WHERE verification_token = $1 LIMIT 1"
+    let billing_email: Option<(Uuid, String, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT id, email, verification_token_expires_at FROM customer_billing_emails WHERE verification_token = $1 LIMIT 1",
     )
     .bind(token)
     .fetch_optional(&state.db)
     .await?;
 
-    if let Some((id, email)) = billing_email {
+    if let Some((id, email, expires_at)) = billing_email {
+        if expires_at.is_some_and(|exp| exp < Utc::now()) {
+            return Err(ApiError::BadRequest(
+                "Invalid or expired verification token.".into(),
+            ));
+        }
+
         sqlx::query(
-            "UPDATE customer_billing_emails SET verified = true, verification_token = NULL, verified_at = now() WHERE id = $1"
+            "UPDATE customer_billing_emails SET verified = true, verification_token = NULL, verification_token_expires_at = NULL, verified_at = now() WHERE id = $1",
         )
         .bind(id)
         .execute(&state.db)
@@ -685,7 +1213,9 @@ pub(crate) async fn verify_email(
         })));
     }
 
-    Err(ApiError::BadRequest("Invalid or expired verification token.".into()))
+    Err(ApiError::BadRequest(
+        "Invalid or expired verification token.".into(),
+    ))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -711,38 +1241,34 @@ pub(crate) async fn resend_verification(
     validate_email(&payload.email)?;
 
     let customer: Option<(Uuid, String, String, bool)> = sqlx::query_as(
-        "SELECT id, name, email, email_verified FROM customers WHERE email = $1 LIMIT 1"
+        "SELECT id, name, email, email_verified FROM customers WHERE LOWER(email) = LOWER($1) LIMIT 1",
     )
     .bind(payload.email.trim())
     .fetch_optional(&state.db)
     .await?;
 
     if let Some((customer_id, name, email, email_verified)) = customer {
-        if email_verified {
-            return Ok(Json(json!({
-                "ok": true,
-                "message": "Your email is already verified. You can log in directly."
-            })));
+        if !email_verified {
+            let mut token_bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+            let verification_token = hex::encode(token_bytes);
+
+            sqlx::query(
+                "UPDATE customers SET verification_token = $1, verification_token_expires_at = now() + interval '24 hours', updated_at = now() WHERE id = $2",
+            )
+            .bind(&verification_token)
+            .bind(customer_id)
+            .execute(&state.db)
+            .await?;
+
+            send_verification_email(
+                &state.config,
+                Some(state.db.clone()),
+                &email,
+                &name,
+                &verification_token,
+            );
         }
-
-        let token_bytes: [u8; 32] = rand::random();
-        let verification_token = hex::encode(token_bytes);
-
-        sqlx::query(
-            "UPDATE customers SET verification_token = $1, updated_at = now() WHERE id = $2"
-        )
-        .bind(&verification_token)
-        .bind(customer_id)
-        .execute(&state.db)
-        .await?;
-
-        send_verification_email(
-            &state.config,
-            Some(state.db.clone()),
-            &email,
-            &name,
-            &verification_token,
-        );
     }
 
     Ok(Json(json!({

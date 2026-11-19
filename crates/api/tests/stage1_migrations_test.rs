@@ -283,24 +283,22 @@ $$;
 async fn test_vaultscope_test_migrations_through_0035_and_seeded_preservation() {
     let pool = common::setup_test_db().await;
 
-    // 1. Verify active migrations end at 0035 (neither 0036 candidate is active yet)
+    // 1. Verify active migrations include 0038_security_stripe_unique_and_invoice_seq
     let (max_ver, count, failed_count): (Option<i64>, i64, i64) = sqlx::query_as(
         "SELECT MAX(version), COUNT(*), COUNT(*) FILTER (WHERE success = false) FROM _sqlx_migrations",
     )
     .fetch_one(&pool)
     .await
     .expect("query _sqlx_migrations");
-    assert_eq!(max_ver, Some(37));
-    assert_eq!(count, 35); // 0001..0005, 0007..0035, 0037 (no 0006 or 0036 file in repo)
+    assert_eq!(max_ver, Some(39));
+    assert_eq!(count, 37); // 0001..0005, 0007..0035, 0037, 0038, 0039 (no 0006 or 0036 file in repo)
     assert_eq!(failed_count, 0);
 
-    // 2. Verify index idx_invoices_stripe_payment_intent_id is NOT created prematurely
-    assert!(
-        index_state(&pool, "idx_invoices_stripe_payment_intent_id")
-            .await
-            .is_none(),
-        "Candidate 0036 must not be active in crates/db/migrations yet"
-    );
+    // 2. Verify idx_invoices_stripe_payment_intent_id is now active and valid via 0038
+    let idx_info = index_state(&pool, "idx_invoices_stripe_payment_intent_id")
+        .await
+        .expect("Migration 0038 must install idx_invoices_stripe_payment_intent_id");
+    assert!(idx_info.2 && idx_info.3 && idx_info.4, "Index must be valid, ready, and unique");
 
     // 3. Verify seeded historical invoice INV-2026-0001 is preserved verbatim and deserializes cleanly
     let seeded_id = Uuid::parse_str("00000000-0000-0000-0000-000000000070").unwrap();
