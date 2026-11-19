@@ -152,10 +152,37 @@ pub(crate) async fn export_customers(
     ))
 }
 
-fn csv_escape(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') {
-        format!("\"{}\"", value.replace('"', "\"\""))
+pub fn csv_escape(value: &str) -> String {
+    let neutralized = if value.starts_with(['=', '+', '-', '@', '\t', '\r'])
+        || value.trim_start().starts_with(['=', '+', '-', '@'])
+    {
+        format!("'{value}")
     } else {
         value.to_string()
+    };
+
+    if neutralized.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", neutralized.replace('"', "\"\""))
+    } else {
+        neutralized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::csv_escape;
+
+    #[test]
+    fn test_csv_escape_neutralizes_formula_injection_and_quotes_delimiters() {
+        assert_eq!(csv_escape("normal"), "normal");
+        assert_eq!(csv_escape("=SUM(A1:A2)"), "'=SUM(A1:A2)");
+        assert_eq!(csv_escape("+cmd|' /C calc'!A0"), "'+cmd|' /C calc'!A0");
+        assert_eq!(csv_escape("-2+3"), "'-2+3");
+        assert_eq!(csv_escape("@SUM(1+1)"), "'@SUM(1+1)");
+        assert_eq!(csv_escape("\t=1"), "'\t=1");
+        assert_eq!(csv_escape("\r=1"), "\"'\r=1\"");
+        assert_eq!(csv_escape("  =1+1"), "'  =1+1");
+        assert_eq!(csv_escape("=1,2"), "\"'=1,2\"");
+        assert_eq!(csv_escape("Acme, \"GmbH\""), "\"Acme, \"\"GmbH\"\"\"");
     }
 }
