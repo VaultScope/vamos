@@ -14,6 +14,10 @@ use vaultscope_db::models::Setting;
 pub struct StorefrontConfig {
     pub stripe_public_key: Option<String>,
     pub custom_domain: Option<String>,
+    pub tax_mode: String,
+    pub tax_rate_percent: rust_decimal::Decimal,
+    pub small_business_exempt: bool,
+    pub tax_notice: Option<String>,
 }
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -75,8 +79,14 @@ pub(crate) async fn get_config(State(state): State<AppState>) -> Result<Json<Sto
         stripe_public_key
     };
 
+    let tax_policy = crate::reliablesite_catalog::load_tax_policy(&state.db, &state.config).await;
+
     Ok(Json(StorefrontConfig {
         stripe_public_key: public_key,
         custom_domain,
+        tax_mode: tax_policy.tax_mode,
+        tax_rate_percent: tax_policy.rate_percent,
+        small_business_exempt: tax_policy.small_business_exempt,
+        tax_notice: tax_policy.tax_notice,
     }))
 }

@@ -343,11 +343,53 @@ impl BillingRunner {
 
             let mut created_invoice_id: Option<Uuid> = None;
             if price > rust_decimal::Decimal::ZERO {
+                let setting_rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+                    "SELECT key, value FROM settings WHERE key IN ('taxMode', 'defaultTaxRate', 'tax_rate_percent')",
+                )
+                .fetch_all(&mut *tx)
+                .await?;
+
+                let mut tax_mode: Option<String> = None;
+                let mut tax_rate_override: Option<rust_decimal::Decimal> = None;
+                for (k, v) in setting_rows {
+                    match k.as_str() {
+                        "taxMode" => {
+                            if let Some(s) = v.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                                tax_mode = Some(s.to_string());
+                            }
+                        }
+                        "defaultTaxRate" | "tax_rate_percent" => {
+                            let parsed = if let Some(s) = v.as_str() {
+                                s.trim().parse::<rust_decimal::Decimal>().ok()
+                            } else if let Some(n) = v.as_f64() {
+                                rust_decimal::Decimal::try_from(n).ok()
+                            } else {
+                                v.as_i64().map(rust_decimal::Decimal::from)
+                            };
+                            if let Some(d) = parsed.filter(|d| {
+                                *d >= rust_decimal::Decimal::ZERO
+                                    && *d <= rust_decimal::Decimal::from(100)
+                            }) {
+                                tax_rate_override = Some(d.round_dp(2));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Safe fallback: Kleinunternehmerregelung (§ 19 UStG, 0%) unless explicit standard tax rate configured
+                let tax_rate_pct = if tax_mode
+                    .as_deref()
+                    .is_some_and(|m| m.eq_ignore_ascii_case("small_business"))
+                {
+                    rust_decimal::Decimal::ZERO
+                } else {
+                    tax_rate_override.unwrap_or(rust_decimal::Decimal::ZERO)
+                };
+
                 let quantity: i32 = 1;
                 let subtotal = (price * rust_decimal::Decimal::from(quantity)).round_dp(2);
-                // 19% VAT
-                let tax_rate = rust_decimal::Decimal::new(19, 2);
-                let tax_amount = (subtotal * tax_rate).round_dp(2);
+                let tax_amount = (subtotal * (tax_rate_pct / rust_decimal::Decimal::from(100))).round_dp(2);
                 let total = (subtotal + tax_amount).round_dp(2);
 
                 let invoice_id = Uuid::now_v7();
@@ -372,7 +414,7 @@ impl BillingRunner {
                 .bind(&invoice_number)
                 .bind(row.customer_id)
                 .bind(subtotal)
-                .bind(tax_rate)
+                .bind(tax_rate_pct)
                 .bind(tax_amount)
                 .bind(total)
                 .bind(issue_date)

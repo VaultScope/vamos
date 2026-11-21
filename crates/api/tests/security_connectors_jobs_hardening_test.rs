@@ -291,6 +291,9 @@ fn unit_mailer_header_sanitization_and_service_sanitization() {
         trial_ends_at: None,
         partner_id: None,
         quota_gb: Some(150),
+        order_state: "active".to_string(),
+        order_state_note: None,
+        order_state_updated_at: None,
     };
 
     let sanitized = sanitize_service_for_storefront(svc);
@@ -395,7 +398,8 @@ fn unit_pdf_uses_billing_snapshot_and_actual_tax_rate() {
     assert!(pdf_str.contains("DE999888777"));
     assert!(!pdf_str.contains("Live Company Should Be Overridden"));
     assert!(!pdf_str.contains("Old Street 1"));
-    assert!(pdf_str.contains("zzgl. 0% USt. / VAT:"));
+    assert!(pdf_str.contains("USt. (Par. 19 UStG):"));
+    assert!(pdf_str.contains("Paragraph 19 UStG"));
     assert!(!pdf_str.contains("zzgl. 19% USt. / VAT:"));
 
     // Verify both 0.19 and 19.00 tax_rate representations render "19%"
@@ -812,9 +816,9 @@ async fn db_billing_runner_atomic_renewals_seq_numbering_and_tax_rounding() {
     assert!(!is_trial);
     assert_eq!(quota_gb, Some(250));
 
-    // Invoice uses INV-YYYYMM-NNNNNN sequence and rounded tax (19.99 * 0.19 = 3.7981 -> 3.80)
-    let (inv_num, sub, tax, total): (String, Decimal, Decimal, Decimal) = sqlx::query_as(
-        "SELECT invoice_number, subtotal, tax_amount, total FROM invoices WHERE customer_id = $1",
+    // Invoice uses INV-YYYYMM-NNNNNN sequence and safe fallback § 19 UStG 0% VAT (tax=0.00, total=19.99)
+    let (inv_num, sub, tax_rate, tax, total): (String, Decimal, Decimal, Decimal, Decimal) = sqlx::query_as(
+        "SELECT invoice_number, subtotal, tax_rate, tax_amount, total FROM invoices WHERE customer_id = $1",
     )
     .bind(cust_id)
     .fetch_one(&pool)
@@ -826,8 +830,9 @@ async fn db_billing_runner_atomic_renewals_seq_numbering_and_tax_rounding() {
         "Expected sequential INV-YYYYMM-NNNNNN invoice number, got {inv_num}"
     );
     assert_eq!(sub, Decimal::from_str("19.99").unwrap());
-    assert_eq!(tax, Decimal::from_str("3.80").unwrap());
-    assert_eq!(total, Decimal::from_str("23.79").unwrap());
+    assert_eq!(tax_rate, Decimal::from_str("0.00").unwrap());
+    assert_eq!(tax, Decimal::from_str("0.00").unwrap());
+    assert_eq!(total, Decimal::from_str("19.99").unwrap());
 
     // Running again must NOT duplicate invoice
     runner.process_renewals().await.unwrap();
@@ -837,6 +842,9 @@ async fn db_billing_runner_atomic_renewals_seq_numbering_and_tax_rounding() {
         .await
         .unwrap();
     assert_eq!(inv_count, 1);
+
+    let _ = sqlx::query("DELETE FROM invoice_line_items WHERE invoice_id IN (SELECT id FROM invoices WHERE customer_id = $1)").bind(cust_id).execute(&pool).await;
+    let _ = sqlx::query("DELETE FROM invoices WHERE customer_id = $1").bind(cust_id).execute(&pool).await;
 
     let _ = sqlx::query("DELETE FROM jobs WHERE service_id = $1").bind(svc_id).execute(&pool).await;
     let _ = sqlx::query("DELETE FROM services WHERE id = $1").bind(svc_id).execute(&pool).await;

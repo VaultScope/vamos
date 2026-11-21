@@ -85,7 +85,9 @@ pub(crate) async fn get_by_slug(
     product.trial_quota_gb = effective_trial_quota;
     product.quota_gb = effective_quota;
 
-    let product = crate::reliablesite_catalog::sanitize_product_for_storefront(product);
+    let policy = crate::reliablesite_catalog::load_pricing_policy(&state.db, &state.config).await;
+    let product =
+        crate::reliablesite_catalog::sanitize_product_for_storefront_with_policy(product, policy);
 
     Ok(Json(PartnerResponse {
         partner: PartnerInfo {

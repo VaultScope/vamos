@@ -390,8 +390,14 @@ impl ProvisioningProvider for ReliableSite {
             )));
         }
 
-        // 2. Determine available paymentMethod module
+        // 2. Determine an instant automated paymentMethod module (never fall back to manual banktransfer)
         let methods = self.order_client.get_payment_methods(product_id).await?;
+        let is_manual_module = |module: &str| {
+            matches!(
+                module.trim().to_ascii_lowercase().as_str(),
+                "banktransfer" | "wiretransfer" | "mailin" | "offline" | "check" | "cash"
+            )
+        };
         let payment_method = if let Some(ref preferred) = explicit_payment_method {
             if methods.payment_methods.iter().any(|m| m.module == *preferred) {
                 preferred.clone()
@@ -405,12 +411,11 @@ impl ProvisioningProvider for ReliableSite {
             methods
                 .payment_methods
                 .iter()
-                .find(|m| m.module == "banktransfer")
-                .or_else(|| methods.payment_methods.first())
+                .find(|m| !is_manual_module(&m.module))
                 .map(|m| m.module.clone())
                 .ok_or_else(|| {
                     ConnectorError::Api(format!(
-                        "No payment methods returned for ReliableSite product {}",
+                        "No instant automated payment method enabled for ReliableSite product {} (only manual methods returned; configure RELIABLESITE_PAYMENT_METHOD and an instant billing profile in ReliableSite)",
                         product_id
                     ))
                 })?

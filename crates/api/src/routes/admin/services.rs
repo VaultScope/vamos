@@ -15,6 +15,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(list, create))
         .routes(routes!(get_one))
+        .routes(routes!(update_order_state, update_order_state_post))
         .routes(routes!(suspend))
         .routes(routes!(reactivate))
         .routes(routes!(terminate))
@@ -338,5 +339,161 @@ pub(crate) async fn admin_ipmi_get(
     path: axum::extract::Path<uuid::Uuid>,
 ) -> Result<axum::Json<serde_json::Value>, ApiError> {
     admin_ipmi(auth, state, path, None).await
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateOrderStatePayload {
+    pub order_state: String,
+    #[serde(default)]
+    pub order_state_note: Option<String>,
+    #[serde(default)]
+    pub ip: Option<String>,
+    #[serde(default)]
+    pub notify_customer: Option<bool>,
+}
+
+const VALID_ORDER_STATES: &[&str] = &[
+    "payment_received",
+    "provisioning",
+    "hardware_setup",
+    "active",
+    "action_required",
+    "cancelled",
+];
+
+#[utoipa::path(
+    patch,
+    path = "/{id}/order-state",
+    tag = "Admin Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    request_body = UpdateOrderStatePayload,
+    responses(
+        (status = 200, description = "Order state updated", body = Service),
+        (status = 400, description = "Invalid order state", body = ErrorResponse),
+        (status = 403, description = "Requires services.manage permission", body = ErrorResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub async fn update_order_state(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<UpdateOrderStatePayload>,
+) -> Result<Json<Service>, ApiError> {
+    crate::require_permission!(auth, state, "services.manage");
+
+    let order_state = payload.order_state.trim().to_ascii_lowercase();
+    if !VALID_ORDER_STATES.contains(&order_state.as_str()) {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid order_state '{}'. Allowed: {}",
+            payload.order_state,
+            VALID_ORDER_STATES.join(", ")
+        )));
+    }
+
+    let cleaned_note: Option<String> = payload
+        .order_state_note
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(1000).collect());
+
+    let validated_ip = validate_optional_client_ip(payload.ip.as_deref())?;
+
+    let mut tx = state.db.begin().await?;
+    let current: Service = sqlx::query_as("SELECT * FROM services WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Service not found".into()))?;
+
+    let next_status = match order_state.as_str() {
+        "cancelled" => "terminated",
+        "active" if matches!(current.status, vaultscope_db::models::ServiceStatus::Pending) => {
+            "running"
+        }
+        _ => match current.status {
+            vaultscope_db::models::ServiceStatus::Running => "running",
+            vaultscope_db::models::ServiceStatus::Suspended => "suspended",
+            vaultscope_db::models::ServiceStatus::Pending => "pending",
+            vaultscope_db::models::ServiceStatus::Terminated => "terminated",
+        },
+    };
+
+    let updated: Service = sqlx::query_as(
+        r#"UPDATE services
+           SET order_state = $1,
+               order_state_note = $2,
+               order_state_updated_at = now(),
+               ip = COALESCE($3, ip),
+               status = $4::service_status,
+               updated_at = now()
+           WHERE id = $5
+           RETURNING *"#,
+    )
+    .bind(&order_state)
+    .bind(&cleaned_note)
+    .bind(&validated_ip)
+    .bind(next_status)
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        r#"INSERT INTO activity_log (id, actor_id, actor_type, actor_name, category, action, target, detail, created_at)
+           VALUES ($1, $2, 'staff'::actor_type, $3, 'service', 'service.order_state_updated', $4, $5, now())"#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(auth.0.sub)
+    .bind(&auth.0.email)
+    .bind(id.to_string())
+    .bind(format!(
+        "Changed order_state from '{}' to '{}'{}",
+        current.order_state,
+        order_state,
+        cleaned_note
+            .as_deref()
+            .map(|n| format!(" ({})", n))
+            .unwrap_or_default()
+    ))
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    if payload.notify_customer.unwrap_or(false) {
+        crate::mailer::spawn_order_state_updated_notification(
+            state.clone(),
+            updated.id,
+            updated.order_state.clone(),
+            updated.order_state_note.clone(),
+        );
+    }
+
+    Ok(Json(updated))
+}
+
+#[utoipa::path(
+    post,
+    path = "/{id}/order-state",
+    tag = "Admin Services",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Service ID")),
+    request_body = UpdateOrderStatePayload,
+    responses(
+        (status = 200, description = "Order state updated", body = Service),
+        (status = 400, description = "Invalid order state", body = ErrorResponse),
+        (status = 403, description = "Requires services.manage permission", body = ErrorResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse)
+    )
+)]
+pub async fn update_order_state_post(
+    auth: AuthAdmin,
+    state: State<AppState>,
+    path: Path<Uuid>,
+    payload: Json<UpdateOrderStatePayload>,
+) -> Result<Json<Service>, ApiError> {
+    update_order_state(auth, state, path, payload).await
 }
 

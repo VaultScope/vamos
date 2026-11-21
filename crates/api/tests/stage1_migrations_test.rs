@@ -290,8 +290,8 @@ async fn test_vaultscope_test_migrations_through_0035_and_seeded_preservation() 
     .fetch_one(&pool)
     .await
     .expect("query _sqlx_migrations");
-    assert_eq!(max_ver, Some(39));
-    assert_eq!(count, 37); // 0001..0005, 0007..0035, 0037, 0038, 0039 (no 0006 or 0036 file in repo)
+    assert_eq!(max_ver, Some(42));
+    assert_eq!(count, 40); // 0001..0005, 0007..0035, 0037..0042 (no 0006 or 0036 file in repo)
     assert_eq!(failed_count, 0);
 
     // 2. Verify idx_invoices_stripe_payment_intent_id is now active and valid via 0038

@@ -26,6 +26,10 @@ pub struct Config {
     pub reliablesite_order_api_url: Option<String>,
     pub reliablesite_inventory_url: Option<String>,
     pub reliablesite_payment_method: Option<String>,
+    pub reliablesite_live_fx_enabled: bool,
+    pub reliablesite_usd_to_eur_rate: rust_decimal::Decimal,
+    pub reliablesite_markup_percent: rust_decimal::Decimal,
+    pub default_tax_rate_percent: rust_decimal::Decimal,
     pub sftpgo_url: Option<String>,
     pub sftpgo_user: Option<String>,
     pub sftpgo_pass: Option<String>,
@@ -71,6 +75,10 @@ impl fmt::Debug for Config {
             .field("reliablesite_order_api_url", &self.reliablesite_order_api_url)
             .field("reliablesite_inventory_url", &self.reliablesite_inventory_url)
             .field("reliablesite_payment_method", &self.reliablesite_payment_method)
+            .field("reliablesite_live_fx_enabled", &self.reliablesite_live_fx_enabled)
+            .field("reliablesite_usd_to_eur_rate", &self.reliablesite_usd_to_eur_rate)
+            .field("reliablesite_markup_percent", &self.reliablesite_markup_percent)
+            .field("default_tax_rate_percent", &self.default_tax_rate_percent)
             .field("sftpgo_url", &self.sftpgo_url)
             .field("sftpgo_user", &self.sftpgo_user)
             .field("sftpgo_pass", &redact_opt(&self.sftpgo_pass))
@@ -174,6 +182,24 @@ impl Config {
             reliablesite_order_api_url: env::var("RELIABLESITE_ORDER_API_URL").ok(),
             reliablesite_inventory_url: env::var("RELIABLESITE_INVENTORY_URL").ok(),
             reliablesite_payment_method: env::var("RELIABLESITE_PAYMENT_METHOD").ok(),
+            reliablesite_live_fx_enabled: env::var("RELIABLESITE_LIVE_FX_ENABLED")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
+            reliablesite_usd_to_eur_rate: env::var("RELIABLESITE_USD_TO_EUR_RATE")
+                .ok()
+                .and_then(|s| s.trim().parse::<rust_decimal::Decimal>().ok())
+                .filter(|d| *d > rust_decimal::Decimal::ZERO)
+                .unwrap_or_else(|| rust_decimal::Decimal::new(91, 2)),
+            reliablesite_markup_percent: env::var("RELIABLESITE_MARKUP_PERCENT")
+                .ok()
+                .and_then(|s| s.trim().parse::<rust_decimal::Decimal>().ok())
+                .filter(|d| *d >= rust_decimal::Decimal::ZERO)
+                .unwrap_or_else(|| rust_decimal::Decimal::new(15, 0)),
+            default_tax_rate_percent: env::var("TAX_RATE_PERCENT")
+                .ok()
+                .and_then(|s| s.trim().parse::<rust_decimal::Decimal>().ok())
+                .filter(|d| *d >= rust_decimal::Decimal::ZERO && *d <= rust_decimal::Decimal::from(100))
+                .unwrap_or(rust_decimal::Decimal::ZERO),
             sftpgo_url: env::var("SFTPGO_URL").ok(),
             sftpgo_user: env::var("SFTPGO_USER").ok(),
             sftpgo_pass: env::var("SFTPGO_PASS").ok(),

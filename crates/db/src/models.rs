@@ -215,6 +215,10 @@ pub struct Product {
     pub updated_at: DateTime<Utc>,
 }
 
+fn default_order_state() -> String {
+    "active".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Service {
     pub id: Uuid,
@@ -243,6 +247,12 @@ pub struct Service {
     pub partner_id: Option<Uuid>,
     #[serde(default)]
     pub quota_gb: Option<i32>,
+    #[serde(default = "default_order_state")]
+    pub order_state: String,
+    #[serde(default)]
+    pub order_state_note: Option<String>,
+    #[serde(default)]
+    pub order_state_updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, ToSchema)]

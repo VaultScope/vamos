@@ -210,6 +210,160 @@ pub fn spawn_customer_reply_notification(
     });
 }
 
+pub fn is_dedicated_product(provider: &str, category: &str) -> bool {
+    let prov = provider.trim().to_ascii_lowercase();
+    let cat = category.trim().to_ascii_lowercase();
+    prov == "reliablesite"
+        || prov == "vaultscope_dedicated"
+        || cat == "dedicated"
+        || cat == "ds"
+        || cat == "bare-metal"
+}
+
+pub fn build_service_welcome_email(
+    customer_name: &str,
+    service_name: &str,
+    service_id: Uuid,
+    hostname: &str,
+    quota: i32,
+    is_trial: bool,
+    price: rust_decimal::Decimal,
+    provider: &str,
+    category: &str,
+    response_payload: &serde_json::Value,
+) -> (String, String) {
+    let is_dedicated = is_dedicated_product(provider, category);
+    let is_sftp = response_payload.get("sftpgo_user").is_some()
+        || response_payload.get("raw_response").and_then(|r| r.get("sftpgo_user")).is_some()
+        || service_name.to_lowercase().contains("sftp")
+        || service_name.to_lowercase().contains("storage");
+
+    if is_sftp {
+        let email_subject = format!("[VaultScope] Your service is ready: {}", service_name);
+        let username = response_payload
+            .get("resource_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                response_payload
+                    .get("raw_response")
+                    .and_then(|r| r.get("sftpgo_user"))
+                    .and_then(|u| u.get("username"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("vs_user");
+        let password = "[Shown in Encrypted Customer Dashboard]";
+        let billing_line = if is_trial {
+            format!("Subscription: Free Trial ({} GB - auto-upgrades to full plan on renewal)", quota)
+        } else {
+            format!("Subscription: Regular Plan ({} GB) - €{}/mo", quota, price)
+        };
+        let details_block = format!(
+            "SERVICE DETAILS & ACCESS CREDENTIALS\n----------------------------------------\nProduct: {}\n{}\nStorage Quota: {} GB\n\nProtocol: SFTP (SSH File Transfer Protocol) / FTPS / WebDAV\nHost: {}\nPort: 2022 (SFTP)\nUsername: {}\nPassword: {}\n----------------------------------------\n\nManage your service in Dashboard: https://vaultscope.de/dashboard/storage",
+            service_name, billing_line, quota, hostname, username, password
+        );
+        let body = format!(
+            "Hello {},\n\nThank you for choosing VaultScope!\n\nYour service \"{}\" has been successfully provisioned and is now active.\n\n{}\n\nYou can access your service, manage configuration, or view billing anytime in your VaultScope Portal:\nhttps://vaultscope.de/dashboard\n\nIf you have any questions or require support, our team is available via your dashboard:\nhttps://vaultscope.de/dashboard/support\n\nBest regards,\nThe VaultScope Team\nhttps://vaultscope.de",
+            customer_name, service_name, details_block
+        );
+        return (email_subject, body);
+    }
+
+    let ip_opt = response_payload
+        .get("ip")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let dashboard_path = if is_dedicated { "ds" } else { "vps" };
+    let billing_line = if is_trial {
+        "Subscription: Free Trial".to_string()
+    } else {
+        format!("Subscription: Regular Plan - €{}", price)
+    };
+
+    if is_dedicated && ip_opt.is_none() {
+        let email_subject = format!(
+            "[VaultScope] Dedicated Server Provisioning Started: {}",
+            service_name
+        );
+        let body = format!(
+            "Hello {},\n\nThank you for your payment! Your dedicated server order \"{}\" has been submitted to hardware provisioning.\n\nPROVISIONING TIMELINE\n----------------------------------------\nProduct: {}\n{}\nHostname: {}\nProvisioning Time: Up to 7 business days (regularly after payment has succeeded)\n----------------------------------------\n\nDedicated server provisioning regularly takes up to 7 business days after payment succeeds. Once hardware setup, OS installation, and network allocation are complete, your IP address, credentials, and IPMI/KVM console will appear in your dashboard:\nhttps://vaultscope.de/dashboard/ds/{}\n\nIf you have any questions or require support, our team is available via your dashboard:\nhttps://vaultscope.de/dashboard/support\n\nBest regards,\nThe VaultScope Team\nhttps://vaultscope.de",
+            customer_name, service_name, service_name, billing_line, hostname, service_id
+        );
+        return (email_subject, body);
+    }
+
+    let ip = ip_opt.unwrap_or("Assigned in Dashboard");
+    let root_pass = "[Shown in Encrypted Customer Dashboard]";
+    let email_subject = format!("[VaultScope] Your service is ready: {}", service_name);
+    let details_block = format!(
+        "SERVICE DETAILS & ACCESS CREDENTIALS\n----------------------------------------\nProduct: {}\n{}\n\nIP Address: {}\nHostname: {}\nSSH Port: 22\nUsername: root\nRoot Password: {}\n----------------------------------------\n\nManage your server in Dashboard: https://vaultscope.de/dashboard/{}/{}",
+        service_name, billing_line, ip, hostname, root_pass, dashboard_path, service_id
+    );
+    let body = format!(
+        "Hello {},\n\nThank you for choosing VaultScope!\n\nYour service \"{}\" has been successfully provisioned and is now active.\n\n{}\n\nYou can access your service, manage configuration, or view billing anytime in your VaultScope Portal:\nhttps://vaultscope.de/dashboard\n\nIf you have any questions or require support, our team is available via your dashboard:\nhttps://vaultscope.de/dashboard/support\n\nBest regards,\nThe VaultScope Team\nhttps://vaultscope.de",
+        customer_name, service_name, details_block
+    );
+    (email_subject, body)
+}
+
+/// Spawns a background task to notify the customer right after payment & order placement.
+pub fn spawn_order_confirmation_notification(
+    state: AppState,
+    customer_id: Uuid,
+    service_name: String,
+    provider: String,
+    category: String,
+    service_id: Uuid,
+    paid_total: Option<rust_decimal::Decimal>,
+) {
+    tokio::spawn(async move {
+        let customer_opt: Option<(String, String)> =
+            sqlx::query_as("SELECT name, email FROM customers WHERE id = $1")
+                .bind(customer_id)
+                .fetch_optional(&state.db)
+                .await
+                .unwrap_or(None);
+
+        let Some((name, email)) = customer_opt else {
+            return;
+        };
+
+        let is_dedicated = is_dedicated_product(&provider, &category);
+        let paid_line = paid_total
+            .map(|t| format!("Amount Paid: €{:.2}\n", t))
+            .unwrap_or_default();
+
+        let (subject, body) = if is_dedicated {
+            (
+                format!("[VaultScope] Payment Received — Dedicated Server Order Confirmed: {}", service_name),
+                format!(
+                    "Hello {},\n\nThank you for your order! Your payment has succeeded and your dedicated server \"{}\" is now queued for hardware provisioning.\n\nORDER SUMMARY\n----------------------------------------\nServer: {}\n{}Provisioning Time: Regularly up to 7 business days after payment succeeds\n----------------------------------------\n\nPlease note that dedicated server provisioning regularly takes up to 7 business days after payment succeeds. You will receive updates by email once hardware setup and network configuration are ready, and you can track your server status anytime in your dashboard:\n{}/dashboard/ds/{}\n\nBest regards,\nThe VaultScope Team",
+                    name,
+                    service_name,
+                    service_name,
+                    paid_line,
+                    state.config.storefront_url.trim_end_matches('/'),
+                    service_id
+                ),
+            )
+        } else {
+            (
+                format!("[VaultScope] Order Confirmed: {}", service_name),
+                format!(
+                    "Hello {},\n\nThank you for your order! Your payment has succeeded and provisioning has started for \"{}\".\n\n{}You can view status and credentials in your dashboard:\n{}/dashboard\n\nBest regards,\nThe VaultScope Team",
+                    name,
+                    service_name,
+                    paid_line,
+                    state.config.storefront_url.trim_end_matches('/')
+                ),
+            )
+        };
+
+        send_billing_email_with_cc(&state, customer_id, &email, &subject, &body).await;
+    });
+}
+
 /// Spawns a background task to notify the customer that their ordered service is provisioned and ready.
 pub fn spawn_service_welcome_notification(
     state: AppState,
@@ -217,15 +371,14 @@ pub fn spawn_service_welcome_notification(
     response_payload: serde_json::Value,
 ) {
     tokio::spawn(async move {
-        // Query service and customer info
-        let service_res = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<i32>, bool, rust_decimal::Decimal)>(
-            "SELECT customer_id, name, hostname, quota_gb, is_trial, price FROM services WHERE id = $1"
+        let service_res = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<i32>, bool, rust_decimal::Decimal, String, String)>(
+            "SELECT s.customer_id, s.name, s.hostname, s.quota_gb, s.is_trial, s.price, p.provider, p.category FROM services s JOIN products p ON p.id = s.product_id WHERE s.id = $1"
         )
         .bind(service_id)
         .fetch_optional(&state.db)
         .await;
 
-        let (customer_id, service_name, hostname_opt, quota_gb_opt, is_trial, price) = match service_res {
+        let (customer_id, service_name, hostname_opt, quota_gb_opt, is_trial, price, provider, category) = match service_res {
             Ok(Some(row)) => row,
             Ok(None) => {
                 tracing::warn!("Service {} not found for welcome notification", service_id);
@@ -255,57 +408,17 @@ pub fn spawn_service_welcome_notification(
 
         let hostname = hostname_opt.unwrap_or_else(|| "sftp.vaultscope.de".to_string());
         let quota = quota_gb_opt.unwrap_or(25);
-
-        let is_sftp = response_payload.get("sftpgo_user").is_some()
-            || response_payload.get("raw_response").and_then(|r| r.get("sftpgo_user")).is_some()
-            || service_name.to_lowercase().contains("sftp")
-            || service_name.to_lowercase().contains("storage");
-
-        let email_subject = format!("[VaultScope] Your service is ready: {}", service_name);
-
-        let details_block = if is_sftp {
-            let username = response_payload.get("resource_id")
-                .and_then(|v| v.as_str())
-                .or_else(|| response_payload.get("raw_response").and_then(|r| r.get("sftpgo_user")).and_then(|u| u.get("username")).and_then(|v| v.as_str()))
-                .unwrap_or("vs_user");
-
-            // Never transmit plaintext credentials over email; customers retrieve them via the encrypted dashboard endpoint.
-            let password = "[Shown in Encrypted Customer Dashboard]";
-
-            let billing_line = if is_trial {
-                format!("Subscription: Free Trial ({} GB - auto-upgrades to full plan on renewal)", quota)
-            } else {
-                format!("Subscription: Regular Plan ({} GB) - €{}/mo", quota, price)
-            };
-
-            format!(
-                "SERVICE DETAILS & ACCESS CREDENTIALS\n----------------------------------------\nProduct: {}\n{}\nStorage Quota: {} GB\n\nProtocol: SFTP (SSH File Transfer Protocol) / FTPS / WebDAV\nHost: {}\nPort: 2022 (SFTP)\nUsername: {}\nPassword: {}\n----------------------------------------\n\nManage your service in Dashboard: https://vaultscope.de/dashboard/storage",
-                service_name, billing_line, quota, hostname, username, password
-            )
-        } else {
-            let ip = response_payload.get("ip")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("Assigned in Dashboard");
-
-            // Never transmit plaintext root passwords over email; customers retrieve them via the encrypted dashboard endpoint.
-            let root_pass = "[Shown in Encrypted Customer Dashboard]";
-
-            let billing_line = if is_trial {
-                "Subscription: Free Trial".to_string()
-            } else {
-                format!("Subscription: Regular Plan - €{}/mo", price)
-            };
-
-            format!(
-                "SERVICE DETAILS & ACCESS CREDENTIALS\n----------------------------------------\nProduct: {}\n{}\n\nIP Address: {}\nHostname: {}\nSSH Port: 22\nUsername: root\nRoot Password: {}\n----------------------------------------\n\nManage your server in Dashboard: https://vaultscope.de/dashboard/vps/{}",
-                service_name, billing_line, ip, hostname, root_pass, service_id
-            )
-        };
-
-        let body = format!(
-            "Hello {},\n\nThank you for choosing VaultScope!\n\nYour service \"{}\" has been successfully provisioned and is now active.\n\n{}\n\nYou can access your service, manage configuration, or view billing anytime in your VaultScope Portal:\nhttps://vaultscope.de/dashboard\n\nIf you have any questions or require support, our team is available via your dashboard:\nhttps://vaultscope.de/dashboard/support\n\nBest regards,\nThe VaultScope Team\nhttps://vaultscope.de",
-            customer_name, service_name, details_block
+        let (email_subject, body) = build_service_welcome_email(
+            &customer_name,
+            &service_name,
+            service_id,
+            &hostname,
+            quota,
+            is_trial,
+            price,
+            &provider,
+            &category,
+            &response_payload,
         );
 
         send_email(&state, &customer_email, &email_subject, &body, None).await;
@@ -498,6 +611,28 @@ pub fn spawn_invoice_paid_notification(state: AppState, invoice_id: Uuid) {
             return;
         };
 
+        let has_dedicated: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                SELECT 1
+                FROM invoice_line_items ili
+                JOIN services s ON s.id = ili.service_id
+                JOIN products p ON p.id = s.product_id
+                WHERE ili.invoice_id = $1
+                  AND (p.provider IN ('reliablesite', 'vaultscope_dedicated')
+                       OR LOWER(p.category) IN ('dedicated', 'ds', 'bare-metal'))
+            )"#,
+        )
+        .bind(invoice_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(false);
+
+        let dedicated_note = if has_dedicated {
+            "\nPlease note: Dedicated server provisioning regularly takes up to 7 business days after payment succeeds. We will send an email as soon as your server setup and credentials are ready.\n"
+        } else {
+            ""
+        };
+
         let billing_url = format!(
             "{}/dashboard/profile/billing",
             state.config.storefront_url.trim_end_matches('/')
@@ -507,8 +642,76 @@ pub fn spawn_invoice_paid_notification(state: AppState, invoice_id: Uuid) {
             invoice_number
         );
         let body = format!(
-            "Hello {},\n\nThank you! We have received your payment of €{:.2} for invoice {}.\n\nYou can download the PDF receipt anytime from your Billing Dashboard:\n{}\n\nBest regards,\nThe VaultScope Billing Team",
-            name, total, invoice_number, billing_url
+            "Hello {},\n\nThank you! We have received your payment of €{:.2} for invoice {}.\n{}You can download the PDF receipt anytime from your Billing Dashboard:\n{}\n\nBest regards,\nThe VaultScope Billing Team",
+            name, total, invoice_number, dedicated_note, billing_url
+        );
+
+        send_billing_email_with_cc(&state, customer_id, &email, &subject, &body).await;
+    });
+}
+
+/// Sends an email notification when an Admin updates a service's order/provisioning state.
+pub fn spawn_order_state_updated_notification(
+    state: AppState,
+    service_id: Uuid,
+    order_state: String,
+    order_state_note: Option<String>,
+) {
+    tokio::spawn(async move {
+        let row: Option<(Uuid, String, String, String)> = sqlx::query_as(
+            "SELECT s.customer_id, s.name, p.provider, p.category FROM services s JOIN products p ON p.id = s.product_id WHERE s.id = $1",
+        )
+        .bind(service_id)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+
+        let Some((customer_id, service_name, provider, category)) = row else {
+            return;
+        };
+
+        let customer_opt: Option<(String, String)> =
+            sqlx::query_as("SELECT name, email FROM customers WHERE id = $1")
+                .bind(customer_id)
+                .fetch_optional(&state.db)
+                .await
+                .unwrap_or(None);
+
+        let Some((name, email)) = customer_opt else {
+            return;
+        };
+
+        let is_dedicated = is_dedicated_product(&provider, &category);
+        let state_label = match order_state.as_str() {
+            "payment_received" => "Payment Received / Order Queued",
+            "provisioning" => "Provisioning in Progress",
+            "hardware_setup" => "Hardware Setup & OS Installation",
+            "active" => "Active / Ready",
+            "action_required" => "Action Required",
+            "cancelled" => "Cancelled",
+            other => other,
+        };
+        let note_line = order_state_note
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|n| format!("Note: {}\n", n))
+            .unwrap_or_default();
+        let timeline_line = if is_dedicated && order_state != "active" && order_state != "cancelled" {
+            "\nPlease note: Dedicated server provisioning regularly takes up to 7 business days after payment succeeds.\n"
+        } else {
+            ""
+        };
+        let base_url = state.config.storefront_url.trim_end_matches('/');
+        let target_url = if is_dedicated {
+            format!("{}/dashboard/ds/{}", base_url, service_id)
+        } else {
+            format!("{}/dashboard/orders", base_url)
+        };
+        let subject = format!("[VaultScope] Order Status Update ({}): {}", state_label, service_name);
+        let body = format!(
+            "Hello {},\n\nThere is an update on your order \"{}\":\n\nNew Order State: {}\n{}{}\nView your order and service status anytime in your dashboard:\n{}\n\nBest regards,\nThe VaultScope Team",
+            name, service_name, state_label, note_line, timeline_line, target_url
         );
 
         send_billing_email_with_cc(&state, customer_id, &email, &subject, &body).await;

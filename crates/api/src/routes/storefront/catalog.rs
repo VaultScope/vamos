@@ -4,7 +4,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::error::ApiError;
 use crate::openapi::ErrorResponse;
-use crate::reliablesite_catalog::sanitize_product_for_storefront;
+use crate::reliablesite_catalog::{load_pricing_policy, sanitize_product_for_storefront_with_policy};
 use crate::state::AppState;
 use vaultscope_db::models::Product;
 
@@ -22,6 +22,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
     )
 )]
 pub(crate) async fn list_visible(State(state): State<AppState>) -> Result<Json<Vec<Product>>, ApiError> {
+    let policy = load_pricing_policy(&state.db, &state.config).await;
     let products: Vec<Product> =
         sqlx::query_as("SELECT * FROM products WHERE hidden = false ORDER BY category, name")
             .fetch_all(&state.db)
@@ -29,7 +30,7 @@ pub(crate) async fn list_visible(State(state): State<AppState>) -> Result<Json<V
     Ok(Json(
         products
             .into_iter()
-            .map(sanitize_product_for_storefront)
+            .map(|p| sanitize_product_for_storefront_with_policy(p, policy))
             .collect(),
     ))
 }

@@ -833,7 +833,13 @@ pub(crate) async fn download_pdf(
     .fetch_all(&state.db)
     .await?;
 
-    let pdf_bytes = crate::pdf::generate_invoice_pdf(&invoice, &customer, &line_items);
+    let tax_policy = crate::reliablesite_catalog::load_tax_policy(&state.db, &state.config).await;
+    let pdf_bytes = crate::pdf::generate_invoice_pdf_with_tax_id(
+        &invoice,
+        &customer,
+        &line_items,
+        tax_policy.seller_tax_id.as_deref(),
+    );
     let filename = format!("invoice-{}.pdf", invoice.invoice_number);
 
     let response = Response::builder()

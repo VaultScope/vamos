@@ -252,14 +252,21 @@ async fn execute_and_persist_job(
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
+                    let target_order_state = if job.target_api == "reliablesite" && ip.is_empty() {
+                        "provisioning"
+                    } else {
+                        "active"
+                    };
+
                     if let Err(e) = sqlx::query(
-                        "UPDATE services SET status = 'running', config = $1, provider_resource_id = $2, ip = $3, hostname = $4, encrypted_password = COALESCE($5, encrypted_password) WHERE id = $6",
+                        "UPDATE services SET status = 'running', config = $1, provider_resource_id = $2, ip = $3, hostname = $4, encrypted_password = COALESCE($5, encrypted_password), order_state = $6, order_state_updated_at = now() WHERE id = $7",
                     )
                     .bind(&sanitized_response)
                     .bind(resource_id)
                     .bind(if ip.is_empty() { None } else { Some(ip) })
                     .bind(if hostname.is_empty() { None } else { Some(hostname) })
                     .bind(encrypted_password.as_deref())
+                    .bind(target_order_state)
                     .bind(service_id)
                     .execute(&mut *tx)
                     .await

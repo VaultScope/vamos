@@ -17,7 +17,8 @@ use uuid::Uuid;
 
 use vaultscope_api::auth::{jwt, Audience, Claims};
 use vaultscope_api::reliablesite_catalog::{
-    DedicatedProductOptionsResponse, DedicatedQuote,
+    convert_usd_to_retail_eur, fetch_live_usd_to_eur_from_urls, parse_live_fx_rate_json,
+    DedicatedPricingPolicy, DedicatedProductOptionsResponse, DedicatedQuote,
 };
 use vaultscope_connectors::reliablesite::ReliableSite;
 use vaultscope_connectors::ProvisioningProvider;
@@ -283,13 +284,17 @@ async fn test_storefront_reliablesite_options_quote_and_validation() {
         "Storefront /quote leaked upstream vendor name"
     );
     let quote: DedicatedQuote = serde_json::from_slice(&quote_bytes).unwrap();
-    assert_eq!(quote.recurring_net, Decimal::from_str("438.00").unwrap());
-    assert_eq!(quote.setup_fee_net, Decimal::from_str("29.00").unwrap());
-    assert_eq!(quote.subtotal_net, Decimal::from_str("467.00").unwrap());
-    assert_eq!(quote.vat_amount, Decimal::from_str("88.73").unwrap());
-    assert_eq!(quote.total_gross, Decimal::from_str("555.73").unwrap());
+    // 299.00 USD -> 312.90 EUR; 99.00 USD -> 103.60 EUR; 40.00 USD -> 41.86 EUR => 458.36 EUR recurring
+    // Setup 29.00 USD -> 30.35 EUR => subtotal 488.71 EUR; safe default taxMode=small_business -> 0% VAT
+    assert_eq!(quote.recurring_net, Decimal::from_str("458.36").unwrap());
+    assert_eq!(quote.setup_fee_net, Decimal::from_str("30.35").unwrap());
+    assert_eq!(quote.subtotal_net, Decimal::from_str("488.71").unwrap());
+    assert_eq!(quote.vat_amount, Decimal::from_str("0.00").unwrap());
+    assert_eq!(quote.total_gross, Decimal::from_str("488.71").unwrap());
+    assert!(quote.small_business_exempt);
 
-    // 2b. Verify 6-month (semiannually) pricing uses real 6-month rates (1704.30 + 564.30 + 29.00 setup)
+    // 2b. Verify 6-month (semiannually) pricing uses converted 6-month rates:
+    // Base (1704.30 * 312.90 / 299.00 = 1783.53) + 2Gbps (564.30 * 0.91 * 1.15 = 590.54) = 2374.07 recurring; setup 30.35
     let mut semi_map = opts.default_config_options.clone();
     semi_map.insert("659".to_string(), 2392);
     semi_map.insert("643".to_string(), 2232);
@@ -319,8 +324,8 @@ async fn test_storefront_reliablesite_options_quote_and_validation() {
         serde_json::from_slice(&to_bytes(semi_resp.into_body(), 1024 * 1024).await.unwrap())
             .unwrap();
     assert_eq!(semi_quote.period_days, 180);
-    assert_eq!(semi_quote.recurring_net, Decimal::from_str("2268.60").unwrap());
-    assert_eq!(semi_quote.setup_fee_net, Decimal::from_str("29.00").unwrap());
+    assert_eq!(semi_quote.recurring_net, Decimal::from_str("2374.09").unwrap());
+    assert_eq!(semi_quote.setup_fee_net, Decimal::from_str("30.35").unwrap());
 
     // 3. Reject unavailable billing cycle ('quarterly' = -1 on NL)
     let bad_cycle = app
@@ -722,7 +727,7 @@ async fn test_job_execute_reliablesite_order_with_mock_api() {
                         "orderId": 88156,
                         "invoiceId": 588048,
                         "productIds": "91022",
-                        "paymentMethod": "banktransfer",
+                        "paymentMethod": "paypalbilling",
                         "productId": 428,
                         "replayed": false
                     }))
@@ -800,9 +805,413 @@ async fn test_job_execute_reliablesite_order_with_mock_api() {
     assert_eq!(sent_body["productId"], 428);
     assert_eq!(sent_body["billingCycle"], "semiannually");
     assert_eq!(sent_body["hostname"], "ams-e2e.vaultscope.de");
-    assert_eq!(sent_body["paymentMethod"], "banktransfer");
+    assert_eq!(sent_body["paymentMethod"], "paypalbilling");
     assert_eq!(sent_body["configOptions"]["622"], 2325);
     assert_eq!(sent_body["configOptions"]["565"], 1751);
     assert_eq!(sent_body["promoCode"], "RESELLERNL");
     assert_eq!(sent_body["orderNotes"], "Rack in AMS01");
+}
+
+#[test]
+fn test_reliablesite_usd_to_eur_15pct_markup_conversion() {
+    let policy = DedicatedPricingPolicy::default();
+    assert_eq!(
+        convert_usd_to_retail_eur(Decimal::from_str("299.00").unwrap(), policy),
+        Decimal::from_str("312.90").unwrap()
+    );
+    assert_eq!(
+        convert_usd_to_retail_eur(Decimal::from_str("29.00").unwrap(), policy),
+        Decimal::from_str("30.35").unwrap()
+    );
+    assert_eq!(
+        convert_usd_to_retail_eur(Decimal::ZERO, policy),
+        Decimal::ZERO
+    );
+    assert_eq!(
+        convert_usd_to_retail_eur(Decimal::from_str("-1.0000").unwrap(), policy),
+        Decimal::from_str("-1.0000").unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_reliablesite_provision_fails_closed_when_only_banktransfer_available() {
+    let orders_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let orders_called_clone = orders_called.clone();
+
+    let mock_order_app = Router::new()
+        .route(
+            "/v1/Login/Token",
+            post(|| async {
+                Json(json!({ "status": true, "message": "tok_fail_closed" }))
+            }),
+        )
+        .route(
+            "/v1/Products/{product_id}/Stock",
+            get(|| async {
+                Json(json!({
+                    "productId": 428,
+                    "stock": 3,
+                    "stockControlled": true
+                }))
+            }),
+        )
+        .route(
+            "/v1/PaymentMethods",
+            get(|| async {
+                Json(json!({
+                    "paymentMethods": [
+                        { "module": "banktransfer", "displayName": "Bank Transfer" }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/v1/Orders",
+            post(move || {
+                let called = orders_called_clone.clone();
+                async move {
+                    called.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Json(json!({
+                        "orderId": 99999,
+                        "invoiceId": 99999,
+                        "productIds": "99999",
+                        "paymentMethod": "banktransfer",
+                        "productId": 428
+                    }))
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_order_app).await.unwrap();
+    });
+
+    let base_url = format!("http://{addr}");
+    let connector: Arc<dyn ProvisioningProvider> = Arc::new(ReliableSite::with_endpoints(
+        "test_rs_key_fail_closed".to_string(),
+        base_url.clone(),
+        format!("{base_url}/inventory"),
+        None,
+    ));
+    let registry: Arc<dyn ConnectorRegistry> = Arc::new(SingleReliableSiteRegistry(connector));
+
+    let job = Job {
+        id: Uuid::now_v7(),
+        task: "provision".to_string(),
+        target_api: "reliablesite".to_string(),
+        customer_id: Some(Uuid::now_v7()),
+        service_id: Some(Uuid::now_v7()),
+        status: JobStatus::Queued,
+        error: None,
+        request_payload: Some(json!({
+            "server_type": "428",
+            "location": "NL",
+            "image": "ubuntu-24.04",
+            "ssh_keys": [],
+            "name": "ams-failclosed.vaultscope.de",
+            "extra": {
+                "reliablesite_product_id": 428,
+                "billing_cycle": "monthly",
+                "config_options": {
+                    "622": 2325,
+                    "565": 1751
+                }
+            }
+        })),
+        response_payload: None,
+        attempts: 1,
+        max_attempts: 3,
+        scheduled_at: chrono::Utc::now(),
+        started_at: None,
+        completed_at: None,
+        created_at: chrono::Utc::now(),
+    };
+
+    let err = vaultscope_jobs::tasks::execute(&job, &registry)
+        .await
+        .expect_err("ReliableSite provision must fail closed if only manual banktransfer is available");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("automated payment method"),
+        "unexpected error message: {err_msg}"
+    );
+    assert!(
+        !orders_called.load(std::sync::atomic::Ordering::SeqCst),
+        "POST /v1/Orders must never be invoked with manual banktransfer"
+    );
+}
+
+#[test]
+fn test_parse_live_fx_rate_json_accepts_valid_and_rejects_outliers() {
+    assert_eq!(
+        parse_live_fx_rate_json(&json!({ "amount": 1.0, "base": "USD", "rates": { "EUR": 0.90992 } })),
+        Some(Decimal::from_str("0.90992").unwrap())
+    );
+    assert_eq!(
+        parse_live_fx_rate_json(&json!({ "rates": { "EUR": "0.94125" } })),
+        Some(Decimal::from_str("0.94125").unwrap())
+    );
+    assert_eq!(
+        parse_live_fx_rate_json(&json!({ "rates": { "EUR": 0.05 } })),
+        None
+    );
+    assert_eq!(
+        parse_live_fx_rate_json(&json!({ "rates": { "EUR": 9.99 } })),
+        None
+    );
+}
+
+#[tokio::test]
+async fn test_fetch_live_usd_to_eur_rate_uses_fallback_url_and_computes_live_retail_price() {
+    let mock_fx_app = Router::new()
+        .route("/broken", get(|| async { StatusCode::BAD_GATEWAY }))
+        .route(
+            "/latest",
+            get(|| async {
+                Json(json!({
+                    "amount": 1.0,
+                    "base": "USD",
+                    "rates": { "EUR": 0.94 }
+                }))
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_fx_app).await.unwrap();
+    });
+
+    let bad_url = format!("http://{addr}/broken");
+    let good_url = format!("http://{addr}/latest");
+    let live_rate = fetch_live_usd_to_eur_from_urls(&[&bad_url, &good_url])
+        .await
+        .expect("live FX helper must fail over to healthy provider");
+
+    assert_eq!(live_rate, Decimal::from_str("0.94").unwrap());
+
+    let policy = DedicatedPricingPolicy {
+        usd_to_eur_rate: live_rate,
+        markup_percent: Decimal::from(15),
+    };
+    // $299.00 * 0.94 * 1.15 = 323.219 -> 323.22 EUR
+    assert_eq!(
+        convert_usd_to_retail_eur(Decimal::from_str("299.00").unwrap(), policy),
+        Decimal::from_str("323.22").unwrap()
+    );
+}
+
+#[test]
+fn test_dedicated_server_welcome_email_states_up_to_7_business_days_when_pending_build() {
+    let service_id = Uuid::now_v7();
+    let (subject, body) = vaultscope_api::mailer::build_service_welcome_email(
+        "Alice",
+        "Dual Intel Xeon Gold 6148",
+        service_id,
+        "ams-01.vaultscope.de",
+        0,
+        false,
+        Decimal::from_str("312.90").unwrap(),
+        "reliablesite",
+        "dedicated",
+        &json!({ "resource_id": "ds-ord-88156" }),
+    );
+    assert!(subject.contains("Provisioning Started"));
+    assert!(body.contains("up to 7 business days"));
+    assert!(body.contains(&format!("/dashboard/ds/{service_id}")));
+    assert!(!body.contains("/dashboard/vps/"));
+}
+
+#[tokio::test]
+async fn test_admin_rbac_order_state_update_and_customer_dashboard_visibility() {
+    let state = common::test_app_state().await;
+    let app = vaultscope_api::routes::build_router(state.clone());
+    let (cookie, csrf) = get_csrf_cookie_and_token(&app).await;
+
+    // Seed Customer + Dedicated Service in payment_received state
+    let cust_id = Uuid::now_v7();
+    let email = format!("orderstate-{}@vs.test", cust_id.simple());
+    sqlx::query(
+        "INSERT INTO customers (id, external_id, name, email, status, email_verified) VALUES ($1, $2, 'Order Client', $3, 'active', true)",
+    )
+    .bind(cust_id)
+    .bind(cust_id.to_string())
+    .bind(&email)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let svc_id = Uuid::now_v7();
+    let prod_428_id = Uuid::parse_str("10000000-0000-4000-8000-000000000428").unwrap();
+    sqlx::query(
+        r#"INSERT INTO services (id, customer_id, product_id, name, hostname, price, status, order_state, order_state_note)
+           VALUES ($1, $2, $3, 'NL Dedicated Server', 'nl-01.vaultscope.de', 312.90, 'pending', 'payment_received', 'Payment received')"#,
+    )
+    .bind(svc_id)
+    .bind(cust_id)
+    .bind(prod_428_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    // Seed Support staff (services.view only -> NO services.manage) and Technical/Admin staff (services.manage)
+    let support_role_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO roles (id, name, permissions, mapped_group) VALUES ($1, $2, ARRAY['services.view']::text[], $3)",
+    )
+    .bind(support_role_id)
+    .bind(format!("support-ro-{}", support_role_id.simple()))
+    .bind(format!("grp-ro-{}", support_role_id.simple()))
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let support_staff_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO staff (id, external_id, username, email, role_id, auth_version) VALUES ($1, $2, $3, $4, $5, 1)",
+    )
+    .bind(support_staff_id)
+    .bind(support_staff_id.to_string())
+    .bind(format!("sup_{}", support_staff_id.simple()))
+    .bind(format!("sup_{}@vs.test", support_staff_id.simple()))
+    .bind(support_role_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let mgr_role_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO roles (id, name, permissions, mapped_group) VALUES ($1, $2, ARRAY['services.view','services.manage']::text[], $3)",
+    )
+    .bind(mgr_role_id)
+    .bind(format!("infra-mgr-{}", mgr_role_id.simple()))
+    .bind(format!("grp-mgr-{}", mgr_role_id.simple()))
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let mgr_staff_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO staff (id, external_id, username, email, role_id, auth_version) VALUES ($1, $2, $3, $4, $5, 1)",
+    )
+    .bind(mgr_staff_id)
+    .bind(mgr_staff_id.to_string())
+    .bind(format!("mgr_{}", mgr_staff_id.simple()))
+    .bind(format!("mgr_{}@vs.test", mgr_staff_id.simple()))
+    .bind(mgr_role_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let support_jwt = make_token(
+        support_staff_id,
+        "sup@vs.test",
+        "Support",
+        Audience::Admin,
+        &state.config.jwt_secret,
+    );
+    let mgr_jwt = make_token(
+        mgr_staff_id,
+        "mgr@vs.test",
+        "Technical",
+        Audience::Admin,
+        &state.config.jwt_secret,
+    );
+    let cust_jwt = make_token(
+        cust_id,
+        &email,
+        "customer",
+        Audience::Storefront,
+        &state.config.jwt_secret,
+    );
+
+    // 1. Support role WITHOUT services.manage must receive 403 Forbidden
+    let forbidden_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/admin/services/{svc_id}/order-state"))
+                .header(header::AUTHORIZATION, format!("Bearer {support_jwt}"))
+                .header(header::COOKIE, &cookie)
+                .header("x-csrf-token", &csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "order_state": "hardware_setup" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden_resp.status(), StatusCode::FORBIDDEN);
+
+    // 2. Reject invalid order_state
+    let bad_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/admin/services/{svc_id}/order-state"))
+                .header(header::AUTHORIZATION, format!("Bearer {mgr_jwt}"))
+                .header(header::COOKIE, &cookie)
+                .header("x-csrf-token", &csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "order_state": "bogus_state" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Staff WITH services.manage updates order_state & note
+    let ok_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/admin/services/{svc_id}/order-state"))
+                .header(header::AUTHORIZATION, format!("Bearer {mgr_jwt}"))
+                .header(header::COOKIE, &cookie)
+                .header("x-csrf-token", &csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "order_state": "hardware_setup",
+                        "order_state_note": "Chassis racked in AMS01, OS install running."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+    let ok_bytes = to_bytes(ok_resp.into_body(), 1024 * 1024).await.unwrap();
+    let ok_json: Value = serde_json::from_slice(&ok_bytes).unwrap();
+    assert_eq!(ok_json["order_state"], "hardware_setup", "PATCH response was: {ok_json}");
+
+    // 4. Customer sees updated order_state & note in dashboard /storefront/services
+    let list_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/storefront/services")
+                .header(header::AUTHORIZATION, format!("Bearer {cust_jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let body_bytes = to_bytes(list_resp.into_body(), 1024 * 1024).await.unwrap();
+    let list_json: Vec<Value> = serde_json::from_slice(&body_bytes).unwrap();
+    let found = list_json
+        .iter()
+        .find(|s| s["id"].as_str() == Some(&svc_id.to_string()))
+        .expect("customer order must appear in storefront services");
+    assert_eq!(found["order_state"], "hardware_setup");
+    assert_eq!(
+        found["order_state_note"],
+        "Chassis racked in AMS01, OS install running."
+    );
 }

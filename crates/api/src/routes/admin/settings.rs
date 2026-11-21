@@ -126,7 +126,7 @@ pub(crate) async fn update_batch(
     crate::require_permission!(auth, state, "settings.manage");
     let mut tx = state.db.begin().await?;
 
-    for entry in entries {
+    for entry in &entries {
         let key = entry.key.trim();
         if key.is_empty() || key.ends_with("_configured") {
             continue;
@@ -140,6 +140,62 @@ pub(crate) async fn update_batch(
         )
         .bind(key)
         .bind(&entry.value)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // If ReliableSite FX rate, auto-FX toggle, or markup changed, recompute retail EUR prices from wholesale cost
+    if entries.iter().any(|e| {
+        matches!(
+            e.key.trim(),
+            "reliablesite_auto_fx_enabled"
+                | "reliablesite_usd_to_eur_rate"
+                | "reliablesite_markup_percent"
+        )
+    }) {
+        let settings_rows: Vec<Setting> = sqlx::query_as(
+            "SELECT * FROM settings WHERE key IN ('reliablesite_auto_fx_enabled', 'reliablesite_usd_to_eur_rate', 'reliablesite_markup_percent')",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut auto_fx = true;
+        let mut fx = state.config.reliablesite_usd_to_eur_rate;
+        let mut markup = state.config.reliablesite_markup_percent;
+        for row in settings_rows {
+            if row.key == "reliablesite_auto_fx_enabled" {
+                if let Some(b) = row.value.as_bool() {
+                    auto_fx = b;
+                }
+                continue;
+            }
+            let parsed = if let Some(s) = row.value.as_str() {
+                s.trim().parse::<rust_decimal::Decimal>().ok()
+            } else if let Some(n) = row.value.as_f64() {
+                rust_decimal::Decimal::try_from(n).ok()
+            } else {
+                row.value.as_i64().map(rust_decimal::Decimal::from)
+            };
+            if let Some(d) = parsed {
+                if row.key == "reliablesite_usd_to_eur_rate" && d > rust_decimal::Decimal::ZERO {
+                    fx = d;
+                } else if row.key == "reliablesite_markup_percent" && d >= rust_decimal::Decimal::ZERO {
+                    markup = d;
+                }
+            }
+        }
+
+        if state.config.reliablesite_live_fx_enabled && auto_fx {
+            if let Some(live_fx) = crate::reliablesite_catalog::resolve_live_usd_to_eur_rate().await {
+                fx = live_fx;
+            }
+        }
+
+        let multiplier = fx * (rust_decimal::Decimal::ONE + (markup / rust_decimal::Decimal::from(100)));
+        sqlx::query(
+            "UPDATE products SET price = ROUND(cost * $1, 2), updated_at = now() WHERE provider = 'reliablesite' AND cost > 0",
+        )
+        .bind(multiplier)
         .execute(&mut *tx)
         .await?;
     }

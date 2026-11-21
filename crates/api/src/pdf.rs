@@ -8,6 +8,16 @@ pub fn generate_invoice_pdf(
     customer: &Customer,
     line_items: &[InvoiceLineItem],
 ) -> Vec<u8> {
+    generate_invoice_pdf_with_tax_id(invoice, customer, line_items, None)
+}
+
+/// Generates a GoBD-compliant PDF document including an optional seller tax ID / USt-IdNr.
+pub fn generate_invoice_pdf_with_tax_id(
+    invoice: &Invoice,
+    customer: &Customer,
+    line_items: &[InvoiceLineItem],
+    seller_tax_id: Option<&str>,
+) -> Vec<u8> {
     let mut content = String::with_capacity(4096);
 
     // --- Header Background Accent Bar ---
@@ -250,12 +260,19 @@ pub fn generate_invoice_pdf(
     content.push_str("0.9 0.9 0.9 RG 0.5 w\n");
     content.push_str(&format!("330 {} m 550 {} l S\n", totals_y + 40, totals_y + 40));
 
+    let is_small_business_exempt = invoice.tax_rate <= rust_decimal::Decimal::ZERO;
+    let vat_row_label = if is_small_business_exempt {
+        "USt. (Par. 19 UStG):".to_string()
+    } else {
+        format!("zzgl. {} USt. / VAT:", format_tax_rate_percent(invoice.tax_rate))
+    };
+
     content.push_str("0.4 0.4 0.4 rg\n");
     content.push_str(&format!("BT /F1 8.5 Tf 340 {} Td (Nettobetrag / Subtotal:) Tj ET\n", totals_y + 24));
     content.push_str(&format!(
-        "BT /F1 8.5 Tf 340 {} Td (zzgl. {} USt. / VAT:) Tj ET\n",
+        "BT /F1 8.5 Tf 340 {} Td ({}) Tj ET\n",
         totals_y + 10,
-        format_tax_rate_percent(invoice.tax_rate)
+        vat_row_label
     ));
 
     content.push_str("0.1 0.1 0.1 rg\n");
@@ -291,9 +308,20 @@ pub fn generate_invoice_pdf(
         "BT /F2 8 Tf 45 {} Td (Hinweise zur Besteuerung & Zahlungsmodalitaeten / GoBD Compliance:) Tj ET\n",
         legal_y
     ));
+    let tax_legal_line = if is_small_business_exempt {
+        "Gemaess Paragraph 19 UStG wird keine Umsatzsteuer berechnet (Kleinunternehmerregelung).".to_string()
+    } else if let Some(tid) = seller_tax_id.map(str::trim).filter(|s| !s.is_empty()) {
+        format!(
+            "Steuerbare Leistung gemaess Paragraph 1 Abs. 1 Nr. 1 UStG. Steuernummer/USt-IdNr.: {}.",
+            encode_pdf_text(tid)
+        )
+    } else {
+        "Steuerbare Leistung gemaess Paragraph 1 Abs. 1 Nr. 1 UStG. Leistungszeitraum entspricht dem Rechnungsdatum.".to_string()
+    };
     content.push_str(&format!(
-        "BT /F1 7.5 Tf 45 {} Td (Steuerbare Leistung gemaess Paragraph 1 Abs. 1 Nr. 1 UStG. Leistungszeitraum entspricht dem Rechnungsdatum.) Tj ET\n",
-        legal_y - 11
+        "BT /F1 7.5 Tf 45 {} Td ({}) Tj ET\n",
+        legal_y - 11,
+        tax_legal_line
     ));
     if !invoice.notes.is_empty() {
         content.push_str(&format!(
@@ -531,5 +559,18 @@ mod tests {
         assert!(pdf.starts_with(b"%PDF-1.4"));
         assert!(pdf.ends_with(b"%%EOF\n"));
         assert!(pdf.len() > 1000);
+
+        let mut sb_invoice = invoice.clone();
+        sb_invoice.tax_rate = Decimal::ZERO;
+        sb_invoice.tax_amount = Decimal::ZERO;
+        sb_invoice.total = Decimal::new(10000, 2);
+        let sb_pdf = generate_invoice_pdf(&sb_invoice, &customer, &items);
+        let sb_str = String::from_utf8_lossy(&sb_pdf);
+        assert!(sb_str.contains("Paragraph 19 UStG"));
+        assert!(!sb_str.contains("zzgl."));
+
+        let std_pdf = generate_invoice_pdf_with_tax_id(&invoice, &customer, &items, Some("DE999999999"));
+        let std_str = String::from_utf8_lossy(&std_pdf);
+        assert!(std_str.contains("Steuernummer/USt-IdNr.: DE999999999"));
     }
 }

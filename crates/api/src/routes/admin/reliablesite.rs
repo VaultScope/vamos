@@ -125,7 +125,8 @@ pub(crate) async fn sync_inventory(
         .unwrap_or_else(|| "NL".to_string());
 
     let rs = state.config.reliablesite_connector();
-    let summary = reliablesite_catalog::sync_datacenter_to_db(&state.db, &rs, &dc).await?;
+    let policy = reliablesite_catalog::load_pricing_policy(&state.db, &state.config).await;
+    let summary = reliablesite_catalog::sync_datacenter_to_db_with_policy(&state.db, &rs, &dc, policy).await?;
     Ok(Json(summary))
 }
 

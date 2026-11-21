@@ -73,7 +73,14 @@ pub(crate) async fn get_product_options(
         }
     }
 
-    let resp = reliablesite_catalog::get_dedicated_options(&state.db, &product, live_stock).await?;
+    let policy = reliablesite_catalog::load_pricing_policy(&state.db, &state.config).await;
+    let resp = reliablesite_catalog::get_dedicated_options_with_policy(
+        &state.db,
+        &product,
+        live_stock,
+        policy,
+    )
+    .await?;
     Ok(Json(resp))
 }
 
@@ -114,11 +121,15 @@ pub(crate) async fn quote_product(
         ));
     }
 
-    let quote = reliablesite_catalog::compute_quote(
+    let policy = reliablesite_catalog::load_pricing_policy(&state.db, &state.config).await;
+    let tax_policy = reliablesite_catalog::load_tax_policy(&state.db, &state.config).await;
+    let quote = reliablesite_catalog::compute_quote_with_policy(
         &state.db,
         &product,
         payload.billing_cycle.as_deref(),
         payload.config_options.as_ref(),
+        policy,
+        &tax_policy,
     )
     .await?;
 

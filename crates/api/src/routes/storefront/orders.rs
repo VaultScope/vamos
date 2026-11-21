@@ -43,18 +43,29 @@ pub fn validate_stripe_payment_intent_id(raw: &str) -> Result<&str, ApiError> {
     Ok(raw)
 }
 
-/// Computes net subtotal, 19% VAT (rounded to 2 decimal places via `rust_decimal`),
-/// gross total, and gross total in integer euro cents consistently for both
+/// Computes net subtotal, tax for an explicit percentage rate (rounded to 2 decimal places via `rust_decimal`),
+/// gross total, and gross total in integer euro cents consistently across
 /// Stripe PaymentIntent creation and order/invoice verification.
-pub fn compute_order_totals(subtotal_net: Decimal) -> (Decimal, Decimal, Decimal, i64) {
+pub fn compute_order_totals_with_rate(
+    subtotal_net: Decimal,
+    tax_rate_percent: Decimal,
+) -> (Decimal, Decimal, Decimal, i64) {
     let subtotal = subtotal_net.max(Decimal::ZERO).round_dp(2);
-    let tax_amount = (subtotal * Decimal::new(19, 2)).round_dp(2);
+    let clamped_rate = tax_rate_percent.max(Decimal::ZERO).min(Decimal::from(100));
+    let tax_amount = (subtotal * (clamped_rate / Decimal::from(100))).round_dp(2);
     let total = (subtotal + tax_amount).round_dp(2);
     let total_cents = (total * Decimal::from(100))
         .round()
         .to_i64()
         .unwrap_or(0);
     (subtotal, tax_amount, total, total_cents)
+}
+
+/// Computes net subtotal, 19% VAT (rounded to 2 decimal places via `rust_decimal`),
+/// gross total, and gross total in integer euro cents consistently for both
+/// Stripe PaymentIntent creation and order/invoice verification.
+pub fn compute_order_totals(subtotal_net: Decimal) -> (Decimal, Decimal, Decimal, i64) {
+    compute_order_totals_with_rate(subtotal_net, Decimal::new(19, 0))
 }
 
 /// Verifies a Stripe PaymentIntent JSON object for a storefront service order.
@@ -272,6 +283,9 @@ pub(crate) async fn create_payment_intent(
         ));
     }
 
+    let pricing_policy = reliablesite_catalog::load_pricing_policy(&state.db, &state.config).await;
+    let tax_policy = reliablesite_catalog::load_tax_policy(&state.db, &state.config).await;
+
     let subtotal_net = if product.provider == "reliablesite" {
         let cycle = extract_optional_string(
             payload.billing_cycle.as_deref(),
@@ -279,11 +293,13 @@ pub(crate) async fn create_payment_intent(
             &["billing_cycle", "billingCycle"],
         );
         let opts = extract_config_options(payload.config_options.as_ref(), payload.config.as_ref());
-        let quote = reliablesite_catalog::compute_quote(
+        let quote = reliablesite_catalog::compute_quote_with_policy(
             &state.db,
             &product,
             cycle.as_deref(),
             opts.as_ref(),
+            pricing_policy,
+            &tax_policy,
         )
         .await?;
 
@@ -305,7 +321,8 @@ pub(crate) async fn create_payment_intent(
         .as_deref()
         .ok_or(ApiError::Internal("Stripe not configured".into()))?;
 
-    let (_, _, _, total_cents) = compute_order_totals(subtotal_net);
+    let (_, _, _, total_cents) =
+        compute_order_totals_with_rate(subtotal_net, tax_policy.rate_percent);
     let amount = total_cents.max(50);
 
     let customer_id_str = auth.0.sub.to_string();
@@ -474,6 +491,9 @@ pub(crate) async fn place_order(
         }
     }
 
+    let pricing_policy = reliablesite_catalog::load_pricing_policy(&state.db, &state.config).await;
+    let tax_policy = reliablesite_catalog::load_tax_policy(&state.db, &state.config).await;
+
     let is_reliablesite = product.provider == "reliablesite";
     let rs_quote = if is_reliablesite {
         let cycle = extract_optional_string(
@@ -482,11 +502,13 @@ pub(crate) async fn place_order(
             &["billing_cycle", "billingCycle"],
         );
         let opts = extract_config_options(payload.config_options.as_ref(), payload.config.as_ref());
-        let q = reliablesite_catalog::compute_quote(
+        let q = reliablesite_catalog::compute_quote_with_policy(
             &state.db,
             &product,
             cycle.as_deref(),
             opts.as_ref(),
+            pricing_policy,
+            &tax_policy,
         )
         .await?;
 
@@ -513,7 +535,7 @@ pub(crate) async fn place_order(
     };
 
     let (invoice_subtotal, invoice_tax_amount, invoice_total, total_cents) =
-        compute_order_totals(subtotal_net);
+        compute_order_totals_with_rate(subtotal_net, tax_policy.rate_percent);
 
     let has_trial = !is_reliablesite && effective_trial_days.unwrap_or(0) > 0;
     let is_storage = product.category.to_lowercase().contains("sftp")
@@ -870,9 +892,20 @@ pub(crate) async fn place_order(
         }
     }
 
+    let initial_order_state = if verified_payment_intent_id.is_some() {
+        "payment_received"
+    } else {
+        "provisioning"
+    };
+    let initial_order_state_note: Option<&str> = if product.provider == "reliablesite" {
+        Some("Queued for dedicated hardware provisioning (regularly up to 7 business days after payment).")
+    } else {
+        None
+    };
+
     sqlx::query(
-        r#"INSERT INTO services (id, customer_id, product_id, name, hostname, price, status, next_due, stripe_payment_intent_id, is_trial, trial_ends_at, partner_id, quota_gb, config)
-        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $10, $11, $12, $13)"#,
+        r#"INSERT INTO services (id, customer_id, product_id, name, hostname, price, status, next_due, stripe_payment_intent_id, is_trial, trial_ends_at, partner_id, quota_gb, config, order_state, order_state_note, order_state_updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $10, $11, $12, $13, $14, $15, now())"#,
     )
     .bind(service_id)
     .bind(auth.0.sub)
@@ -887,6 +920,8 @@ pub(crate) async fn place_order(
     .bind(partner_id)
     .bind(current_quota_gb)
     .bind(&initial_service_config)
+    .bind(initial_order_state)
+    .bind(initial_order_state_note)
     .execute(&mut *tx)
     .await
     .map_err(|e| {
@@ -912,12 +947,13 @@ pub(crate) async fn place_order(
 
         sqlx::query(
             r#"INSERT INTO invoices (id, invoice_number, customer_id, status, subtotal, tax_rate, tax_amount, total, issue_date, due_date, paid_at, stripe_payment_intent_id, notes)
-            VALUES ($1, $2, $3, 'paid', $4, 19.00, $5, $6, $7, $7, now(), $8, $9)"#,
+            VALUES ($1, $2, $3, 'paid', $4, $5, $6, $7, $8, $8, now(), $9, $10)"#,
         )
         .bind(invoice_id)
         .bind(&inv_num)
         .bind(auth.0.sub)
         .bind(invoice_subtotal)
+        .bind(tax_policy.rate_percent)
         .bind(invoice_tax_amount)
         .bind(invoice_total)
         .bind(today)
@@ -1027,6 +1063,18 @@ pub(crate) async fn place_order(
     }
 
     tx.commit().await?;
+
+    crate::mailer::spawn_order_confirmation_notification(
+        state.clone(),
+        auth.0.sub,
+        product.name.clone(),
+        product.provider.clone(),
+        product.category.clone(),
+        service_id,
+        verified_payment_intent_id
+            .is_some()
+            .then_some(invoice_total),
+    );
 
     Ok(Json(
         json!({ "service_id": service_id, "job_id": job_id, "status": "pending" }),
