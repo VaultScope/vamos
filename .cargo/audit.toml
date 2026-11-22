@@ -1,9 +1,9 @@
 # Configuration for cargo-audit
 [advisories]
 ignore = [
-    # RUSTSEC-2023-0071: rsa 0.9.10 Marvin Attack timing sidechannel.
-    # Present in Cargo.lock solely via sqlx-mysql, which is an inactive optional
-    # dependency of the sqlx crate. VaultScope exclusively uses PostgreSQL (sqlx-postgres).
-    # MySQL drivers and rsa are never compiled, linked, or executed.
+    # RUSTSEC-2023-0071: rsa 0.9.10 Marvin Attack timing sidechannel (via jsonwebtoken's
+    # rust_crypto feature and optional sqlx-mysql). VaultScope exclusively uses HS256
+    # symmetric HMAC-SHA256 JWTs and PostgreSQL (sqlx-postgres); RSA decryption/signing
+    # and MySQL drivers are never invoked at runtime.
     "RUSTSEC-2023-0071",
 ]

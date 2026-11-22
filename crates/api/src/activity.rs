@@ -3,6 +3,7 @@ use uuid::Uuid;
 use vaultscope_db::models::ActorType;
 
 /// Asynchronously inserts an audit entry into `activity_log`.
+#[allow(clippy::too_many_arguments)]
 pub async fn record(
     pool: &sqlx::PgPool,
     actor_id: Option<Uuid>,
@@ -33,6 +34,7 @@ pub async fn record(
 }
 
 /// Spawns a background task to insert an audit entry into `activity_log` without blocking the request handler.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_record(
     pool: sqlx::PgPool,
     actor_id: Option<Uuid>,

@@ -58,7 +58,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, CryptoError> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(CryptoError::Decrypt("invalid hex length".into()));
     }
     let bytes = s.as_bytes();

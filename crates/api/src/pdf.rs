@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use vaultscope_db::models::{Customer, Invoice, InvoiceLineItem, InvoiceStatus};
 
 /// Generates a GoBD-compliant PDF document for the given invoice, customer, and line items.
+#[allow(dead_code)]
 pub fn generate_invoice_pdf(
     invoice: &Invoice,
     customer: &Customer,
@@ -474,7 +475,8 @@ fn encode_pdf_text(s: &str) -> String {
             'Ü' => out.push_str("\\334"),
             'ß' => out.push_str("\\337"),
             '€' => out.push_str("EUR"),
-            c if c.is_ascii() => out.push(c),
+            c if c.is_ascii() && !c.is_ascii_control() => out.push(c),
+            c if c.is_ascii_control() => out.push(' '),
             _ => out.push('?'),
         }
     }

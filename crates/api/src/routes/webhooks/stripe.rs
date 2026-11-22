@@ -60,7 +60,7 @@ pub fn verify_stripe_signature(payload: &str, sig_header: &str, secret: &str) ->
     }
 
     let now = Utc::now().timestamp();
-    if (now - timestamp).abs() > SIGNATURE_TOLERANCE_SECS {
+    if now.abs_diff(timestamp) > SIGNATURE_TOLERANCE_SECS as u64 {
         return Err("Stripe-Signature timestamp outside tolerance");
     }
 
@@ -282,8 +282,7 @@ pub async fn handle_stripe_webhook(
                     let currency_ok = obj
                         .get("currency")
                         .and_then(Value::as_str)
-                        .map(|c| c.eq_ignore_ascii_case("eur"))
-                        .unwrap_or(true);
+                        .is_some_and(|c| c.eq_ignore_ascii_case("eur"));
                     if !currency_ok {
                         error!(event_id = %event_id, pi_id = %pi_id, "Rejecting invoice.payment_succeeded with non-EUR currency");
                         "failed"
@@ -301,8 +300,7 @@ pub async fn handle_stripe_webhook(
                             let amount_ok = obj
                                 .get("amount_paid")
                                 .and_then(Value::as_i64)
-                                .map(|amt| amt >= expected_cents)
-                                .unwrap_or(true);
+                                .is_some_and(|amt| amt >= expected_cents);
                             if !amount_ok {
                                 error!(event_id = %event_id, pi_id = %pi_id, invoice_id = %inv_id, "Insufficient amount_paid on invoice.payment_succeeded");
                                 "failed"

@@ -223,22 +223,31 @@ pub fn resolve_client_ip_with_cidrs(
         return peer.to_string();
     }
 
-    if let Some(cf_ip) = headers
-        .get("cf-connecting-ip")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .and_then(|s| s.parse::<IpAddr>().ok())
-    {
-        return normalize_ip(cf_ip).to_string();
+    let trust_cf = std::env::var("TRUST_CLOUDFLARE_HEADERS")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
+        .unwrap_or(true);
+
+    if trust_cf {
+        if let Some(cf_ip) = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .and_then(|s| s.parse::<IpAddr>().ok())
+        {
+            return normalize_ip(cf_ip).to_string();
+        }
     }
 
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        let hops: Vec<IpAddr> = xff
-            .split(',')
-            .filter_map(|s| s.trim().parse::<IpAddr>().ok())
-            .map(normalize_ip)
-            .collect();
+    let hops: Vec<IpAddr> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|xff| xff.split(','))
+        .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+        .map(normalize_ip)
+        .collect();
 
+    if !hops.is_empty() {
         if let Some(client) = hops.iter().rev().find(|ip| !is_trusted_proxy(**ip, extra_cidrs)) {
             return client.to_string();
         }

@@ -220,6 +220,7 @@ pub fn is_dedicated_product(provider: &str, category: &str) -> bool {
         || cat == "bare-metal"
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_service_welcome_email(
     customer_name: &str,
     service_name: &str,
