@@ -3,6 +3,7 @@ use std::sync::Arc;
 use vaultscope_api::config::Config;
 use vaultscope_api::state::AppState;
 
+#[allow(dead_code)]
 pub async fn setup_test_db() -> PgPool {
     let database_url = std::env::var("TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/vaultscope_test".to_string());
@@ -24,6 +25,7 @@ pub async fn setup_test_db() -> PgPool {
     pool
 }
 
+#[allow(dead_code)]
 pub fn test_config() -> Config {
     Config {
         database_url: std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
@@ -68,6 +70,7 @@ pub fn test_config() -> Config {
     }
 }
 
+#[allow(dead_code)]
 pub async fn test_app_state() -> AppState {
     let pool = setup_test_db().await;
     let config = test_config();

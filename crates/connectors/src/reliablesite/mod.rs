@@ -113,9 +113,11 @@ impl ReliableSite {
         for srv in &servers {
             let groups = self.inventory_client.addon_groups_list(srv.product_id).await?;
             for g in &groups {
-                if !addons_by_group.contains_key(&g.group_id) {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    addons_by_group.entry(g.group_id)
+                {
                     let addons = self.inventory_client.addons_list(g.group_id).await?;
-                    addons_by_group.insert(g.group_id, addons);
+                    entry.insert(addons);
                 }
             }
             server_groups.insert(srv.product_id, groups);
@@ -173,6 +175,7 @@ impl ReliableSite {
         }))
     }
 
+    #[allow(clippy::type_complexity)]
     fn extract_order_params(
         &self,
         params: &ProvisionParams,
@@ -224,6 +227,10 @@ impl ReliableSite {
         let mut config_options = BTreeMap::new();
         if let Some(obj) = raw_cfg.and_then(|v| v.as_object()) {
             for (k, v) in obj {
+                let gid: u32 = k.trim().parse().map_err(|_| {
+                    ConnectorError::Api(format!("Invalid numeric Group_Id key: {}", k))
+                })?;
+                let canonical_key = gid.to_string();
                 let addon_id = v
                     .as_u64()
                     .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
@@ -236,7 +243,12 @@ impl ReliableSite {
                 let addon_u32 = u32::try_from(addon_id).map_err(|_| {
                     ConnectorError::Api(format!("Addon_Id out of range for group {}", k))
                 })?;
-                config_options.insert(k.trim().to_string(), addon_u32);
+                if config_options.insert(canonical_key, addon_u32).is_some() {
+                    return Err(ConnectorError::Api(format!(
+                        "Duplicate configuration group key {}",
+                        gid
+                    )));
+                }
             }
         }
 

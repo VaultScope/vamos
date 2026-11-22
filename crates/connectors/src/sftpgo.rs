@@ -19,6 +19,7 @@ impl SftpGo {
     pub fn new(base_url: String, admin_user: String, admin_pass: String) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| Client::new());
         Self {
@@ -141,12 +142,17 @@ impl ProvisioningProvider for SftpGo {
             150 * 1024 * 1024 * 1024 // 150 GB default
         };
         
-        if let Some(explicit_quota) = params.extra.get("quota_size").and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64))) {
+        if let Some(explicit_quota) = params
+            .extra
+            .get("quota_size")
+            .and_then(|v| v.as_i64().or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok())))
+            .filter(|q| *q > 0)
+        {
             quota_bytes = explicit_quota;
         } else if let Some(specs) = params.extra.get("specs") {
-            if let Some(gb) = specs.get("storage_gb").and_then(|v| v.as_i64()) {
+            if let Some(gb) = specs.get("storage_gb").and_then(|v| v.as_i64()).filter(|g| *g > 0) {
                 if !is_trial {
-                    quota_bytes = gb * 1024 * 1024 * 1024;
+                    quota_bytes = gb.saturating_mul(1024 * 1024 * 1024);
                 }
             }
         }
@@ -215,10 +221,17 @@ impl ProvisioningProvider for SftpGo {
 
     async fn delete(&self, resource_id: &str) -> ConnectorResult<()> {
         let resource_id = validate_resource_id(resource_id)?;
-        let _ = self
-            .request::<serde_json::Value>(reqwest::Method::DELETE, &format!("/api/v2/users/{}", resource_id), None::<&()>)
-            .await;
-        Ok(())
+        match self
+            .request::<serde_json::Value>(
+                reqwest::Method::DELETE,
+                &format!("/api/v2/users/{}", resource_id),
+                None::<&()>,
+            )
+            .await
+        {
+            Ok(_) | Err(ConnectorError::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     async fn reinstall(&self, _resource_id: &str, _params: &ReinstallParams) -> ConnectorResult<()> {
@@ -231,7 +244,11 @@ impl ProvisioningProvider for SftpGo {
             .request(reqwest::Method::GET, &format!("/api/v2/users/{}", resource_id), None::<&()>)
             .await?;
 
-        if let Some(quota) = params.get("quota_size").and_then(|v| v.as_i64()) {
+        if let Some(quota) = params
+            .get("quota_size")
+            .and_then(|v| v.as_i64().or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok())))
+            .filter(|q| *q > 0)
+        {
             user["quota_size"] = json!(quota);
         }
 

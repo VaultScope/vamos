@@ -139,6 +139,49 @@ pub struct CreatePartner {
     pub commission_fixed_eur: Option<rust_decimal::Decimal>,
 }
 
+fn validate_partner_payload(payload: &CreatePartner) -> Result<String, ApiError> {
+    let slug = payload.slug.trim().to_lowercase().replace(' ', "-");
+    if slug.is_empty()
+        || slug.len() > 100
+        || !slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    {
+        return Err(ApiError::BadRequest(
+            "Invalid partner slug (use lowercase alphanumeric characters and hyphens)".into(),
+        ));
+    }
+    if payload.name.trim().is_empty() || payload.name.len() > 255 {
+        return Err(ApiError::BadRequest("Partner name must be 1..255 characters".into()));
+    }
+    if let Some(days) = payload.trial_days_override {
+        if !(0..=365).contains(&days) {
+            return Err(ApiError::BadRequest("trial_days_override must be 0..365".into()));
+        }
+    }
+    if let Some(tq) = payload.trial_quota_gb_override {
+        if !(1..=100_000).contains(&tq) {
+            return Err(ApiError::BadRequest("trial_quota_gb_override out of range".into()));
+        }
+    }
+    if let Some(q) = payload.quota_gb_override {
+        if !(1..=100_000).contains(&q) {
+            return Err(ApiError::BadRequest("quota_gb_override out of range".into()));
+        }
+    }
+    if let Some(rate) = payload.commission_rate {
+        if rate < rust_decimal::Decimal::ZERO || rate > rust_decimal::Decimal::from(100) {
+            return Err(ApiError::BadRequest("commission_rate must be between 0 and 100".into()));
+        }
+    }
+    if let Some(fixed) = payload.commission_fixed_eur {
+        if fixed < rust_decimal::Decimal::ZERO {
+            return Err(ApiError::BadRequest("commission_fixed_eur cannot be negative".into()));
+        }
+    }
+    Ok(slug)
+}
+
 #[utoipa::path(
     post,
     path = "/",
@@ -154,7 +197,7 @@ pub(crate) async fn create(
 ) -> Result<Json<Partner>, ApiError> {
     crate::require_permission!(auth, state, "products.edit");
 
-    let slug = payload.slug.trim().to_lowercase().replace(' ', "-");
+    let slug = validate_partner_payload(&payload)?;
     let id = Uuid::now_v7();
 
     let partner: Partner = sqlx::query_as(
@@ -210,7 +253,7 @@ pub(crate) async fn update(
 ) -> Result<Json<Partner>, ApiError> {
     crate::require_permission!(auth, state, "products.edit");
 
-    let slug = payload.slug.trim().to_lowercase().replace(' ', "-");
+    let slug = validate_partner_payload(&payload)?;
 
     let partner: Partner = sqlx::query_as(
         r#"

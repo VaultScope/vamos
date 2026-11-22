@@ -136,6 +136,17 @@ pub(crate) async fn update(
     Json(payload): Json<UpdateTaxRate>,
 ) -> Result<Json<TaxRate>, ApiError> {
     crate::require_permission!(auth, state, "tax.manage");
+    if let Some(ref name) = payload.name {
+        validate_required_string(name, "Name")?;
+        validate_string_length(name, "Name", MAX_SHORT_STRING_LENGTH)?;
+    }
+    if let Some(ref country) = payload.country {
+        validate_required_string(country, "Country")?;
+        validate_string_length(country, "Country", MAX_SHORT_STRING_LENGTH)?;
+    }
+    if let Some(rate) = payload.rate {
+        validate_percentage(rate, "Tax rate")?;
+    }
     let tax_rate: TaxRate = sqlx::query_as(
         r#"UPDATE tax_rates
            SET name = COALESCE($1, name),

@@ -16,10 +16,20 @@ pub struct HetznerCloud {
 
 impl HetznerCloud {
     pub fn new(token: String) -> Self {
-        Self {
-            client: Client::new(),
-            token,
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { client, token }
+    }
+
+    fn validate_server_id(resource_id: &str) -> ConnectorResult<&str> {
+        let trimmed = resource_id.trim();
+        if trimmed.is_empty() || trimmed.len() > 32 || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ConnectorError::Api("invalid Hetzner server resource_id".into()));
         }
+        Ok(trimmed)
     }
 
     fn auth_header(&self) -> String {
@@ -154,6 +164,7 @@ impl ProvisioningProvider for HetznerCloud {
     }
 
     async fn power_action(&self, resource_id: &str, action: PowerAction) -> ConnectorResult<()> {
+        let resource_id = Self::validate_server_id(resource_id)?;
         let action_name = match action {
             PowerAction::Start => "poweron",
             PowerAction::Stop => "shutdown",
@@ -172,6 +183,7 @@ impl ProvisioningProvider for HetznerCloud {
     }
 
     async fn status(&self, resource_id: &str) -> ConnectorResult<ResourceStatus> {
+        let resource_id = Self::validate_server_id(resource_id)?;
         let resp: serde_json::Value = self
             .request(
                 reqwest::Method::GET,
@@ -191,6 +203,7 @@ impl ProvisioningProvider for HetznerCloud {
     }
 
     async fn delete(&self, resource_id: &str) -> ConnectorResult<()> {
+        let resource_id = Self::validate_server_id(resource_id)?;
         let _: serde_json::Value = self
             .request(
                 reqwest::Method::DELETE,
@@ -202,6 +215,7 @@ impl ProvisioningProvider for HetznerCloud {
     }
 
     async fn reinstall(&self, resource_id: &str, params: &ReinstallParams) -> ConnectorResult<()> {
+        let resource_id = Self::validate_server_id(resource_id)?;
         let body = RebuildRequest {
             image: params.image.clone(),
         };
@@ -221,6 +235,7 @@ impl ProvisioningProvider for HetznerCloud {
     }
 
     async fn console(&self, resource_id: &str) -> ConnectorResult<serde_json::Value> {
+        let resource_id = Self::validate_server_id(resource_id)?;
         let resp: RequestConsoleResponse = self
             .request(
                 reqwest::Method::POST,

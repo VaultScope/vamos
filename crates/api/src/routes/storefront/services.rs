@@ -219,24 +219,28 @@ pub(crate) async fn power_restart(
 }
 
 async fn get_service_provider(db: &sqlx::PgPool, service: &Service) -> String {
-    if let Some(p) = service.config.get("provider").and_then(|v| v.as_str()) {
-        return p.to_string();
-    }
-    let prod_provider: Option<(String,)> = sqlx::query_as(
-        "SELECT provider FROM products WHERE id = $1"
-    )
-    .bind(service.product_id)
-    .fetch_optional(db)
-    .await
-    .unwrap_or(None);
+    let prod_provider: Option<(String,)> =
+        sqlx::query_as("SELECT provider FROM products WHERE id = $1")
+            .bind(service.product_id)
+            .fetch_optional(db)
+            .await
+            .unwrap_or(None);
 
-    prod_provider.map(|p| p.0).unwrap_or_else(|| {
-        if service.name.to_lowercase().contains("dedicated") {
-            "reliablesite".to_string()
-        } else {
-            "hetzner_cloud".to_string()
+    if let Some((p,)) = prod_provider {
+        if !p.trim().is_empty() {
+            return p;
         }
-    })
+    }
+    if let Some(p) = service.config.get("provider").and_then(|v| v.as_str()) {
+        if !p.trim().is_empty() {
+            return p.to_string();
+        }
+    }
+    if service.name.to_lowercase().contains("dedicated") {
+        "reliablesite".to_string()
+    } else {
+        "hetzner_cloud".to_string()
+    }
 }
 
 async fn power_action_helper(
@@ -252,6 +256,12 @@ async fn power_action_helper(
             .fetch_optional(&state.db)
             .await?
             .ok_or(ApiError::NotFound("service not found".into()))?;
+
+    if service.status != vaultscope_db::models::ServiceStatus::Running {
+        return Err(ApiError::BadRequest(
+            "Power actions are only available on active running services".into(),
+        ));
+    }
 
     if service.provider_resource_id.is_empty() {
         return Err(ApiError::BadRequest("service not yet provisioned".into()));
@@ -302,6 +312,25 @@ pub(crate) async fn reinstall(
     Path(id): Path<Uuid>,
     Json(payload): Json<ReinstallPayload>,
 ) -> Result<Json<Value>, ApiError> {
+    let os_trimmed = payload.os.trim();
+    const ALLOWED_OS_IMAGES: &[&str] = &[
+        "ubuntu-22.04",
+        "ubuntu-24.04",
+        "debian-11",
+        "debian-12",
+        "centos-stream-9",
+        "almalinux-9",
+        "rockylinux-9",
+        "fedora-39",
+        "fedora-40",
+    ];
+    if !ALLOWED_OS_IMAGES.contains(&os_trimmed) {
+        return Err(ApiError::BadRequest(format!(
+            "Unsupported OS image '{}'",
+            os_trimmed
+        )));
+    }
+
     let service: Service =
         sqlx::query_as("SELECT * FROM services WHERE id = $1 AND customer_id = $2")
             .bind(id)
@@ -309,6 +338,12 @@ pub(crate) async fn reinstall(
             .fetch_optional(&state.db)
             .await?
             .ok_or(ApiError::NotFound("service not found".into()))?;
+
+    if service.status != vaultscope_db::models::ServiceStatus::Running {
+        return Err(ApiError::BadRequest(
+            "Service must be running to reinstall the operating system".into(),
+        ));
+    }
 
     if service.provider_resource_id.is_empty() {
         return Err(ApiError::BadRequest("service not yet provisioned".into()));
@@ -319,7 +354,7 @@ pub(crate) async fn reinstall(
     let reinstall_payload = json!({
         "resource_id": service.provider_resource_id,
         "params": {
-            "image": payload.os
+            "image": os_trimmed
         }
     });
 
@@ -362,11 +397,23 @@ pub(crate) async fn delete_service(
             .await?
             .ok_or(ApiError::NotFound("service not found".into()))?;
 
-    if service.status == vaultscope_db::models::ServiceStatus::Running {
+    if matches!(
+        service.status,
+        vaultscope_db::models::ServiceStatus::Running
+            | vaultscope_db::models::ServiceStatus::Suspended
+            | vaultscope_db::models::ServiceStatus::Terminated
+    ) {
         return Err(ApiError::BadRequest(
-            "Cannot delete a running service. Please stop or suspend it first.".into(),
+            "Cannot delete a running, suspended, or already terminated service.".into(),
         ));
     }
+
+    sqlx::query(
+        "UPDATE jobs SET status = 'cancelled'::job_status, completed_at = now() WHERE service_id = $1 AND status = 'queued'::job_status",
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await?;
 
     if !service.provider_resource_id.is_empty() {
         let provider = get_service_provider(&state.db, &service).await;
@@ -432,10 +479,22 @@ pub(crate) async fn cancel_service(
     if service.status == vaultscope_db::models::ServiceStatus::Terminated {
         return Err(ApiError::BadRequest("Service is already terminated".into()));
     }
+    if service.status == vaultscope_db::models::ServiceStatus::Suspended {
+        return Err(ApiError::BadRequest(
+            "Suspended services cannot be self-cancelled. Please contact support.".into(),
+        ));
+    }
 
     let is_immediate = payload.mode.eq_ignore_ascii_case("immediate");
 
     if is_immediate {
+        sqlx::query(
+            "UPDATE jobs SET status = 'cancelled'::job_status, completed_at = now() WHERE service_id = $1 AND status = 'queued'::job_status",
+        )
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+
         if !service.provider_resource_id.is_empty() {
             let job_id = Uuid::now_v7();
             let delete_payload = json!({
@@ -531,7 +590,7 @@ pub(crate) async fn uncancel_service(
 async fn send_cancellation_email(state: &AppState, email_to: &str, service_name: &str, effective_date: &str) {
     let smtp_host = state.config.smtp_host.clone().unwrap_or_else(|| "mail.vaultscope.de".to_string());
     let smtp_user = state.config.smtp_username.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
-    let smtp_pass = state.config.smtp_password.clone().unwrap_or_else(|| "".to_string());
+    let smtp_pass = state.config.smtp_password.clone().unwrap_or_default();
     let smtp_from = state.config.smtp_from.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
 
     let subject = crate::mailer::sanitize_email_header(&format!("Cancellation Confirmation: {}", service_name));
@@ -587,7 +646,15 @@ pub(crate) async fn ipmi_access(
             .await?
             .ok_or(ApiError::NotFound("service not found".into()))?;
 
-    let client_ip = payload.and_then(|p| p.0.client_ip);
+    if service.status != vaultscope_db::models::ServiceStatus::Running {
+        return Err(ApiError::BadRequest(
+            "Service must be running to request IPMI access".into(),
+        ));
+    }
+
+    let client_ip = crate::routes::admin::services::validate_optional_client_ip(
+        payload.as_ref().and_then(|p| p.0.client_ip.as_deref()),
+    )?;
     ipmi_access_inner(&state, &service, client_ip.as_deref()).await
 }
 
@@ -685,7 +752,7 @@ pub(crate) async fn vnc_console(
     match res {
         Ok(info) => Ok(Json(info)),
         Err(e) => {
-            if service.provider_resource_id.starts_with("srv-") {
+            if state.config.dev_mode && service.provider_resource_id.starts_with("srv-") {
                 tracing::warn!("Hetzner console request failed for mock ID {}: {}. Returning simulated session.", service.provider_resource_id, e);
                 Ok(Json(json!({
                     "wss_url": "wss://console.hetzner.cloud/?token=mock_session_token",

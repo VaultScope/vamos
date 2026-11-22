@@ -93,13 +93,12 @@ pub(crate) async fn get_one(
     .await?;
 
     let related_service: Option<vaultscope_db::models::Service> = match ticket.related_service_id {
-        Some(sid) => {
-            sqlx::query_as("SELECT * FROM services WHERE id = $1 AND customer_id = $2")
-                .bind(sid)
-                .bind(auth.0.sub)
-                .fetch_optional(&state.db)
-                .await?
-        }
+        Some(sid) => sqlx::query_as("SELECT * FROM services WHERE id = $1 AND customer_id = $2")
+            .bind(sid)
+            .bind(auth.0.sub)
+            .fetch_optional(&state.db)
+            .await?
+            .map(crate::reliablesite_catalog::sanitize_service_for_storefront),
         None => None,
     };
 
@@ -254,12 +253,25 @@ pub(crate) async fn upload_attachment(
         return Err(ApiError::NotFound("ticket not found".into()));
     }
 
-    while let Some(field) = multipart
+    if let Some(field) = multipart
         .next_field()
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?
     {
-        let raw_filename = field.file_name().unwrap_or("image.png").to_string();
+        let raw_filename = field.file_name().unwrap_or("image.png");
+        let safe_filename: String = raw_filename
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("image.png")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(128)
+            .collect();
+        let safe_filename = if safe_filename.trim().is_empty() {
+            "image.png".to_string()
+        } else {
+            safe_filename
+        };
         let content_type = field.content_type().map(|s| s.to_string());
 
         let data = field
@@ -268,7 +280,7 @@ pub(crate) async fn upload_attachment(
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
         let processed = crate::media::validate_and_save_ticket_attachment(
-            &raw_filename,
+            &safe_filename,
             content_type.as_deref(),
             &data,
         )
@@ -276,7 +288,7 @@ pub(crate) async fn upload_attachment(
 
         return Ok(Json(AttachmentResponse {
             id: processed.id,
-            filename: raw_filename,
+            filename: safe_filename,
             url: processed.url,
             size: processed.size,
             content_type: processed.content_type,

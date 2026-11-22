@@ -193,8 +193,13 @@ pub(crate) async fn create(
         Vec::with_capacity(payload.line_items.len());
     for item in &payload.line_items {
         let unit_price = item.unit_price.round_dp(2);
-        let item_total = (Decimal::from(item.quantity) * unit_price).round_dp(2);
-        subtotal += item_total;
+        let item_total = Decimal::from(item.quantity)
+            .checked_mul(unit_price)
+            .ok_or_else(|| ApiError::BadRequest("Line item total overflow".into()))?
+            .round_dp(2);
+        subtotal = subtotal
+            .checked_add(item_total)
+            .ok_or_else(|| ApiError::BadRequest("Invoice subtotal overflow".into()))?;
         normalized_items.push((
             item.description.clone(),
             item.quantity,
@@ -206,8 +211,14 @@ pub(crate) async fn create(
     subtotal = subtotal.round_dp(2);
 
     let tax_rate_pct = payload.tax_rate.round_dp(2);
-    let tax_amount = (subtotal * (tax_rate_pct / Decimal::from(100))).round_dp(2);
-    let total = (subtotal + tax_amount).round_dp(2);
+    let tax_amount = subtotal
+        .checked_mul(tax_rate_pct / Decimal::from(100))
+        .ok_or_else(|| ApiError::BadRequest("Invoice tax amount overflow".into()))?
+        .round_dp(2);
+    let total = subtotal
+        .checked_add(tax_amount)
+        .ok_or_else(|| ApiError::BadRequest("Invoice total overflow".into()))?
+        .round_dp(2);
 
     let mut tx = state.db.begin().await?;
 
@@ -299,6 +310,11 @@ pub(crate) async fn update(
     if existing.status != InvoiceStatus::Draft {
         return Err(ApiError::BadRequest(
             "Only draft invoices can be updated".into(),
+        ));
+    }
+    if payload.status == Some(InvoiceStatus::Paid) {
+        return Err(ApiError::BadRequest(
+            "Draft invoices must be finalized before being marked paid".into(),
         ));
     }
 
@@ -417,7 +433,7 @@ async fn dispatch_invoice_email(
 
     let smtp_host = state.config.smtp_host.clone().unwrap_or_else(|| "mail.vaultscope.de".to_string());
     let smtp_user = state.config.smtp_username.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
-    let smtp_pass = state.config.smtp_password.clone().unwrap_or_else(|| "".to_string());
+    let smtp_pass = state.config.smtp_password.clone().unwrap_or_default();
     let smtp_from = state.config.smtp_from.clone().unwrap_or_else(|| "system@vaultscope.de".to_string());
 
     let billing_url = format!(
@@ -519,9 +535,9 @@ pub(crate) async fn mark_paid(
         .await?
         .ok_or(ApiError::NotFound("invoice not found".into()))?;
 
-    if existing.status == InvoiceStatus::Void {
+    if existing.status == InvoiceStatus::Void || existing.status == InvoiceStatus::Draft {
         return Err(ApiError::BadRequest(
-            "Cannot mark a voided invoice as paid".into(),
+            "Cannot mark a draft or voided invoice as paid".into(),
         ));
     }
 
@@ -530,7 +546,7 @@ pub(crate) async fn mark_paid(
            SET status = 'paid'::invoice_status,
                paid_at = COALESCE(paid_at, now()),
                updated_at = now()
-           WHERE id = $1 AND status != 'void'::invoice_status
+           WHERE id = $1 AND status NOT IN ('void'::invoice_status, 'draft'::invoice_status)
            RETURNING *"#,
     )
     .bind(id)

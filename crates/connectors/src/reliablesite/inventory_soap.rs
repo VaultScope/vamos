@@ -118,9 +118,16 @@ fn child_text_map<'a>(node: Node<'a, 'a>) -> HashMap<&'a str, &'a str> {
 fn verify_soap_result(doc: &Document<'_>, operation: &str) -> ConnectorResult<()> {
     let mut result_flag: Option<bool> = None;
     let mut message: Option<&str> = None;
+    let mut fault_string: Option<&str> = None;
 
     for node in doc.descendants().filter(|n| n.is_element()) {
         match node.tag_name().name() {
+            "Fault" if fault_string.is_none() => {
+                fault_string = Some("SOAP Fault");
+            }
+            "faultstring" => {
+                fault_string = node.text().map(str::trim).or(Some("SOAP Fault"));
+            }
             "Result" if result_flag.is_none() => {
                 if let Some(txt) = node.text() {
                     result_flag = match txt.trim().to_ascii_lowercase().as_str() {
@@ -135,6 +142,13 @@ fn verify_soap_result(doc: &Document<'_>, operation: &str) -> ConnectorResult<()
             }
             _ => {}
         }
+    }
+
+    if let Some(fault) = fault_string {
+        return Err(ConnectorError::Api(format!(
+            "ReliableSite {} SOAP Fault: {}",
+            operation, fault
+        )));
     }
 
     if result_flag == Some(false) {

@@ -1204,7 +1204,7 @@ fn test_config_debug_redacts_secrets_and_jwt_validation_and_env() {
 
     // JWT validation: distinct char count < 12 panics
     let low_entropy = std::panic::catch_unwind(|| {
-        validate_jwt_secret_with_mode(&"abcabcabcabcabcabcabcabcabcabc12".to_string(), false);
+        validate_jwt_secret_with_mode("abcabcabcabcabcabcabcabcabcabc12", false);
     });
     assert!(low_entropy.is_err());
 

@@ -465,25 +465,25 @@ fn test_staff_privilege_escalation_logic() {
 
     // Wildcard owner can assign anything
     assert!(ensure_role_assignable(&wildcard, &wildcard).is_ok());
-    assert!(ensure_role_assignable(&wildcard, &vec!["rbac.manage".into()]).is_ok());
+    assert!(ensure_role_assignable(&wildcard, &["rbac.manage".into()]).is_ok());
 
     // Non-wildcard staff manager cannot grant "*", "rbac.manage", or unheld permissions
     assert!(ensure_role_assignable(&staff_mgr, &wildcard).is_err());
-    assert!(ensure_role_assignable(&staff_mgr, &vec!["rbac.manage".into()]).is_err());
-    assert!(ensure_role_assignable(&staff_mgr, &vec!["invoices.delete".into()]).is_err());
+    assert!(ensure_role_assignable(&staff_mgr, &["rbac.manage".into()]).is_err());
+    assert!(ensure_role_assignable(&staff_mgr, &["invoices.delete".into()]).is_err());
     assert!(ensure_role_assignable(
         &staff_mgr,
-        &vec!["tickets.view".into(), "invoices.view".into()]
+        &["tickets.view".into(), "invoices.view".into()]
     )
     .is_err());
 
     // Subset of caller's permissions is permitted
-    assert!(ensure_role_assignable(&staff_mgr, &vec!["tickets.view".into()]).is_ok());
+    assert!(ensure_role_assignable(&staff_mgr, &["tickets.view".into()]).is_ok());
     assert!(ensure_role_assignable(&staff_mgr, &staff_mgr).is_ok());
     assert!(ensure_role_assignable(&staff_mgr, &[]).is_ok());
 
     // Caller who already holds rbac.manage may assign rbac.manage, but still not "*"
-    assert!(ensure_role_assignable(&staff_and_rbac, &vec!["rbac.manage".into()]).is_ok());
+    assert!(ensure_role_assignable(&staff_and_rbac, &["rbac.manage".into()]).is_ok());
     assert!(ensure_role_assignable(&staff_and_rbac, &wildcard).is_err());
 }
 

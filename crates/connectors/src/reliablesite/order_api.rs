@@ -72,14 +72,16 @@ impl OrderApiClient {
 
         let body_text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            tracing::warn!(%status, "ReliableSite Login/Token non-success response");
             return Err(ConnectorError::Api(format!(
-                "ReliableSite Login/Token failed ({}): {}",
-                status, body_text
+                "ReliableSite Login/Token failed ({})",
+                status
             )));
         }
 
         let parsed: LoginTokenResponse = serde_json::from_str(&body_text).map_err(|e| {
-            ConnectorError::Api(format!("Invalid Login/Token JSON ({}): {}", e, body_text))
+            tracing::warn!("Invalid ReliableSite Login/Token JSON: {}", e);
+            ConnectorError::Api(format!("Invalid Login/Token JSON ({})", e))
         })?;
 
         if parsed.status == Some(false) {

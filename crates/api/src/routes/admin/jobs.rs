@@ -25,7 +25,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
 )]
 pub(crate) async fn list(auth: AuthAdmin, State(state): State<AppState>) -> Result<Json<Vec<Job>>, ApiError> {
     crate::require_permission!(auth, state, "jobs.view");
-    let jobs = sqlx::query_as::<_, Job>("SELECT * FROM jobs ORDER BY created_at DESC")
+    let jobs = sqlx::query_as::<_, Job>("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 500")
         .fetch_all(&state.db)
         .await?;
 
@@ -58,12 +58,13 @@ pub(crate) async fn retry_job(
                started_at = NULL,
                completed_at = NULL
            WHERE id = $1
+             AND status IN ('failed'::job_status, 'cancelled'::job_status)
            RETURNING *"#
     )
     .bind(id)
     .fetch_optional(&state.db)
     .await?
-    .ok_or(ApiError::NotFound("job not found".into()))?;
+    .ok_or(ApiError::BadRequest("Only failed or cancelled jobs can be retried".into()))?;
 
     Ok(Json(job))
 }
@@ -90,12 +91,13 @@ pub(crate) async fn cancel_job(
            SET status = 'cancelled'::job_status,
                completed_at = now()
            WHERE id = $1
+             AND status = 'queued'::job_status
            RETURNING *"#
     )
     .bind(id)
     .fetch_optional(&state.db)
     .await?
-    .ok_or(ApiError::NotFound("job not found".into()))?;
+    .ok_or(ApiError::BadRequest("Only queued jobs can be cancelled".into()))?;
 
     Ok(Json(job))
 }

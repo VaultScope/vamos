@@ -80,6 +80,39 @@ pub(crate) struct CreateProduct {
     hidden: Option<bool>,
 }
 
+fn validate_product_payload(payload: &CreateProduct) -> Result<(), ApiError> {
+    if payload.name.trim().is_empty() || payload.name.len() > 255 {
+        return Err(ApiError::BadRequest("Product name must be 1..255 characters".into()));
+    }
+    if !payload.cost.is_finite() || !(0.0..=1_000_000.0).contains(&payload.cost) {
+        return Err(ApiError::BadRequest("Invalid product cost".into()));
+    }
+    if !payload.price.is_finite() || !(0.0..=1_000_000.0).contains(&payload.price) {
+        return Err(ApiError::BadRequest("Invalid product price".into()));
+    }
+    if let Some(fee) = payload.setup_fee {
+        if !fee.is_finite() || !(0.0..=1_000_000.0).contains(&fee) {
+            return Err(ApiError::BadRequest("Invalid setup fee".into()));
+        }
+    }
+    if let Some(days) = payload.trial_days {
+        if !(0..=365).contains(&days) {
+            return Err(ApiError::BadRequest("Trial days must be between 0 and 365".into()));
+        }
+    }
+    if let Some(tq) = payload.trial_quota_gb {
+        if !(0..=100_000).contains(&tq) {
+            return Err(ApiError::BadRequest("Trial quota GB out of range".into()));
+        }
+    }
+    if let Some(q) = payload.quota_gb {
+        if !(0..=100_000).contains(&q) {
+            return Err(ApiError::BadRequest("Quota GB out of range".into()));
+        }
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/",
@@ -94,6 +127,7 @@ pub(crate) async fn create(
     Json(payload): Json<CreateProduct>,
 ) -> Result<Json<Product>, ApiError> {
     crate::require_permission!(auth, state, "products.create");
+    validate_product_payload(&payload)?;
     let id = Uuid::now_v7();
     let product: Product = sqlx::query_as(
         r#"INSERT INTO products (id, name, category, provider, target, specs, cost, price, setup_fee, billing_cycle, trial_days, trial_quota_gb, quota_gb, service_form_id, hidden)
@@ -140,6 +174,7 @@ pub(crate) async fn update(
     Json(payload): Json<CreateProduct>,
 ) -> Result<Json<Product>, ApiError> {
     crate::require_permission!(auth, state, "products.edit");
+    validate_product_payload(&payload)?;
     let product: Product = sqlx::query_as(
         r#"UPDATE products SET name=$1, category=$2, provider=$3, target=$4, specs=$5,
         cost=$6, price=$7, setup_fee=$8, billing_cycle=$9::billing_cycle, trial_days=$10,

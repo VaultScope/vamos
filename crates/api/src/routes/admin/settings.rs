@@ -36,6 +36,10 @@ pub fn is_secret_setting_key(key: &str) -> bool {
         || lower.contains("pass")
         || lower.contains("token")
         || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("private_key")
+        || lower.contains("signing_key")
+        || lower.contains("credential")
 }
 
 /// Returns `true` if a setting value is empty, non-string, or a masked placeholder.
@@ -177,9 +181,15 @@ pub(crate) async fn update_batch(
                 row.value.as_i64().map(rust_decimal::Decimal::from)
             };
             if let Some(d) = parsed {
-                if row.key == "reliablesite_usd_to_eur_rate" && d > rust_decimal::Decimal::ZERO {
+                if row.key == "reliablesite_usd_to_eur_rate"
+                    && d >= rust_decimal::Decimal::new(1, 2)
+                    && d <= rust_decimal::Decimal::from(10)
+                {
                     fx = d;
-                } else if row.key == "reliablesite_markup_percent" && d >= rust_decimal::Decimal::ZERO {
+                } else if row.key == "reliablesite_markup_percent"
+                    && d >= rust_decimal::Decimal::ZERO
+                    && d <= rust_decimal::Decimal::from(500)
+                {
                     markup = d;
                 }
             }

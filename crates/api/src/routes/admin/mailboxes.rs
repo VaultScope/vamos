@@ -68,6 +68,16 @@ pub fn is_forbidden_smtp_ip(ip: IpAddr) -> bool {
                 );
                 return is_forbidden_smtp_v4(embedded);
             }
+            // 6to4 2002::/16 (embeds IPv4 in seg[1] and seg[2])
+            if seg[0] == 0x2002 {
+                let embedded = Ipv4Addr::new(
+                    (seg[1] >> 8) as u8,
+                    seg[1] as u8,
+                    (seg[2] >> 8) as u8,
+                    seg[2] as u8,
+                );
+                return is_forbidden_smtp_v4(embedded);
+            }
 
             v6.is_loopback()
                 || v6.is_unspecified()
@@ -78,8 +88,8 @@ pub fn is_forbidden_smtp_ip(ip: IpAddr) -> bool {
                 || (seg[0] & 0xffc0) == 0xfe80
                 // Site-local fec0::/10
                 || (seg[0] & 0xffc0) == 0xfec0
-                // Documentation 2001:db8::/32
-                || (seg[0] == 0x2001 && seg[1] == 0x0db8)
+                // Documentation 2001:db8::/32 or Teredo 2001:0000::/32
+                || (seg[0] == 0x2001 && (seg[1] == 0x0db8 || seg[1] == 0x0000))
         }
     }
 }
@@ -275,7 +285,8 @@ pub(crate) async fn create(
     Json(payload): Json<CreateMailbox>,
 ) -> Result<Json<Mailbox>, ApiError> {
     crate::require_permission!(auth, state, "mail.manage");
-    let _ = validate_smtp_port(payload.port as i64)?;
+    let port = validate_smtp_port(payload.port as i64)?;
+    validate_smtp_host(&payload.host, port, state.config.dev_mode).await?;
     let is_default = payload.is_default.unwrap_or(false);
 
     // If this is set to default, maybe we should unset other defaults, but simple implementation is fine for now
@@ -324,15 +335,43 @@ pub(crate) async fn update(
 ) -> Result<Json<Value>, ApiError> {
     crate::require_permission!(auth, state, "mail.manage");
 
-    if let Some(p) = payload.port {
-        let _ = validate_smtp_port(p as i64)?;
+    let existing: Mailbox = sqlx::query_as("SELECT * FROM mailboxes WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::NotFound("mailbox not found".into()))?;
+
+    let effective_port = match payload.port {
+        Some(p) => validate_smtp_port(p as i64)?,
+        None => validate_smtp_port(existing.port as i64)?,
+    };
+
+    if let Some(ref new_host) = payload.host {
+        validate_smtp_host(new_host, effective_port, state.config.dev_mode).await?;
     }
 
-    // Preserve existing DB password when password is omitted or empty
+    // Preserve existing DB password when password is omitted or empty,
+    // UNLESS host, port, or user_name is being modified (prevents SMTP credential exfiltration).
     let password = payload
         .password
         .as_deref()
         .filter(|p| !p.trim().is_empty());
+
+    let host_changed = payload
+        .host
+        .as_deref()
+        .is_some_and(|h| !h.trim().eq_ignore_ascii_case(existing.host.trim()));
+    let port_changed = payload.port.is_some_and(|p| p != existing.port);
+    let user_changed = payload
+        .user_name
+        .as_deref()
+        .is_some_and(|u| u.trim() != existing.user_name.trim());
+
+    if (host_changed || port_changed || user_changed) && password.is_none() {
+        return Err(ApiError::BadRequest(
+            "Password must be re-entered when changing the SMTP host, port, or username".into(),
+        ));
+    }
 
     let res = sqlx::query(
         r#"UPDATE mailboxes
@@ -393,6 +432,7 @@ pub(crate) struct TestMailboxPayload {
     send_test_email: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_smtp_test(
     state: &AppState,
     host: &str,
@@ -423,6 +463,7 @@ async fn execute_smtp_test(
                 ApiError::Internal("Failed to configure SMTP transport".into())
             })?
             .port(port)
+            .timeout(Some(Duration::from_secs(10)))
             .credentials(creds)
             .build();
 

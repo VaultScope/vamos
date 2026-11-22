@@ -149,7 +149,7 @@ pub async fn create(
     let is_trial = payload.is_trial.unwrap_or_else(|| trial_days.unwrap_or(0) > 0);
 
     let (next_due, trial_ends_at) = if is_trial {
-        let days = trial_days.unwrap_or(14).max(1) as i64;
+        let days = trial_days.unwrap_or(14).clamp(1, 365) as i64;
         let expiry = chrono::Utc::now() + chrono::Duration::days(days);
         (Some(expiry), Some(expiry))
     } else {
@@ -193,12 +193,52 @@ pub async fn suspend(
 ) -> Result<axum::Json<Service>, ApiError> {
     crate::require_permission!(auth, state, "services.power");
     let service: Service = sqlx::query_as(
-        r#"UPDATE services SET status = 'suspended', updated_at = now() WHERE id = $1 RETURNING *"#,
+        r#"UPDATE services
+           SET status = 'suspended', updated_at = now()
+           WHERE id = $1 AND status != 'terminated'::service_status
+           RETURNING *"#,
     )
     .bind(id)
     .fetch_optional(&state.db)
     .await?
-    .ok_or_else(|| ApiError::NotFound("Service not found".into()))?;
+    .ok_or_else(|| ApiError::NotFound("Active service not found".into()))?;
+
+    if !service.provider_resource_id.is_empty() {
+        let provider: Option<String> =
+            sqlx::query_scalar("SELECT provider FROM products WHERE id = $1")
+                .bind(service.product_id)
+                .fetch_optional(&state.db)
+                .await?;
+        let target_api = provider.unwrap_or_else(|| "sftpgo".to_string());
+        if target_api != "manual" && target_api != "reliablesite" {
+            let payload = serde_json::json!({
+                "resource_id": service.provider_resource_id,
+                "action": "stop",
+            });
+            let _ = sqlx::query(
+                "INSERT INTO jobs (id, task, target_api, customer_id, service_id, request_payload) VALUES ($1, 'power_action', $2, $3, $4, $5)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(target_api)
+            .bind(service.customer_id)
+            .bind(service.id)
+            .bind(payload)
+            .execute(&state.db)
+            .await;
+        }
+    }
+
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(auth.0.sub),
+        vaultscope_db::models::ActorType::Staff,
+        auth.0.email.clone(),
+        "service".to_string(),
+        "suspended".to_string(),
+        service.name.clone(),
+        format!("Suspended service {} ({})", service.name, service.id),
+    );
+
     Ok(axum::Json(service))
 }
 
@@ -220,12 +260,52 @@ pub async fn reactivate(
 ) -> Result<axum::Json<Service>, ApiError> {
     crate::require_permission!(auth, state, "services.power");
     let service: Service = sqlx::query_as(
-        r#"UPDATE services SET status = 'running', updated_at = now() WHERE id = $1 RETURNING *"#,
+        r#"UPDATE services
+           SET status = 'running', updated_at = now()
+           WHERE id = $1 AND status != 'terminated'::service_status
+           RETURNING *"#,
     )
     .bind(id)
     .fetch_optional(&state.db)
     .await?
-    .ok_or_else(|| ApiError::NotFound("Service not found".into()))?;
+    .ok_or_else(|| ApiError::NotFound("Suspended service not found".into()))?;
+
+    if !service.provider_resource_id.is_empty() {
+        let provider: Option<String> =
+            sqlx::query_scalar("SELECT provider FROM products WHERE id = $1")
+                .bind(service.product_id)
+                .fetch_optional(&state.db)
+                .await?;
+        let target_api = provider.unwrap_or_else(|| "sftpgo".to_string());
+        if target_api != "manual" && target_api != "reliablesite" {
+            let payload = serde_json::json!({
+                "resource_id": service.provider_resource_id,
+                "action": "start",
+            });
+            let _ = sqlx::query(
+                "INSERT INTO jobs (id, task, target_api, customer_id, service_id, request_payload) VALUES ($1, 'power_action', $2, $3, $4, $5)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(target_api)
+            .bind(service.customer_id)
+            .bind(service.id)
+            .bind(payload)
+            .execute(&state.db)
+            .await;
+        }
+    }
+
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(auth.0.sub),
+        vaultscope_db::models::ActorType::Staff,
+        auth.0.email.clone(),
+        "service".to_string(),
+        "reactivated".to_string(),
+        service.name.clone(),
+        format!("Reactivated service {} ({})", service.name, service.id),
+    );
+
     Ok(axum::Json(service))
 }
 
@@ -245,14 +325,62 @@ pub async fn terminate(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
 ) -> Result<axum::Json<Service>, ApiError> {
-    crate::require_permission!(auth, state, "services.power");
+    if crate::middleware::rbac::check_permission(&auth, &state, "services.manage").await.is_err() {
+        crate::require_permission!(auth, state, "services.power");
+    }
     let service: Service = sqlx::query_as(
-        r#"UPDATE services SET status = 'terminated', updated_at = now() WHERE id = $1 RETURNING *"#,
+        r#"UPDATE services
+           SET status = 'terminated', cancel_at_period_end = false, updated_at = now()
+           WHERE id = $1
+           RETURNING *"#,
     )
     .bind(id)
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| ApiError::NotFound("Service not found".into()))?;
+
+    let _ = sqlx::query(
+        "UPDATE jobs SET status = 'cancelled'::job_status, completed_at = now() WHERE service_id = $1 AND status = 'queued'::job_status",
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await;
+
+    if !service.provider_resource_id.is_empty() {
+        let provider: Option<String> =
+            sqlx::query_scalar("SELECT provider FROM products WHERE id = $1")
+                .bind(service.product_id)
+                .fetch_optional(&state.db)
+                .await?;
+        let target_api = provider.unwrap_or_else(|| "sftpgo".to_string());
+        if target_api != "manual" {
+            let payload = serde_json::json!({
+                "resource_id": service.provider_resource_id,
+            });
+            let _ = sqlx::query(
+                "INSERT INTO jobs (id, task, target_api, customer_id, service_id, request_payload) VALUES ($1, 'delete', $2, $3, $4, $5)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(target_api)
+            .bind(service.customer_id)
+            .bind(service.id)
+            .bind(payload)
+            .execute(&state.db)
+            .await;
+        }
+    }
+
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(auth.0.sub),
+        vaultscope_db::models::ActorType::Staff,
+        auth.0.email.clone(),
+        "service".to_string(),
+        "terminated".to_string(),
+        service.name.clone(),
+        format!("Terminated service {} ({})", service.name, service.id),
+    );
+
     Ok(axum::Json(service))
 }
 
