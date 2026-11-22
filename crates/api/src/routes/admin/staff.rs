@@ -90,9 +90,18 @@ pub(crate) async fn list(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<StaffWithRole>>, ApiError> {
     crate::require_permission!(auth, state, "staff.view");
-    let staff: Vec<Staff> = sqlx::query_as("SELECT * FROM staff ORDER BY created_at")
-        .fetch_all(&state.db)
-        .await?;
+    let staff: Vec<Staff> = sqlx::query_as(
+        r#"SELECT s.id, s.external_id, s.username, s.first_name, s.last_name, s.email,
+                  (s.email_verified OR COALESCE(c.email_verified, false)) AS email_verified,
+                  s.avatar_url, s.role_id,
+                  (s.mfa_enabled OR COALESCE(c.two_factor_enabled, false)) AS mfa_enabled,
+                  s.last_login, s.last_login_ip, s.created_at, s.updated_at, s.password_hash
+           FROM staff s
+           LEFT JOIN customers c ON LOWER(c.email) = LOWER(s.email) OR s.external_id = ('customer_' || c.id::text)
+           ORDER BY s.created_at"#,
+    )
+    .fetch_all(&state.db)
+    .await?;
 
     let roles: Vec<Role> = sqlx::query_as("SELECT * FROM roles")
         .fetch_all(&state.db)
@@ -131,11 +140,21 @@ pub(crate) async fn me(
     State(state): State<AppState>,
 ) -> Result<Json<StaffWithRole>, ApiError> {
     // No permission check needed — every staff member can read their own profile
-    let staff: Staff = sqlx::query_as("SELECT * FROM staff WHERE id = $1")
-        .bind(auth.0.sub)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or(ApiError::NotFound("staff not found".into()))?;
+    let staff: Staff = sqlx::query_as(
+        r#"SELECT s.id, s.external_id, s.username, s.first_name, s.last_name, s.email,
+                  (s.email_verified OR COALESCE(c.email_verified, false)) AS email_verified,
+                  s.avatar_url, s.role_id,
+                  (s.mfa_enabled OR COALESCE(c.two_factor_enabled, false)) AS mfa_enabled,
+                  s.last_login, s.last_login_ip, s.created_at, s.updated_at, s.password_hash
+           FROM staff s
+           LEFT JOIN customers c ON LOWER(c.email) = LOWER(s.email) OR s.external_id = ('customer_' || c.id::text)
+           WHERE s.id = $1
+           LIMIT 1"#,
+    )
+    .bind(auth.0.sub)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(ApiError::NotFound("staff not found".into()))?;
 
     let role: Role = sqlx::query_as("SELECT * FROM roles WHERE id = $1")
         .bind(staff.role_id)
@@ -309,6 +328,14 @@ pub(crate) async fn delete_role(
     Path(id): Path<Uuid>,
 ) -> Result<Json<()>, ApiError> {
     crate::require_permission!(auth, state, "rbac.manage");
+    let caller_perms = fetch_caller_permissions(&state.db, auth.0.sub).await?;
+    let existing_role: Role = sqlx::query_as("SELECT * FROM roles WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::NotFound("role not found".into()))?;
+    ensure_role_assignable(&caller_perms, &existing_role.permissions)?;
+
     let staff_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM staff WHERE role_id = $1")
         .bind(id)
         .fetch_one(&state.db)
@@ -356,6 +383,7 @@ pub(crate) struct CreateStaff {
         (status = 403, description = "Forbidden role assignment", body = ErrorResponse)
     )
 )]
+#[allow(clippy::type_complexity)]
 pub(crate) async fn create_staff(
     auth: AuthAdmin,
     State(state): State<AppState>,
@@ -371,22 +399,55 @@ pub(crate) async fn create_staff(
         .ok_or_else(|| ApiError::BadRequest("Invalid role_id".into()))?;
     ensure_role_assignable(&caller_perms, &target_role.permissions)?;
 
-    let ext_id = payload
-        .external_id
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| format!("local_{}", Uuid::now_v7()));
     validate_required_string(&payload.username, "Username")?;
     let email = payload.email.trim().to_string();
     validate_email(&email)?;
 
-    let password_hash = match payload.password {
+    // If a VaultScope customer account with this email exists, share its credentials & 2FA
+    let linked_customer: Option<(Uuid, Option<String>, bool, bool, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, password_hash, email_verified, two_factor_enabled, totp_secret
+             FROM customers
+             WHERE LOWER(email) = LOWER($1)
+             LIMIT 1",
+        )
+        .bind(&email)
+        .fetch_optional(&state.db)
+        .await?;
+
+    let ext_id = payload
+        .external_id
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| linked_customer.as_ref().map(|(cid, _, _, _, _)| format!("customer_{cid}")))
+        .unwrap_or_else(|| format!("local_{}", Uuid::now_v7()));
+
+    let explicit_password_hash = match payload.password {
         Some(pw) if !pw.is_empty() => Some(hash_staff_password(pw).await?),
         _ => None,
     };
 
+    let (password_hash, email_verified, mfa_enabled, totp_secret) =
+        if let Some((cid, cust_pw, cust_verified, cust_2fa, cust_totp)) = linked_customer {
+            if let Some(ref new_hash) = explicit_password_hash {
+                let _ = sqlx::query("UPDATE customers SET password_hash = COALESCE(password_hash, $1), updated_at = now() WHERE id = $2")
+                    .bind(new_hash)
+                    .bind(cid)
+                    .execute(&state.db)
+                    .await;
+            }
+            (
+                explicit_password_hash.or(cust_pw),
+                cust_verified,
+                cust_2fa,
+                cust_totp,
+            )
+        } else {
+            (explicit_password_hash, false, false, None)
+        };
+
     let staff: Staff = sqlx::query_as(
-        r#"INSERT INTO staff (id, external_id, first_name, last_name, username, email, role_id, password_hash)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        r#"INSERT INTO staff (id, external_id, first_name, last_name, username, email, email_verified, role_id, password_hash, mfa_enabled, totp_secret)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
            RETURNING *"#,
     )
     .bind(Uuid::now_v7())
@@ -395,8 +456,11 @@ pub(crate) async fn create_staff(
     .bind(payload.last_name.trim())
     .bind(payload.username.trim())
     .bind(&email)
+    .bind(email_verified)
     .bind(payload.role_id)
     .bind(password_hash)
+    .bind(mfa_enabled)
+    .bind(totp_secret)
     .fetch_one(&state.db)
     .await?;
 
@@ -510,12 +574,23 @@ pub(crate) async fn update_staff(
     .bind(trimmed_username)
     .bind(trimmed_email)
     .bind(payload.role_id)
-    .bind(password_hash)
+    .bind(&password_hash)
     .bind(bump_auth)
     .bind(id)
     .fetch_optional(&state.db)
     .await?
     .ok_or(ApiError::NotFound("staff not found".into()))?;
+
+    if let Some(ref new_hash) = password_hash {
+        let _ = sqlx::query(
+            "UPDATE customers SET password_hash = $1, auth_version = auth_version + 1, updated_at = now() WHERE LOWER(email) = LOWER($2) OR ('customer_' || id::text) = $3",
+        )
+        .bind(new_hash)
+        .bind(&staff.email)
+        .bind(&staff.external_id)
+        .execute(&state.db)
+        .await;
+    }
 
     Ok(Json(staff))
 }
@@ -679,8 +754,21 @@ pub(crate) async fn upload_avatar(
     Path(id): Path<Uuid>,
     mut multipart: Multipart,
 ) -> Result<Json<Staff>, ApiError> {
+    let target_staff: Staff = sqlx::query_as("SELECT * FROM staff WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::NotFound("staff not found".into()))?;
+
     if auth.0.sub != id {
         crate::require_permission!(auth, state, "staff.manage");
+        let caller_perms = fetch_caller_permissions(&state.db, auth.0.sub).await?;
+        let target_role: Role = sqlx::query_as("SELECT * FROM roles WHERE id = $1")
+            .bind(target_staff.role_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(ApiError::Forbidden)?;
+        ensure_role_assignable(&caller_perms, &target_role.permissions)?;
     }
 
     let mut avatar_url = String::new();

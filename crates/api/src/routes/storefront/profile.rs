@@ -140,6 +140,11 @@ pub(crate) async fn update_profile(
                     "Username exceeds maximum length of 150 characters".into(),
                 ));
             }
+            if trimmed.contains('@') {
+                return Err(ApiError::BadRequest(
+                    "Username cannot contain '@'".into(),
+                ));
+            }
             Some(trimmed.to_string())
         }
         None => None,
@@ -539,11 +544,22 @@ pub(crate) async fn setup_mfa(
     // Store encrypted secret on customer
     let encrypted_secret =
         crate::routes::auth::encrypt_totp_secret(&state.config.encryption_key_bytes(), &secret_base32)?;
-    sqlx::query("UPDATE customers SET totp_secret = $1 WHERE id = $2")
-        .bind(&encrypted_secret)
-        .bind(auth.0.sub)
-        .execute(&state.db)
-        .await?;
+    sqlx::query(
+        "UPDATE customers SET totp_secret = $1 WHERE id = $2 AND two_factor_enabled = false",
+    )
+    .bind(&encrypted_secret)
+    .bind(auth.0.sub)
+    .execute(&state.db)
+    .await?;
+
+    let _ = sqlx::query(
+        "UPDATE staff SET totp_secret = $1, updated_at = now() WHERE (LOWER(email) = LOWER($2) OR external_id = $3) AND mfa_enabled = false",
+    )
+    .bind(&encrypted_secret)
+    .bind(&customer.email)
+    .bind(format!("customer_{}", auth.0.sub))
+    .execute(&state.db)
+    .await;
 
     Ok(Json(serde_json::json!({
         "secret": secret_base32,
@@ -690,6 +706,15 @@ pub(crate) async fn enable_mfa(
     .execute(&mut *tx)
     .await?;
 
+    sqlx::query(
+        "UPDATE staff SET mfa_enabled = true, totp_secret = $1, auth_version = auth_version + 1, updated_at = now() WHERE LOWER(email) = LOWER($2) OR external_id = $3",
+    )
+    .bind(&encrypted_secret)
+    .bind(&customer.email)
+    .bind(format!("customer_{}", auth.0.sub))
+    .execute(&mut *tx)
+    .await?;
+
     sqlx::query("DELETE FROM customer_mfa_recovery_codes WHERE customer_id = $1")
         .bind(auth.0.sub)
         .execute(&mut *tx)
@@ -765,16 +790,12 @@ pub(crate) async fn disable_mfa(
                 ApiError::BadRequest(
                     "Current password and a valid 2FA or recovery code are required to disable two-factor authentication.".into(),
                 )
-            })?
-            .to_string();
-        let hash_owned = hash_str.clone();
-        let pw_valid = tokio::task::spawn_blocking(move || bcrypt::verify(&pw, &hash_owned))
-            .await
-            .map_err(|e| ApiError::Internal(format!("Password verification task failed: {e}")))?
-            .unwrap_or(false);
+            })?;
+        let pw_valid =
+            crate::routes::auth::verify_password_constant_time(pw, Some(hash_str.as_str())).await?;
         if !pw_valid {
             return Err(ApiError::BadRequest(
-                "Invalid current password, 2FA code, or recovery code to disable two-factor authentication.".into(),
+                "Invalid account password, 2FA code, or recovery code to disable two-factor authentication.".into(),
             ));
         }
     }
@@ -853,6 +874,14 @@ pub(crate) async fn disable_mfa(
         "UPDATE customers SET two_factor_enabled = false, totp_secret = NULL, auth_version = auth_version + 1, updated_at = now() WHERE id = $1",
     )
     .bind(auth.0.sub)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE staff SET mfa_enabled = false, totp_secret = NULL, auth_version = auth_version + 1, updated_at = now() WHERE LOWER(email) = LOWER($1) OR external_id = $2",
+    )
+    .bind(&customer.email)
+    .bind(format!("customer_{}", auth.0.sub))
     .execute(&mut *tx)
     .await?;
 
@@ -996,7 +1025,7 @@ pub(crate) async fn delete_own_account(
         .ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
 
     let active_services: (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM services WHERE customer_id = $1 AND status IN ('running'::service_status, 'pending'::service_status)",
+        "SELECT count(*) FROM services WHERE customer_id = $1 AND status IN ('running'::service_status, 'pending'::service_status, 'suspended'::service_status)",
     )
     .bind(customer_id)
     .fetch_one(&mut *tx)
@@ -1004,7 +1033,20 @@ pub(crate) async fn delete_own_account(
 
     if active_services.0 > 0 {
         return Err(ApiError::BadRequest(
-            "Cannot delete account while you have active running or pending services. Please terminate your services first.".into(),
+            "Cannot delete account while you have active running, pending, or suspended services. Please terminate your services first.".into(),
+        ));
+    }
+
+    let unpaid_invoices: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM invoices WHERE customer_id = $1 AND status IN ('pending'::invoice_status, 'overdue'::invoice_status)",
+    )
+    .bind(customer_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if unpaid_invoices.0 > 0 {
+        return Err(ApiError::BadRequest(
+            "Cannot delete account while you have open unpaid or overdue invoices. Please settle all open invoices first.".into(),
         ));
     }
 
@@ -1175,11 +1217,11 @@ pub(crate) async fn delete_own_account(
         state.db.clone(),
         Some(customer_id),
         vaultscope_db::models::ActorType::Customer,
-        customer.name.clone(),
+        "Deleted Customer".to_string(),
         "customer".to_string(),
         "account_closed".to_string(),
-        customer.email.clone(),
-        format!("Customer self-service account closure: {}", customer.email),
+        customer_id.to_string(),
+        format!("Customer self-service account closure (id: {})", customer_id),
     );
 
     Ok(Json(serde_json::json!({

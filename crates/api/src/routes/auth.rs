@@ -144,7 +144,7 @@ pub(crate) async fn check_and_mark_totp_used(
     }
 }
 
-async fn verify_password_constant_time(
+pub(crate) async fn verify_password_constant_time(
     password: &str,
     stored_hash: Option<&str>,
 ) -> Result<bool, ApiError> {
@@ -212,6 +212,7 @@ pub enum LoginOutcome {
         (status = 401, description = "Invalid credentials", body = ErrorResponse)
     )
 )]
+#[allow(clippy::type_complexity)]
 pub(crate) async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -232,59 +233,217 @@ pub(crate) async fn login(
     let is_admin = payload.audience == "admin";
 
     if is_admin {
-        validate_email(&identifier)?;
-        let staff: Option<(Uuid, String, String, Option<String>, bool, bool, Option<String>, i64)> =
-            sqlx::query_as(
-                "SELECT s.id, s.email, r.name, s.password_hash, s.email_verified, s.mfa_enabled, s.totp_secret, s.auth_version
-                 FROM staff s
-                 JOIN roles r ON s.role_id = r.id
-                 WHERE LOWER(s.email) = LOWER($1)
-                 LIMIT 1",
-            )
-            .bind(&identifier)
-            .fetch_optional(&state.db)
-            .await?;
+        if identifier.contains('@') {
+            validate_email(&identifier)?;
+        }
+        let staff: Option<(
+            Uuid,
+            String,
+            String,
+            Option<String>,
+            bool,
+            bool,
+            Option<String>,
+            i64,
+            String,
+        )> = sqlx::query_as(
+            "SELECT s.id, s.email, r.name, s.password_hash, s.email_verified, s.mfa_enabled, s.totp_secret, s.auth_version, s.external_id
+             FROM staff s
+             JOIN roles r ON s.role_id = r.id
+             WHERE (LOWER(s.email) = LOWER($1) OR (s.username <> '' AND LOWER(s.username) = LOWER($1)))
+             LIMIT 1",
+        )
+        .bind(&identifier)
+        .fetch_optional(&state.db)
+        .await?;
 
-        let stored_hash = staff
-            .as_ref()
-            .and_then(|row| row.3.as_deref());
-        if !verify_password_constant_time(&payload.password, stored_hash).await? {
+        let linked_customer: Option<(Uuid, String, Option<String>, bool, Option<String>)> =
+            if let Some((_, ref s_email, _, _, _, _, _, _, ref s_ext_id)) = staff {
+                sqlx::query_as(
+                    "SELECT id, email, password_hash, two_factor_enabled, totp_secret
+                     FROM customers
+                     WHERE LOWER(email) = LOWER($1) OR ('customer_' || id::text) = $2
+                     LIMIT 1",
+                )
+                .bind(s_email)
+                .bind(s_ext_id)
+                .fetch_optional(&state.db)
+                .await?
+            } else {
+                None
+            };
+
+        let staff_hash = staff.as_ref().and_then(|row| row.3.as_deref());
+        let customer_hash = linked_customer.as_ref().and_then(|row| row.2.as_deref());
+
+        let mut password_ok = verify_password_constant_time(&payload.password, staff_hash).await?;
+        let mut matched_via_customer_hash = false;
+        if !password_ok
+            && customer_hash.is_some()
+            && customer_hash != staff_hash
+            && verify_password_constant_time(&payload.password, customer_hash).await?
+        {
+            password_ok = true;
+            matched_via_customer_hash = true;
+        }
+
+        if !password_ok {
             return Err(ApiError::Unauthorized);
         }
 
-        let (staff_id, email, role_name, _, email_verified, mfa_enabled, totp_secret, auth_version) =
-            staff.ok_or(ApiError::Unauthorized)?;
+        let (
+            staff_id,
+            email,
+            role_name,
+            _,
+            email_verified,
+            mfa_enabled,
+            totp_secret,
+            auth_version,
+            _,
+        ) = staff.ok_or(ApiError::Unauthorized)?;
 
-        if mfa_enabled {
-            if let Some(ref secret_stored) = totp_secret.filter(|s| !s.trim().is_empty()) {
-                let provided_code = payload
-                    .totp_code
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
+        let (linked_customer_id, linked_customer_email, linked_customer_pw, linked_customer_2fa, linked_customer_totp) =
+            match linked_customer {
+                Some((cid, cemail, cpw, c2fa, ctotp)) => (Some(cid), Some(cemail), cpw, c2fa, ctotp),
+                None => (None, None, None, false, None),
+            };
 
-                let Some(raw_code) = provided_code else {
-                    return Ok(Json(json!({
-                        "mfa_required": true,
-                        "email": email,
-                        "message": "Two-factor authentication code required"
-                    })));
-                };
+        // Keep staff password_hash synchronized if authenticated via linked VaultScope customer credentials
+        if matched_via_customer_hash {
+            if let Some(ref cpw) = linked_customer_pw {
+                let _ = sqlx::query("UPDATE staff SET password_hash = $1, updated_at = now() WHERE id = $2")
+                    .bind(cpw)
+                    .bind(staff_id)
+                    .execute(&state.db)
+                    .await;
+            }
+        }
 
-                let secret_base32 =
-                    decrypt_totp_secret(&state.config.encryption_key_bytes(), secret_stored)?;
-                let valid_clean = verify_totp_code(&secret_base32, &email, raw_code)?;
-                let mut mfa_ok = false;
-                if let Some(clean_code) = valid_clean {
-                    if check_and_mark_totp_used(&state, staff_id, &clean_code).await {
-                        mfa_ok = true;
+        let staff_secret_clean = totp_secret.filter(|s| !s.trim().is_empty());
+        let customer_secret_clean = linked_customer_totp.filter(|s| !s.trim().is_empty());
+        let effective_mfa_enabled = mfa_enabled || linked_customer_2fa;
+
+        // Backfill staff MFA columns if linked VaultScope customer has 2FA enabled
+        if linked_customer_2fa && (!mfa_enabled || staff_secret_clean.is_none()) {
+            if let Some(ref c_sec) = customer_secret_clean {
+                let _ = sqlx::query(
+                    "UPDATE staff SET mfa_enabled = true, totp_secret = COALESCE(NULLIF(trim(totp_secret), ''), $1), updated_at = now() WHERE id = $2",
+                )
+                .bind(c_sec)
+                .bind(staff_id)
+                .execute(&state.db)
+                .await;
+            }
+        }
+
+        if effective_mfa_enabled {
+            let candidate_secrets: Vec<(&str, &str)> = {
+                let mut v = Vec::new();
+                if let Some(ref c_sec) = customer_secret_clean {
+                    if linked_customer_2fa {
+                        v.push((c_sec.as_str(), linked_customer_email.as_deref().unwrap_or(&email)));
                     }
                 }
-                if !mfa_ok {
-                    return Err(ApiError::BadRequest(
-                        "Invalid two-factor authentication code".into(),
-                    ));
+                if let Some(ref s_sec) = staff_secret_clean {
+                    if v.iter().all(|(existing, _)| *existing != s_sec.as_str()) {
+                        v.push((s_sec.as_str(), email.as_str()));
+                    }
                 }
+                if v.is_empty() {
+                    if let Some(ref c_sec) = customer_secret_clean {
+                        v.push((c_sec.as_str(), linked_customer_email.as_deref().unwrap_or(&email)));
+                    }
+                }
+                v
+            };
+
+            if candidate_secrets.is_empty() {
+                tracing::error!(staff_id = %staff_id, "Admin MFA enabled without configured TOTP secret");
+                return Err(ApiError::Unauthorized);
+            }
+
+            let provided_code = payload
+                .totp_code
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            let Some(raw_code) = provided_code else {
+                return Ok(Json(json!({
+                    "mfa_required": true,
+                    "email": email,
+                    "message": "Two-factor authentication code required"
+                })));
+            };
+
+            let mut mfa_ok = false;
+            for (secret_stored, acct_email) in candidate_secrets {
+                if let Ok(secret_base32) =
+                    decrypt_totp_secret(&state.config.encryption_key_bytes(), secret_stored)
+                {
+                    if let Ok(Some(clean_code)) = verify_totp_code(&secret_base32, acct_email, raw_code) {
+                        let staff_fresh = check_and_mark_totp_used(&state, staff_id, &clean_code).await;
+                        let cust_fresh = match linked_customer_id {
+                            Some(cid) => check_and_mark_totp_used(&state, cid, &clean_code).await,
+                            None => true,
+                        };
+                        if staff_fresh && cust_fresh {
+                            mfa_ok = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Also support single-use recovery codes from the linked VaultScope customer account
+            if !mfa_ok {
+                if let Some(cid) = linked_customer_id {
+                    let normalized = raw_code.replace(['-', ' '], "").to_uppercase();
+                    if !normalized.is_empty() {
+                        let mut hasher = Sha256::new();
+                        hasher.update(normalized.as_bytes());
+                        let code_hash = hex::encode(hasher.finalize());
+
+                        let consumed: Option<Uuid> = sqlx::query_scalar(
+                            r#"WITH target AS (
+                                   SELECT id FROM customer_mfa_recovery_codes
+                                   WHERE customer_id = $1 AND code_hash = $2 AND used_at IS NULL
+                                   LIMIT 1
+                                   FOR UPDATE SKIP LOCKED
+                               )
+                               UPDATE customer_mfa_recovery_codes r
+                               SET used_at = now()
+                               FROM target
+                               WHERE r.id = target.id AND r.used_at IS NULL
+                               RETURNING r.id"#,
+                        )
+                        .bind(cid)
+                        .bind(&code_hash)
+                        .fetch_optional(&state.db)
+                        .await?;
+
+                        if consumed.is_some() {
+                            mfa_ok = true;
+                            crate::activity::spawn_record(
+                                state.db.clone(),
+                                Some(staff_id),
+                                vaultscope_db::models::ActorType::Staff,
+                                email.clone(),
+                                "security".to_string(),
+                                "2fa_recovery_used".to_string(),
+                                "CAMOS Admin".to_string(),
+                                format!("Shared recovery code used during CAMOS admin login for {}", email),
+                            );
+                        }
+                    }
+                }
+            }
+
+            if !mfa_ok {
+                return Err(ApiError::BadRequest(
+                    "Invalid two-factor authentication code".into(),
+                ));
             }
         }
 
@@ -412,14 +571,17 @@ pub(crate) async fn login(
                     let code_hash = hex::encode(hasher.finalize());
 
                     let consumed: Option<Uuid> = sqlx::query_scalar(
-                        r#"UPDATE customer_mfa_recovery_codes
-                           SET used_at = now()
-                           WHERE id = (
+                        r#"WITH target AS (
                                SELECT id FROM customer_mfa_recovery_codes
                                WHERE customer_id = $1 AND code_hash = $2 AND used_at IS NULL
                                LIMIT 1
+                               FOR UPDATE SKIP LOCKED
                            )
-                           RETURNING id"#,
+                           UPDATE customer_mfa_recovery_codes r
+                           SET used_at = now()
+                           FROM target
+                           WHERE r.id = target.id AND r.used_at IS NULL
+                           RETURNING r.id"#,
                     )
                     .bind(customer_id)
                     .bind(&code_hash)
@@ -631,14 +793,23 @@ pub(crate) async fn admin_mfa_setup(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
-    let row: Option<(String, bool)> =
-        sqlx::query_as("SELECT email, mfa_enabled FROM staff WHERE id = $1")
+    let row: Option<(String, bool, String)> =
+        sqlx::query_as("SELECT email, mfa_enabled, external_id FROM staff WHERE id = $1")
             .bind(auth.0.sub)
             .fetch_optional(&state.db)
             .await?;
 
-    let (email, mfa_enabled) = row.ok_or_else(|| ApiError::NotFound("Staff account not found".into()))?;
-    if mfa_enabled {
+    let (email, mfa_enabled, external_id) =
+        row.ok_or_else(|| ApiError::NotFound("Staff account not found".into()))?;
+    let linked_cust_2fa: Option<bool> = sqlx::query_scalar(
+        "SELECT two_factor_enabled FROM customers WHERE LOWER(email) = LOWER($1) OR ('customer_' || id::text) = $2 LIMIT 1",
+    )
+    .bind(&email)
+    .bind(&external_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if mfa_enabled || linked_cust_2fa.unwrap_or(false) {
         return Err(ApiError::BadRequest(
             "Two-factor authentication is already enabled. Disable it first before reconfiguring.".into(),
         ));
@@ -657,7 +828,7 @@ pub(crate) async fn admin_mfa_setup(
         30,
         secret_bytes,
         Some("VaultScope Admin".to_string()),
-        email,
+        email.clone(),
     )
     .map_err(|e| ApiError::Internal(format!("TOTP init error: {e}")))?;
 
@@ -673,6 +844,15 @@ pub(crate) async fn admin_mfa_setup(
         .bind(auth.0.sub)
         .execute(&state.db)
         .await?;
+
+    let _ = sqlx::query(
+        "UPDATE customers SET totp_secret = $1, updated_at = now() WHERE (LOWER(email) = LOWER($2) OR ('customer_' || id::text) = $3) AND two_factor_enabled = false",
+    )
+    .bind(&encrypted_secret)
+    .bind(&email)
+    .bind(&external_id)
+    .execute(&state.db)
+    .await;
 
     Ok(Json(json!({
         "secret": secret_base32,
@@ -698,13 +878,13 @@ pub(crate) async fn admin_mfa_enable(
     State(state): State<AppState>,
     Json(payload): Json<AdminMfaCodePayload>,
 ) -> Result<Json<Value>, ApiError> {
-    let row: Option<(String, bool, Option<String>)> =
-        sqlx::query_as("SELECT email, mfa_enabled, totp_secret FROM staff WHERE id = $1")
+    let row: Option<(String, bool, Option<String>, String)> =
+        sqlx::query_as("SELECT email, mfa_enabled, totp_secret, external_id FROM staff WHERE id = $1")
             .bind(auth.0.sub)
             .fetch_optional(&state.db)
             .await?;
 
-    let (email, mfa_enabled, totp_secret) =
+    let (email, mfa_enabled, totp_secret, external_id) =
         row.ok_or_else(|| ApiError::NotFound("Staff account not found".into()))?;
     if mfa_enabled {
         return Err(ApiError::BadRequest(
@@ -738,6 +918,16 @@ pub(crate) async fn admin_mfa_enable(
     .execute(&state.db)
     .await?;
 
+    // Synchronize 2FA activation to linked VaultScope customer account if present
+    let _ = sqlx::query(
+        "UPDATE customers SET two_factor_enabled = true, totp_secret = $1, auth_version = auth_version + 1, updated_at = now() WHERE LOWER(email) = LOWER($2) OR ('customer_' || id::text) = $3",
+    )
+    .bind(&encrypted_secret)
+    .bind(&email)
+    .bind(&external_id)
+    .execute(&state.db)
+    .await;
+
     Ok(Json(json!({
         "ok": true,
         "message": "Admin two-factor authentication successfully activated."
@@ -755,27 +945,39 @@ pub(crate) async fn admin_mfa_enable(
         (status = 400, description = "Invalid password or TOTP code", body = ErrorResponse)
     )
 )]
+#[allow(clippy::type_complexity)]
 pub(crate) async fn admin_mfa_disable(
     auth: AuthAdmin,
     State(state): State<AppState>,
     Json(payload): Json<AdminMfaDisablePayload>,
 ) -> Result<Json<Value>, ApiError> {
-    let row: Option<(String, bool, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT email, mfa_enabled, totp_secret, password_hash FROM staff WHERE id = $1",
+    let row: Option<(String, bool, Option<String>, Option<String>, String)> = sqlx::query_as(
+        "SELECT email, mfa_enabled, totp_secret, password_hash, external_id FROM staff WHERE id = $1",
     )
     .bind(auth.0.sub)
     .fetch_optional(&state.db)
     .await?;
 
-    let (email, mfa_enabled, totp_secret, password_hash) =
+    let (email, mfa_enabled, totp_secret, password_hash, external_id) =
         row.ok_or_else(|| ApiError::NotFound("Staff account not found".into()))?;
-    if !mfa_enabled {
+
+    let linked_cust: Option<(Uuid, Option<String>, bool, Option<String>)> = sqlx::query_as(
+        "SELECT id, password_hash, two_factor_enabled, totp_secret FROM customers WHERE LOWER(email) = LOWER($1) OR ('customer_' || id::text) = $2 LIMIT 1",
+    )
+    .bind(&email)
+    .bind(&external_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let cust_2fa = linked_cust.as_ref().is_some_and(|c| c.2);
+    if !mfa_enabled && !cust_2fa {
         return Err(ApiError::BadRequest(
             "Two-factor authentication is not currently enabled.".into(),
         ));
     }
 
-    if let Some(ref hash_str) = password_hash {
+    let cust_pw_hash = linked_cust.as_ref().and_then(|c| c.1.as_deref());
+    if password_hash.is_some() || cust_pw_hash.is_some() {
         let pw = payload
             .password
             .as_deref()
@@ -785,17 +987,23 @@ pub(crate) async fn admin_mfa_disable(
                     "Current password and a valid 2FA code are required to disable two-factor authentication.".into(),
                 )
             })?;
-        if !verify_password_constant_time(pw, Some(hash_str)).await? {
+        let mut pw_ok = verify_password_constant_time(pw, password_hash.as_deref()).await?;
+        if !pw_ok && cust_pw_hash.is_some() && cust_pw_hash != password_hash.as_deref() {
+            pw_ok = verify_password_constant_time(pw, cust_pw_hash).await?;
+        }
+        if !pw_ok {
             return Err(ApiError::BadRequest(
                 "Invalid current password or 2FA code to disable two-factor authentication.".into(),
             ));
         }
     }
 
-    let secret_stored = totp_secret.ok_or_else(|| {
-        ApiError::BadRequest("No TOTP secret configured on account.".into())
-    })?;
-    let secret_base32 = decrypt_totp_secret(&state.config.encryption_key_bytes(), &secret_stored)?;
+    let effective_secret = totp_secret
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| linked_cust.as_ref().and_then(|c| c.3.clone()).filter(|s| !s.trim().is_empty()))
+        .ok_or_else(|| ApiError::BadRequest("No TOTP secret configured on account.".into()))?;
+
+    let secret_base32 = decrypt_totp_secret(&state.config.encryption_key_bytes(), &effective_secret)?;
     let Some(clean_code) = verify_totp_code(&secret_base32, &email, &payload.code)? else {
         return Err(ApiError::BadRequest(
             "Invalid 2FA code to disable two-factor authentication.".into(),
@@ -814,6 +1022,19 @@ pub(crate) async fn admin_mfa_disable(
     .bind(auth.0.sub)
     .execute(&state.db)
     .await?;
+
+    if let Some((cid, _, _, _)) = linked_cust {
+        let _ = sqlx::query(
+            "UPDATE customers SET two_factor_enabled = false, totp_secret = NULL, auth_version = auth_version + 1, updated_at = now() WHERE id = $1",
+        )
+        .bind(cid)
+        .execute(&state.db)
+        .await;
+        let _ = sqlx::query("DELETE FROM customer_mfa_recovery_codes WHERE customer_id = $1")
+            .bind(cid)
+            .execute(&state.db)
+            .await;
+    }
 
     Ok(Json(json!({
         "ok": true,
@@ -859,7 +1080,27 @@ pub(crate) async fn register(
     validate_required_string(&payload.country, "Country")?;
     validate_email(&payload.email)?;
     validate_string_length(&payload.username, "Username", 150)?;
+    if payload.username.contains('@') {
+        return Err(ApiError::BadRequest(
+            "Username cannot contain '@'".into(),
+        ));
+    }
     validate_string_length(&payload.name, "Name", 255)?;
+    validate_string_length(&payload.address, "Address", 500)?;
+    validate_string_length(&payload.city, "City", 150)?;
+    validate_string_length(&payload.country, "Country", 100)?;
+    if let Some(ref company) = payload.company {
+        validate_string_length(company, "Company", 255)?;
+    }
+    if let Some(ref postal) = payload.postal_code {
+        validate_string_length(postal, "Postal code", 32)?;
+    }
+    if let Some(ref phone) = payload.phone {
+        validate_string_length(phone, "Phone", 64)?;
+    }
+    if let Some(ref vat_id) = payload.vat_id {
+        validate_string_length(vat_id, "VAT ID", 32)?;
+    }
 
     // Abuse prevention: block known disposable email domains
     let email_lower = payload.email.to_lowercase();
@@ -988,10 +1229,11 @@ fn dispatch_plain_email(
         }
     };
 
+    let safe_subject = crate::mailer::sanitize_email_header(&subject);
     let email = match lettre::Message::builder()
         .from(from_mailbox)
         .to(to_mailbox)
-        .subject(subject.clone())
+        .subject(safe_subject.clone())
         .body(body)
     {
         Ok(msg) => msg,
@@ -1153,27 +1395,29 @@ pub(crate) async fn verify_email(
     validate_required_string(&payload.token, "Token")?;
     let token = payload.token.trim();
 
-    // 1. Check primary customer verification token
-    let customer: Option<(Uuid, String, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT id, email, verification_token_expires_at FROM customers WHERE verification_token = $1 LIMIT 1",
+    // 1. Atomically verify and consume primary customer verification token
+    let verified_customer: Option<(Uuid, String)> = sqlx::query_as(
+        r#"UPDATE customers
+           SET email_verified = true,
+               verification_token = NULL,
+               verification_token_expires_at = NULL,
+               updated_at = now()
+           WHERE verification_token = $1
+             AND (verification_token_expires_at IS NULL OR verification_token_expires_at > now())
+           RETURNING id, email"#,
     )
     .bind(token)
     .fetch_optional(&state.db)
     .await?;
 
-    if let Some((customer_id, email, expires_at)) = customer {
-        if expires_at.is_some_and(|exp| exp < Utc::now()) {
-            return Err(ApiError::BadRequest(
-                "Invalid or expired verification token.".into(),
-            ));
-        }
-
-        sqlx::query(
-            "UPDATE customers SET email_verified = true, verification_token = NULL, verification_token_expires_at = NULL, updated_at = now() WHERE id = $1",
+    if let Some((customer_id, email)) = verified_customer {
+        let _ = sqlx::query(
+            "UPDATE staff SET email_verified = true, updated_at = now() WHERE LOWER(email) = LOWER($1) OR external_id = $2",
         )
-        .bind(customer_id)
+        .bind(&email)
+        .bind(format!("customer_{customer_id}"))
         .execute(&state.db)
-        .await?;
+        .await;
 
         tracing::info!("Customer primary email verified successfully: {}", email);
 
@@ -1183,28 +1427,22 @@ pub(crate) async fn verify_email(
         })));
     }
 
-    // 2. Check billing CC verification token
-    let billing_email: Option<(Uuid, String, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT id, email, verification_token_expires_at FROM customer_billing_emails WHERE verification_token = $1 LIMIT 1",
+    // 2. Atomically verify and consume billing CC verification token
+    let verified_billing: Option<(Uuid, String)> = sqlx::query_as(
+        r#"UPDATE customer_billing_emails
+           SET verified = true,
+               verification_token = NULL,
+               verification_token_expires_at = NULL,
+               verified_at = now()
+           WHERE verification_token = $1
+             AND (verification_token_expires_at IS NULL OR verification_token_expires_at > now())
+           RETURNING id, email"#,
     )
     .bind(token)
     .fetch_optional(&state.db)
     .await?;
 
-    if let Some((id, email, expires_at)) = billing_email {
-        if expires_at.is_some_and(|exp| exp < Utc::now()) {
-            return Err(ApiError::BadRequest(
-                "Invalid or expired verification token.".into(),
-            ));
-        }
-
-        sqlx::query(
-            "UPDATE customer_billing_emails SET verified = true, verification_token = NULL, verification_token_expires_at = NULL, verified_at = now() WHERE id = $1",
-        )
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-
+    if let Some((_id, email)) = verified_billing {
         tracing::info!("Customer billing CC email verified successfully: {}", email);
 
         return Ok(Json(json!({

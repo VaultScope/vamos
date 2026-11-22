@@ -200,11 +200,13 @@ pub(crate) async fn resend_verification_email(
     let token_bytes: [u8; 32] = rand::random();
     let verification_token = hex::encode(token_bytes);
 
-    sqlx::query("UPDATE customers SET verification_token = $1, updated_at = now() WHERE id = $2")
-        .bind(&verification_token)
-        .bind(id)
-        .execute(&state.db)
-        .await?;
+    sqlx::query(
+        "UPDATE customers SET verification_token = $1, verification_token_expires_at = now() + interval '24 hours', updated_at = now() WHERE id = $2",
+    )
+    .bind(&verification_token)
+    .bind(id)
+    .execute(&state.db)
+    .await?;
 
     crate::routes::auth::send_verification_email(
         &state.config,
@@ -242,6 +244,7 @@ pub(crate) async fn mark_email_verified(
         r#"UPDATE customers
            SET email_verified = true,
                verification_token = NULL,
+               verification_token_expires_at = NULL,
                updated_at = now()
            WHERE id = $1
            RETURNING *"#
@@ -250,6 +253,14 @@ pub(crate) async fn mark_email_verified(
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
+
+    let _ = sqlx::query(
+        "UPDATE staff SET email_verified = true, updated_at = now() WHERE LOWER(email) = LOWER($1) OR external_id = $2",
+    )
+    .bind(&customer.email)
+    .bind(format!("customer_{id}"))
+    .execute(&state.db)
+    .await;
 
     Ok(Json(customer))
 }
@@ -309,23 +320,17 @@ pub(crate) async fn promote_to_staff(
         .ok_or_else(|| ApiError::BadRequest("Invalid role_id".into()))?;
 
     let caller_is_owner = caller_role.permissions.iter().any(|p| p == "*");
-    let caller_has_rbac_manage = caller_role.permissions.iter().any(|p| p == "rbac.manage");
     let target_is_owner = target_role.permissions.iter().any(|p| p == "*")
         || target_role.name.eq_ignore_ascii_case("Owner")
         || target_role.name.eq_ignore_ascii_case("Super Admin");
 
-    if target_is_owner && !caller_is_owner && !caller_has_rbac_manage {
+    if target_is_owner && !caller_is_owner {
         return Err(ApiError::Forbidden);
     }
-    if !caller_is_owner && !caller_has_rbac_manage {
-        let has_all_target_perms = target_role
-            .permissions
-            .iter()
-            .all(|perm| caller_role.permissions.contains(perm));
-        if !has_all_target_perms {
-            return Err(ApiError::Forbidden);
-        }
-    }
+    crate::routes::admin::staff::ensure_role_assignable(
+        &caller_role.permissions,
+        &target_role.permissions,
+    )?;
 
     // Validate optional password up front before touching DB state
     let validated_password = match payload.password {
@@ -347,14 +352,41 @@ pub(crate) async fn promote_to_staff(
         .await?
         .ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
 
-    // 3. Check if staff already exists with this email
-    let existing_staff: Option<Staff> = sqlx::query_as("SELECT * FROM staff WHERE email = $1")
-        .bind(&customer.email)
-        .fetch_optional(&state.db)
-        .await?;
+    // Hash password if explicitly supplied, and keep customer + staff credentials shared
+    let explicit_password_hash = match validated_password {
+        Some(pw) => {
+            let hashed =
+                tokio::task::spawn_blocking(move || bcrypt::hash(pw, bcrypt::DEFAULT_COST))
+                    .await
+                    .map_err(|e| ApiError::Internal(e.to_string()))?
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+            sqlx::query("UPDATE customers SET password_hash = COALESCE(password_hash, $1), updated_at = now() WHERE id = $2")
+                .bind(&hashed)
+                .bind(customer.id)
+                .execute(&state.db)
+                .await?;
+            Some(hashed)
+        }
+        None => None,
+    };
+
+    let shared_password_hash = explicit_password_hash.or_else(|| customer.password_hash.clone());
+    let customer_ext_link = format!("customer_{}", customer.id);
+
+    // 3. Check if staff already exists with this email or customer external_id
+    let existing_staff: Option<Staff> = sqlx::query_as(
+        "SELECT * FROM staff WHERE LOWER(email) = LOWER($1) OR external_id = $2 LIMIT 1",
+    )
+    .bind(&customer.email)
+    .bind(&customer_ext_link)
+    .fetch_optional(&state.db)
+    .await?;
 
     if let Some(existing) = existing_staff {
-        if !caller_is_owner && !caller_has_rbac_manage {
+        if existing.id == auth.0.sub && existing.role_id != payload.role_id {
+            return Err(ApiError::Forbidden);
+        }
+        if !caller_is_owner {
             let existing_role: Option<Role> =
                 sqlx::query_as("SELECT * FROM roles WHERE id = $1")
                     .bind(existing.role_id)
@@ -367,12 +399,32 @@ pub(crate) async fn promote_to_staff(
                 if existing_is_owner {
                     return Err(ApiError::Forbidden);
                 }
+                crate::routes::admin::staff::ensure_role_assignable(
+                    &caller_role.permissions,
+                    &er.permissions,
+                )?;
             }
         }
         let updated: Staff = sqlx::query_as(
-            "UPDATE staff SET role_id = $1, updated_at = now() WHERE id = $2 RETURNING *"
+            r#"UPDATE staff
+               SET role_id = $1,
+                   password_hash = COALESCE($2, password_hash),
+                   email_verified = email_verified OR $3,
+                   mfa_enabled = mfa_enabled OR $4,
+                   totp_secret = CASE
+                       WHEN $4 AND $5 IS NOT NULL AND length(trim($5)) > 0 THEN $5
+                       ELSE COALESCE(NULLIF(trim(totp_secret), ''), $5)
+                   END,
+                   auth_version = auth_version + 1,
+                   updated_at = now()
+               WHERE id = $6
+               RETURNING *"#,
         )
         .bind(payload.role_id)
+        .bind(&shared_password_hash)
+        .bind(customer.email_verified)
+        .bind(customer.two_factor_enabled)
+        .bind(&customer.totp_secret)
         .bind(existing.id)
         .fetch_one(&state.db)
         .await?;
@@ -381,7 +433,11 @@ pub(crate) async fn promote_to_staff(
 
     // 4. Generate clean username
     let raw_username = payload.username.unwrap_or_else(|| {
-        customer.email.split('@').next().unwrap_or("staff").to_string()
+        if !customer.username.trim().is_empty() {
+            customer.username.clone()
+        } else {
+            customer.email.split('@').next().unwrap_or("staff").to_string()
+        }
     });
     let sanitized: String = raw_username
         .chars()
@@ -398,35 +454,24 @@ pub(crate) async fn promote_to_staff(
     let first_name = parts.next().unwrap_or("").to_string();
     let last_name = parts.collect::<Vec<_>>().join(" ");
 
-    // 6. Handle password hash on blocking threadpool
-    let password_hash = match validated_password {
-        Some(pw) => {
-            let hashed =
-                tokio::task::spawn_blocking(move || bcrypt::hash(pw, bcrypt::DEFAULT_COST))
-                    .await
-                    .map_err(|e| ApiError::Internal(e.to_string()))?
-                    .map_err(|e| ApiError::Internal(e.to_string()))?;
-            Some(hashed)
-        }
-        None => customer.password_hash,
-    };
-
-    // 7. Insert new staff row
+    // 6. Insert new staff row sharing credentials & 2FA from the customer account
     let staff: Staff = sqlx::query_as(
         r#"INSERT INTO staff (
-            id, external_id, first_name, last_name, username, email, email_verified, role_id, password_hash
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING *"#
+            id, external_id, first_name, last_name, username, email, email_verified, role_id, password_hash, mfa_enabled, totp_secret
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        RETURNING *"#,
     )
     .bind(Uuid::now_v7())
-    .bind(format!("customer_{}", customer.id))
+    .bind(customer_ext_link)
     .bind(first_name)
     .bind(last_name)
     .bind(username)
     .bind(customer.email)
     .bind(customer.email_verified)
     .bind(payload.role_id)
-    .bind(password_hash)
+    .bind(shared_password_hash)
+    .bind(customer.two_factor_enabled)
+    .bind(customer.totp_secret)
     .fetch_one(&state.db)
     .await?;
 
