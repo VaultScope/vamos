@@ -1042,6 +1042,11 @@ pub(crate) async fn admin_mfa_disable(
     })))
 }
 
+const EU_MEMBER_STATE_CODES: &[&str] = &[
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT",
+    "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE",
+];
+
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct RegisterPayload {
     username: String,
@@ -1089,6 +1094,12 @@ pub(crate) async fn register(
     validate_string_length(&payload.address, "Address", 500)?;
     validate_string_length(&payload.city, "City", 150)?;
     validate_string_length(&payload.country, "Country", 100)?;
+    let normalized_country = payload.country.trim().to_uppercase();
+    if !EU_MEMBER_STATE_CODES.contains(&normalized_country.as_str()) {
+        return Err(ApiError::BadRequest(
+            "Account registration is only available for European Union (EU) member states.".into(),
+        ));
+    }
     if let Some(ref company) = payload.company {
         validate_string_length(company, "Company", 255)?;
     }
@@ -1161,7 +1172,7 @@ pub(crate) async fn register(
     .bind(payload.address.trim())
     .bind(postal_code)
     .bind(payload.city.trim())
-    .bind(payload.country.trim())
+    .bind(&normalized_country)
     .bind(payload.vat_id.as_deref().unwrap_or(""))
     .bind(password_hash)
     .bind(&verification_token)
