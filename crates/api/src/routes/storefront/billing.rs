@@ -114,6 +114,7 @@ pub(crate) async fn billing_info(
         "No outstanding balance".to_string()
     };
 
+    #[allow(clippy::type_complexity)]
     let services: Vec<(String, String, rust_decimal::Decimal, Option<chrono::DateTime<chrono::Utc>>, bool)> = sqlx::query_as(
         "SELECT s.id::text, p.name, s.price, s.next_due, s.cancel_at_period_end FROM services s JOIN products p ON s.product_id = p.id WHERE s.customer_id = $1 AND s.status = 'running' ORDER BY s.next_due ASC NULLS LAST"
     )

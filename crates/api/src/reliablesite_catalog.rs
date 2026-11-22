@@ -63,10 +63,8 @@ fn parse_setting_decimal(value: &serde_json::Value) -> Option<Decimal> {
         s.trim().parse::<Decimal>().ok()
     } else if let Some(n) = value.as_f64() {
         Decimal::try_from(n).ok()
-    } else if let Some(n) = value.as_i64() {
-        Some(Decimal::from(n))
     } else {
-        None
+        value.as_i64().map(Decimal::from)
     }
 }
 
@@ -668,6 +666,7 @@ fn retail_base_for_cycle(
     (converted_rec, converted_setup)
 }
 
+#[allow(dead_code)]
 pub async fn get_product_options(
     db: &PgPool,
     product: &Product,
@@ -741,6 +740,7 @@ pub async fn get_product_options_with_policy(
     })
 }
 
+#[allow(dead_code)]
 pub async fn get_dedicated_options(
     db: &PgPool,
     product: &Product,
@@ -807,6 +807,7 @@ pub async fn get_dedicated_options_with_policy(
     })
 }
 
+#[allow(dead_code)]
 pub fn sanitize_product_for_storefront(product: Product) -> Product {
     sanitize_product_for_storefront_with_policy(product, DedicatedPricingPolicy::default())
 }
@@ -844,12 +845,19 @@ pub fn sanitize_service_for_storefront(mut service: Service) -> Service {
     if let Some(obj) = service.config.as_object_mut() {
         obj.remove("provider");
         obj.remove("reliablesite_product_id");
+        obj.remove("promo_code");
+        obj.remove("promoCode");
         obj.remove("password");
         obj.remove("root_password");
         if let Some(raw_obj) = obj.get_mut("raw_response").and_then(|v| v.as_object_mut()) {
             raw_obj.remove("provider");
             raw_obj.remove("paymentMethod");
             raw_obj.remove("productId");
+            raw_obj.remove("productIds");
+            raw_obj.remove("orderId");
+            raw_obj.remove("invoiceId");
+            raw_obj.remove("promoCode");
+            raw_obj.remove("promo_code");
             raw_obj.remove("replayed");
             raw_obj.remove("idempotencyKey");
             raw_obj.remove("password");
@@ -882,6 +890,7 @@ pub fn sanitize_service_for_storefront(mut service: Service) -> Service {
     service
 }
 
+#[allow(dead_code)]
 pub async fn compute_quote(
     db: &PgPool,
     product: &Product,
@@ -935,10 +944,19 @@ pub async fn compute_quote_with_policy(
 
     let resolved_map: BTreeMap<String, u32> = match supplied_options {
         Some(map) => {
+            let mut canonical_map = BTreeMap::new();
             for (gid_str, addon_id) in map {
-                let gid: i32 = gid_str.trim().parse().map_err(|_| {
+                let trimmed = gid_str.trim();
+                let gid: i32 = trimmed.parse().map_err(|_| {
                     ApiError::BadRequest(format!("Invalid configuration group '{}'", gid_str))
                 })?;
+                let canonical_key = gid.to_string();
+                if gid_str != &canonical_key {
+                    return Err(ApiError::BadRequest(format!(
+                        "Non-canonical configuration group key '{}'",
+                        gid_str
+                    )));
+                }
                 let grp = group_map.get(&gid).ok_or_else(|| {
                     ApiError::BadRequest(format!(
                         "Configuration group {} is not valid for '{}'",
@@ -956,17 +974,23 @@ pub async fn compute_quote_with_policy(
                         addon_id, gid, grp.description
                     )));
                 }
+                if canonical_map.insert(canonical_key, *addon_id).is_some() {
+                    return Err(ApiError::BadRequest(format!(
+                        "Duplicate configuration group {}",
+                        gid
+                    )));
+                }
             }
             // Verify all required groups are present when explicit config_options were provided
             for grp in &groups {
-                if grp.required && !map.contains_key(&grp.group_id.to_string()) {
+                if grp.required && !canonical_map.contains_key(&grp.group_id.to_string()) {
                     return Err(ApiError::BadRequest(format!(
                         "Missing required configuration option for group {} ({})",
                         grp.group_id, grp.description
                     )));
                 }
             }
-            map.clone()
+            canonical_map
         }
         None => {
             // Auto-fill baseline default option for each group
@@ -1094,6 +1118,7 @@ fn build_specs_from_server(srv: &InventoryServer) -> serde_json::Value {
     obj
 }
 
+#[allow(dead_code)]
 pub async fn sync_datacenter_to_db(
     db: &PgPool,
     rs: &ReliableSite,

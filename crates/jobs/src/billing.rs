@@ -446,6 +446,11 @@ impl BillingRunner {
             let renewal_days = if row.provider == "reliablesite" {
                 row.config
                     .get("billing_cycle")
+                    .or_else(|| {
+                        row.config
+                            .get("raw_response")
+                            .and_then(|r| r.get("billingCycle").or_else(|| r.get("billing_cycle")))
+                    })
                     .and_then(|v| v.as_str())
                     .and_then(vaultscope_connectors::reliablesite::OrderBillingCycle::from_str_loose)
                     .map(|c| c.period_days())
@@ -458,7 +463,11 @@ impl BillingRunner {
             let target_quota_gb = row
                 .partner_quota_gb_override
                 .or(row.product_quota_gb)
-                .unwrap_or(150);
+                .unwrap_or(150)
+                .max(1);
+
+            // Only upgrade SFTP trial quota immediately if no pending invoice is awaiting payment
+            let apply_quota_upgrade_now = sftp_upgrade && created_invoice_id.is_none();
 
             sqlx::query(
                 r#"
@@ -469,16 +478,16 @@ impl BillingRunner {
             )
             .bind(next_due)
             .bind(price)
-            .bind(sftp_upgrade)
+            .bind(apply_quota_upgrade_now)
             .bind(target_quota_gb)
             .bind(row.id)
             .execute(&mut *tx)
             .await?;
 
-            if sftp_upgrade {
+            if apply_quota_upgrade_now && !row.provider_resource_id.is_empty() {
                 // Insert a job to upgrade the quota in SFTPGo
                 let job_id = Uuid::now_v7();
-                let quota_size = (target_quota_gb as u64) * 1024 * 1024 * 1024;
+                let quota_size = (target_quota_gb as u64).saturating_mul(1024 * 1024 * 1024);
                 let payload = serde_json::json!({
                     "resource_id": row.provider_resource_id,
                     "provider_resource_id": row.provider_resource_id,

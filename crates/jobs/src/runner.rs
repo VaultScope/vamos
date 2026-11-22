@@ -99,13 +99,17 @@ impl JobRunner {
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
         info!("job runner started, polling every {:?}", self.poll_interval);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
 
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(self.poll_interval) => {
                     // Process as many jobs as possible before sleeping again
                     loop {
-                        match self.poll_once().await {
+                        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                            break;
+                        };
+                        match self.poll_once_with_permit(permit).await {
                             Ok(true) => continue, // A job was picked up, try to pick up another one immediately
                             Ok(false) => break,   // No jobs left, break and sleep
                             Err(e) => {
@@ -142,7 +146,10 @@ impl JobRunner {
         .await
     }
 
-    async fn poll_once(&self) -> Result<bool, sqlx::Error> {
+    async fn poll_once_with_permit(
+        &self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<bool, sqlx::Error> {
         let Some(job) = self.claim_next_job().await? else {
             return Ok(false);
         };
@@ -155,6 +162,7 @@ impl JobRunner {
         let encryption_key = self.encryption_key;
 
         tokio::spawn(async move {
+            let _permit = permit;
             execute_and_persist_job(pool, connectors, notifier, encryption_key, job).await;
         });
 
@@ -252,19 +260,30 @@ async fn execute_and_persist_job(
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
-                    let target_order_state = if job.target_api == "reliablesite" && ip.is_empty() {
-                        "provisioning"
-                    } else {
-                        "active"
-                    };
+                    let (target_status, target_order_state) =
+                        if job.target_api == "reliablesite" && ip.is_empty() {
+                            ("pending", "provisioning")
+                        } else {
+                            ("running", "active")
+                        };
 
                     if let Err(e) = sqlx::query(
-                        "UPDATE services SET status = 'running', config = $1, provider_resource_id = $2, ip = $3, hostname = $4, encrypted_password = COALESCE($5, encrypted_password), order_state = $6, order_state_updated_at = now() WHERE id = $7",
+                        r#"UPDATE services
+                           SET status = $1::service_status,
+                               config = COALESCE(services.config, '{}'::jsonb) || $2,
+                               provider_resource_id = $3,
+                               ip = COALESCE(NULLIF($4, ''), ip),
+                               hostname = COALESCE(NULLIF($5, ''), hostname),
+                               encrypted_password = COALESCE($6, encrypted_password),
+                               order_state = $7,
+                               order_state_updated_at = now()
+                           WHERE id = $8"#,
                     )
+                    .bind(target_status)
                     .bind(&sanitized_response)
                     .bind(resource_id)
-                    .bind(if ip.is_empty() { None } else { Some(ip) })
-                    .bind(if hostname.is_empty() { None } else { Some(hostname) })
+                    .bind(ip)
+                    .bind(hostname)
                     .bind(encrypted_password.as_deref())
                     .bind(target_order_state)
                     .bind(service_id)
@@ -305,7 +324,8 @@ async fn execute_and_persist_job(
                     error!("Failed to update failed job {}: {}", job.id, db_err);
                 }
             } else {
-                let backoff = Duration::from_secs(2u64.pow(job.attempts as u32));
+                let exp = job.attempts.clamp(0, 10) as u32;
+                let backoff = Duration::from_secs(2u64.pow(exp));
                 let retry_at = Utc::now() + backoff;
                 if let Err(db_err) = sqlx::query(
                     "UPDATE jobs SET status = 'queued', scheduled_at = $1, error = $2 WHERE id = $3",

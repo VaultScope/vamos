@@ -64,6 +64,7 @@ pub fn compute_order_totals_with_rate(
 /// Computes net subtotal, 19% VAT (rounded to 2 decimal places via `rust_decimal`),
 /// gross total, and gross total in integer euro cents consistently for both
 /// Stripe PaymentIntent creation and order/invoice verification.
+#[allow(dead_code)]
 pub fn compute_order_totals(subtotal_net: Decimal) -> (Decimal, Decimal, Decimal, i64) {
     compute_order_totals_with_rate(subtotal_net, Decimal::new(19, 0))
 }
@@ -412,6 +413,7 @@ pub struct PlaceOrderResponse {
         (status = 404, description = "Product not found", body = ErrorResponse)
     )
 )]
+#[allow(clippy::type_complexity)]
 pub(crate) async fn place_order(
     auth: AuthCustomer,
     State(state): State<AppState>,
@@ -648,16 +650,32 @@ pub(crate) async fn place_order(
     };
 
     let service_id = Uuid::now_v7();
-    let hostname = payload
-        .hostname
-        .filter(|h| !h.trim().is_empty())
-        .unwrap_or_else(|| {
+    let hostname = match payload.hostname.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+        Some(raw_host) => {
+            if raw_host.len() > 253
+                || !raw_host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+                || raw_host.starts_with('-')
+                || raw_host.ends_with('-')
+                || raw_host.starts_with('.')
+                || raw_host.ends_with('.')
+                || raw_host.contains("..")
+            {
+                return Err(ApiError::BadRequest(
+                    "Invalid hostname format (must be a valid RFC 1123 hostname up to 253 characters)".into(),
+                ));
+            }
+            raw_host.to_string()
+        }
+        None => {
             if is_storage {
                 "sftp.vaultscope.de".to_string()
             } else {
                 format!("srv-{}", &service_id.to_string()[..8])
             }
-        });
+        }
+    };
 
     let trial_days_count = if has_trial {
         effective_trial_days.unwrap() as i64
@@ -724,6 +742,28 @@ pub(crate) async fn place_order(
         .as_ref()
         .and_then(|c| c.get("image").or_else(|| c.get("os_image")))
         .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(img) = custom_image {
+        const ALLOWED_OS_IMAGES: &[&str] = &[
+            "ubuntu-22.04",
+            "ubuntu-24.04",
+            "debian-11",
+            "debian-12",
+            "centos-stream-9",
+            "almalinux-9",
+            "rockylinux-9",
+            "fedora-39",
+            "fedora-40",
+        ];
+        if !ALLOWED_OS_IMAGES.contains(&img) {
+            return Err(ApiError::BadRequest(format!(
+                "Unsupported OS image '{}'",
+                img
+            )));
+        }
+    }
+    let custom_image = custom_image
         .or_else(|| product.specs.get("image").and_then(|v| v.as_str()))
         .unwrap_or("ubuntu-22.04");
 

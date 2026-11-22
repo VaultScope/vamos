@@ -372,6 +372,13 @@ pub(crate) async fn pay_invoice(
         ));
     }
 
+    let locked_expected_cents = (locked_invoice.total * rust_decimal::Decimal::from(100))
+        .round()
+        .to_i64()
+        .unwrap_or(0)
+        .max(50);
+    verify_invoice_stripe_pi_response(&pi_data, locked_invoice.id, auth.0.sub, locked_expected_cents)?;
+
     let used_in_services_tx: Option<Uuid> =
         sqlx::query_scalar("SELECT id FROM services WHERE stripe_payment_intent_id = $1")
             .bind(pi_id)
@@ -458,7 +465,7 @@ pub(crate) async fn download_pdf(
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     let invoice: Invoice = sqlx::query_as(
-        "SELECT * FROM invoices WHERE id = $1 AND customer_id = $2"
+        "SELECT * FROM invoices WHERE id = $1 AND customer_id = $2 AND status != 'draft'::invoice_status"
     )
     .bind(id)
     .bind(auth.0.sub)
@@ -488,7 +495,12 @@ pub(crate) async fn download_pdf(
         &line_items,
         tax_policy.seller_tax_id.as_deref(),
     );
-    let filename = format!("invoice-{}.pdf", invoice.invoice_number);
+    let safe_inv_num: String = invoice
+        .invoice_number
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    let filename = format!("invoice-{}.pdf", safe_inv_num);
 
     let response = Response::builder()
         .header(header::CONTENT_TYPE, "application/pdf")
