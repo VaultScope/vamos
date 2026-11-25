@@ -76,6 +76,7 @@ pub(crate) struct StaffWithRole {
     #[serde(flatten)]
     staff: Staff,
     role_name: String,
+    permissions: Vec<String>,
 }
 
 #[utoipa::path(
@@ -110,14 +111,13 @@ pub(crate) async fn list(
     let result = staff
         .into_iter()
         .map(|s| {
-            let role_name = roles
-                .iter()
-                .find(|r| r.id == s.role_id)
-                .map(|r| r.name.clone())
-                .unwrap_or_default();
+            let matched_role = roles.iter().find(|r| r.id == s.role_id);
+            let role_name = matched_role.map(|r| r.name.clone()).unwrap_or_default();
+            let permissions = matched_role.map(|r| r.permissions.clone()).unwrap_or_default();
             StaffWithRole {
                 staff: s,
                 role_name,
+                permissions,
             }
         })
         .collect();
@@ -165,6 +165,7 @@ pub(crate) async fn me(
     Ok(Json(StaffWithRole {
         staff,
         role_name: role.name,
+        permissions: role.permissions,
     }))
 }
 
@@ -179,7 +180,12 @@ pub(crate) async fn list_roles(
     auth: AuthAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Role>>, ApiError> {
-    crate::require_permission!(auth, state, "rbac.manage");
+    if crate::middleware::rbac::check_permission(&auth, &state, "rbac.manage").await.is_err()
+        && crate::middleware::rbac::check_permission(&auth, &state, "staff.view").await.is_err()
+        && crate::middleware::rbac::check_permission(&auth, &state, "customers.edit").await.is_err()
+    {
+        return Err(ApiError::Forbidden);
+    }
     let roles: Vec<Role> = sqlx::query_as("SELECT * FROM roles ORDER BY name")
         .fetch_all(&state.db)
         .await?;
@@ -217,7 +223,29 @@ pub(crate) async fn get_role(
 pub(crate) struct CreateRole {
     name: String,
     permissions: Vec<String>,
-    mapped_group: String,
+    #[serde(default)]
+    mapped_group: Option<String>,
+}
+
+fn derive_role_slug(name: &str, provided: Option<&str>) -> String {
+    if let Some(p) = provided {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let slug: String = name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let cleaned = slug.trim_matches('_').to_string();
+    if cleaned.is_empty() {
+        format!("role_{}", &Uuid::now_v7().simple().to_string()[24..])
+    } else {
+        format!("vs_{cleaned}")
+    }
 }
 
 #[utoipa::path(
@@ -234,17 +262,19 @@ pub(crate) async fn create_role(
     Json(payload): Json<CreateRole>,
 ) -> Result<Json<Role>, ApiError> {
     crate::require_permission!(auth, state, "rbac.manage");
+    validate_required_string(&payload.name, "Role name")?;
     let caller_perms = fetch_caller_permissions(&state.db, auth.0.sub).await?;
     ensure_role_assignable(&caller_perms, &payload.permissions)?;
+    let mapped_group = derive_role_slug(&payload.name, payload.mapped_group.as_deref());
 
     let role: Role = sqlx::query_as(
         r#"INSERT INTO roles (name, permissions, mapped_group)
            VALUES ($1, $2, $3)
            RETURNING *"#,
     )
-    .bind(&payload.name)
+    .bind(payload.name.trim())
     .bind(&payload.permissions)
-    .bind(&payload.mapped_group)
+    .bind(&mapped_group)
     .fetch_one(&state.db)
     .await?;
 

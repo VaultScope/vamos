@@ -13,9 +13,10 @@ use vaultscope_db::models::{Customer, CustomerStatus, Role, Staff};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
-        .routes(routes!(list))
+        .routes(routes!(list, create_customer))
         .routes(routes!(get_one, update, delete_customer))
         .routes(routes!(promote_to_staff))
+        .routes(routes!(impersonate_customer))
         .routes(routes!(resend_verification_email))
         .routes(routes!(mark_email_verified))
 }
@@ -128,7 +129,131 @@ pub(crate) async fn get_one(
 }
 
 #[derive(Deserialize, ToSchema)]
+pub(crate) struct CreateCustomerPayload {
+    name: String,
+    email: String,
+    username: Option<String>,
+    phone: Option<String>,
+    company: Option<String>,
+    address: Option<String>,
+    postal_code: Option<String>,
+    city: Option<String>,
+    country: Option<String>,
+    vat_id: Option<String>,
+    email_verified: Option<bool>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "Admin Customers",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    request_body = CreateCustomerPayload,
+    responses(
+        (status = 200, description = "Customer created", body = Customer),
+        (status = 400, description = "Validation error", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create_customer(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<CreateCustomerPayload>,
+) -> Result<Json<Customer>, ApiError> {
+    crate::require_permission!(auth, state, "customers.create");
+    crate::validation::validate_required_string(&payload.name, "Name")?;
+    crate::validation::validate_required_string(&payload.email, "Email")?;
+    crate::validation::validate_email(payload.email.trim())?;
+
+    let email = payload.email.trim().to_string();
+    let raw_username = payload
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            email
+                .split('@')
+                .next()
+                .unwrap_or("customer")
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .collect()
+        });
+
+    let existing: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM customers WHERE LOWER(email) = LOWER($1) OR (username <> '' AND LOWER(username) = LOWER($2)) LIMIT 1",
+    )
+    .bind(&email)
+    .bind(&raw_username)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if existing.is_some() {
+        return Err(ApiError::BadRequest(
+            "A customer with this email or username already exists".into(),
+        ));
+    }
+
+    let customer_id = Uuid::now_v7();
+    let external_id = format!("local_{customer_id}");
+    let country = payload
+        .country
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("DE")
+        .to_uppercase();
+
+    let customer: Customer = sqlx::query_as(
+        r#"INSERT INTO customers (
+               id, external_id, username, name, email, phone, company, address, postal_code, city, country, vat_id, status, email_verified
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'active'::customer_status, $13)
+           RETURNING *"#,
+    )
+    .bind(customer_id)
+    .bind(external_id)
+    .bind(raw_username)
+    .bind(payload.name.trim())
+    .bind(&email)
+    .bind(payload.phone.as_deref().unwrap_or("").trim())
+    .bind(payload.company.as_deref().unwrap_or("").trim())
+    .bind(payload.address.as_deref().unwrap_or("").trim())
+    .bind(payload.postal_code.as_deref().unwrap_or("").trim())
+    .bind(payload.city.as_deref().unwrap_or("").trim())
+    .bind(country)
+    .bind(payload.vat_id.as_deref().unwrap_or("").trim().to_uppercase())
+    .bind(payload.email_verified.unwrap_or(true))
+    .fetch_one(&state.db)
+    .await?;
+
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(auth.0.sub),
+        vaultscope_db::models::ActorType::Staff,
+        auth.0.email.clone(),
+        "customer".to_string(),
+        "created".to_string(),
+        customer.email.clone(),
+        format!("Admin created customer account {}", customer.name),
+    );
+
+    Ok(Json(customer))
+}
+
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct UpdateCustomer {
+    name: Option<String>,
+    email: Option<String>,
+    username: Option<String>,
+    phone: Option<String>,
+    company: Option<String>,
+    address: Option<String>,
+    postal_code: Option<String>,
+    city: Option<String>,
+    country: Option<String>,
+    vat_id: Option<String>,
+    vat_verified: Option<bool>,
     status: Option<CustomerStatus>,
     notes: Option<String>,
     email_verified: Option<bool>,
@@ -153,15 +278,40 @@ pub(crate) async fn update(
     Json(payload): Json<UpdateCustomer>,
 ) -> Result<Json<Customer>, ApiError> {
     crate::require_permission!(auth, state, "customers.edit");
+    if let Some(ref email) = payload.email {
+        crate::validation::validate_email(email.trim())?;
+    }
     let customer: Customer = sqlx::query_as(
         r#"UPDATE customers
-           SET status = COALESCE($1::customer_status, status),
-               notes = COALESCE($2, notes),
-               email_verified = COALESCE($3, email_verified),
+           SET name = COALESCE(NULLIF(btrim($1), ''), name),
+               email = COALESCE(NULLIF(btrim($2), ''), email),
+               username = COALESCE($3, username),
+               phone = COALESCE($4, phone),
+               company = COALESCE($5, company),
+               address = COALESCE($6, address),
+               postal_code = COALESCE($7, postal_code),
+               city = COALESCE($8, city),
+               country = COALESCE($9, country),
+               vat_id = COALESCE($10, vat_id),
+               vat_verified = COALESCE($11, vat_verified),
+               status = COALESCE($12::customer_status, status),
+               notes = COALESCE($13, notes),
+               email_verified = COALESCE($14, email_verified),
                updated_at = now()
-           WHERE id = $4
+           WHERE id = $15
            RETURNING *"#,
     )
+    .bind(payload.name)
+    .bind(payload.email)
+    .bind(payload.username)
+    .bind(payload.phone)
+    .bind(payload.company)
+    .bind(payload.address)
+    .bind(payload.postal_code)
+    .bind(payload.city)
+    .bind(payload.country)
+    .bind(payload.vat_id)
+    .bind(payload.vat_verified)
     .bind(payload.status)
     .bind(payload.notes)
     .bind(payload.email_verified)
@@ -170,7 +320,120 @@ pub(crate) async fn update(
     .await?
     .ok_or(ApiError::NotFound("customer not found".into()))?;
 
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(auth.0.sub),
+        vaultscope_db::models::ActorType::Staff,
+        auth.0.email.clone(),
+        "customer".to_string(),
+        "updated".to_string(),
+        customer.email.clone(),
+        format!("Updated customer profile for {}", customer.name),
+    );
+
     Ok(Json(customer))
+}
+
+#[utoipa::path(
+    post,
+    path = "/{id}/impersonate",
+    tag = "Admin Customers",
+    security(("bearer_auth" = []), ("csrf_token" = [])),
+    params(("id" = Uuid, Path, description = "Customer ID")),
+    responses(
+        (status = 200, description = "Short-lived Storefront impersonation session token and URL", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Customer not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn impersonate_customer(
+    auth: AuthAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::require_permission!(auth, state, "customers.impersonate");
+
+    let row: Option<(Customer, i64)> = sqlx::query_as::<_, Customer>("SELECT * FROM customers WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .map(|c| (c, 1));
+
+    let (customer, _) = row.ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
+    let auth_version: i64 = sqlx::query_scalar("SELECT auth_version FROM customers WHERE id = $1")
+        .bind(customer.id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(1);
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = crate::auth::Claims {
+        sub: customer.id,
+        email: customer.email.clone(),
+        role: "customer".to_string(),
+        audience: crate::auth::Audience::Storefront,
+        iat: now,
+        exp: now + 3600,
+        auth_version: Some(auth_version),
+        jti: Some(Uuid::now_v7().to_string()),
+    };
+
+    let token = crate::auth::jwt::sign(&claims, &state.config.jwt_secret)?;
+    let storefront_base = state.config.storefront_url.trim_end_matches('/');
+    let base_url = if storefront_base.is_empty() || storefront_base.contains("localhost") {
+        "https://vaultscope.de"
+    } else {
+        storefront_base
+    };
+    let username = if !customer.username.trim().is_empty() {
+        customer.username.clone()
+    } else {
+        customer.email.split('@').next().unwrap_or("customer").to_string()
+    };
+    fn pct_encode(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{:02X}", b));
+            }
+        }
+        out
+    }
+    let impersonation_url = format!(
+        "{}/dashboard#impersonate_token={}&username={}&name={}",
+        base_url,
+        pct_encode(&token),
+        pct_encode(&username),
+        pct_encode(&customer.name),
+    );
+
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(auth.0.sub),
+        vaultscope_db::models::ActorType::Staff,
+        auth.0.email.clone(),
+        "security".to_string(),
+        "impersonated".to_string(),
+        customer.email.clone(),
+        format!(
+            "Staff {} initiated storefront impersonation session for customer {} ({})",
+            auth.0.email, customer.name, customer.email
+        ),
+    );
+
+    Ok(Json(serde_json::json!({
+        "token": token,
+        "claims": claims,
+        "impersonation_url": impersonation_url,
+        "customer": {
+            "id": customer.id,
+            "name": customer.name,
+            "email": customer.email,
+            "username": username,
+        }
+    })))
 }
 
 #[utoipa::path(

@@ -246,8 +246,9 @@ pub(crate) async fn login(
             Option<String>,
             i64,
             String,
+            Vec<String>,
         )> = sqlx::query_as(
-            "SELECT s.id, s.email, r.name, s.password_hash, s.email_verified, s.mfa_enabled, s.totp_secret, s.auth_version, s.external_id
+            "SELECT s.id, s.email, r.name, s.password_hash, s.email_verified, s.mfa_enabled, s.totp_secret, s.auth_version, s.external_id, r.permissions
              FROM staff s
              JOIN roles r ON s.role_id = r.id
              WHERE (LOWER(s.email) = LOWER($1) OR (s.username <> '' AND LOWER(s.username) = LOWER($1)))
@@ -258,7 +259,7 @@ pub(crate) async fn login(
         .await?;
 
         let linked_customer: Option<(Uuid, String, Option<String>, bool, Option<String>)> =
-            if let Some((_, ref s_email, _, _, _, _, _, _, ref s_ext_id)) = staff {
+            if let Some((_, ref s_email, _, _, _, _, _, _, ref s_ext_id, _)) = staff {
                 sqlx::query_as(
                     "SELECT id, email, password_hash, two_factor_enabled, totp_secret
                      FROM customers
@@ -301,6 +302,7 @@ pub(crate) async fn login(
             totp_secret,
             auth_version,
             _,
+            role_permissions,
         ) = staff.ok_or(ApiError::Unauthorized)?;
 
         let (linked_customer_id, linked_customer_email, linked_customer_pw, linked_customer_2fa, linked_customer_totp) =
@@ -489,7 +491,12 @@ pub(crate) async fn login(
             format!("Staff login by @{}", email),
         );
 
-        Ok(Json(json!({ "token": token, "claims": claims, "email_verified": email_verified })))
+        let mut claims_json = serde_json::to_value(&claims).unwrap_or_else(|_| json!({}));
+        if let Some(obj) = claims_json.as_object_mut() {
+            obj.insert("permissions".to_string(), json!(role_permissions));
+        }
+
+        Ok(Json(json!({ "token": token, "claims": claims_json, "email_verified": email_verified })))
     } else {
         if identifier.contains('@') {
             validate_email(&identifier)?;

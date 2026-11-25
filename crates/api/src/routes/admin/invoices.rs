@@ -307,12 +307,7 @@ pub(crate) async fn update(
         .await?
         .ok_or(ApiError::NotFound("invoice not found".into()))?;
 
-    if existing.status != InvoiceStatus::Draft {
-        return Err(ApiError::BadRequest(
-            "Only draft invoices can be updated".into(),
-        ));
-    }
-    if payload.status == Some(InvoiceStatus::Paid) {
+    if existing.status == InvoiceStatus::Draft && payload.status == Some(InvoiceStatus::Paid) {
         return Err(ApiError::BadRequest(
             "Draft invoices must be finalized before being marked paid".into(),
         ));
@@ -324,7 +319,7 @@ pub(crate) async fn update(
                due_date = COALESCE($2, due_date),
                notes = COALESCE($3, notes),
                updated_at = now()
-           WHERE id = $4 AND status = 'draft'::invoice_status
+           WHERE id = $4
            RETURNING *"#,
     )
     .bind(payload.status)
@@ -333,7 +328,7 @@ pub(crate) async fn update(
     .bind(id)
     .fetch_optional(&state.db)
     .await?
-    .ok_or(ApiError::BadRequest("Only draft invoices can be updated".into()))?;
+    .ok_or(ApiError::NotFound("invoice not found".into()))?;
 
     Ok(Json(invoice))
 }
@@ -343,10 +338,10 @@ pub(crate) async fn update(
     path = "/{id}",
     tag = "Admin Invoices",
     security(("bearer_auth" = []), ("csrf_token" = [])),
-    params(("id" = Uuid, Path, description = "Draft invoice ID")),
+    params(("id" = Uuid, Path, description = "Invoice ID")),
     responses(
-        (status = 200, description = "Draft invoice deleted"),
-        (status = 404, description = "Draft invoice not found", body = ErrorResponse)
+        (status = 200, description = "Invoice deleted"),
+        (status = 404, description = "Invoice not found", body = ErrorResponse)
     )
 )]
 pub(crate) async fn delete(
@@ -355,15 +350,38 @@ pub(crate) async fn delete(
     Path(id): Path<Uuid>,
 ) -> Result<Json<()>, ApiError> {
     crate::require_permission!(auth, state, "invoices.delete");
-    let result =
-        sqlx::query("DELETE FROM invoices WHERE id = $1 AND status = 'draft'::invoice_status")
+
+    let mut tx = state.db.begin().await?;
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT invoice_number FROM invoices WHERE id = $1 FOR UPDATE")
             .bind(id)
-            .execute(&state.db)
+            .fetch_optional(&mut *tx)
             .await?;
 
-    if result.rows_affected() == 0 {
-        return Err(ApiError::NotFound("draft invoice not found".into()));
-    }
+    let (invoice_number,) = existing.ok_or_else(|| ApiError::NotFound("invoice not found".into()))?;
+
+    sqlx::query("DELETE FROM invoice_line_items WHERE invoice_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("DELETE FROM invoices WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    crate::activity::spawn_record(
+        state.db.clone(),
+        Some(auth.0.sub),
+        vaultscope_db::models::ActorType::Staff,
+        auth.0.email.clone(),
+        "billing".to_string(),
+        "invoice_deleted".to_string(),
+        invoice_number.clone(),
+        format!("Admin {} deleted invoice {}", auth.0.email, invoice_number),
+    );
 
     Ok(Json(()))
 }
