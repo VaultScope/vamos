@@ -360,6 +360,15 @@ pub(crate) async fn delete(
 
     let (invoice_number,) = existing.ok_or_else(|| ApiError::NotFound("invoice not found".into()))?;
 
+    sqlx::query("SET LOCAL vaultscope.allow_admin_invoice_delete = 'true'")
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("UPDATE invoices SET corrects_invoice_id = NULL WHERE corrects_invoice_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
     sqlx::query("DELETE FROM invoice_line_items WHERE invoice_id = $1")
         .bind(id)
         .execute(&mut *tx)
