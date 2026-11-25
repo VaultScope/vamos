@@ -531,7 +531,7 @@ async fn test_staff_mfa_and_customer_encrypted_totp_secret() {
 
     let app = build_router(state.clone());
 
-    // 1. Staff login case-insensitive email match + updates last_login_ip from peer ConnectInfo
+    // 1. Staff login without 2FA configured requires MFA enrollment and redirects to VaultScope MFA dashboard
     let staff_peer = SocketAddr::from(([198, 51, 100, 88], 12345));
     let mut login_req = Request::builder()
         .method("POST")
@@ -548,14 +548,24 @@ async fn test_staff_mfa_and_customer_encrypted_totp_secret() {
     let login_json: Value =
         serde_json::from_slice(&to_bytes(login_resp.into_body(), 1024 * 64).await.unwrap())
             .unwrap();
-    let staff_token = login_json["token"].as_str().unwrap().to_string();
+    assert_eq!(login_json["mfa_enrollment_required"], true);
+    assert_eq!(
+        login_json["redirect_url"],
+        "https://vaultscope.de/dashboard/profile/mfa"
+    );
+    assert!(login_json["token"].is_null());
 
-    let recorded_ip: String = sqlx::query_scalar("SELECT last_login_ip FROM staff WHERE id = $1")
-        .bind(staff_id)
-        .fetch_one(&state.db)
-        .await
-        .unwrap();
-    assert_eq!(recorded_ip, "198.51.100.88");
+    let staff_claims = Claims {
+        sub: staff_id,
+        email: staff_email.clone(),
+        role: "Owner".to_string(),
+        audience: Audience::Admin,
+        iat: chrono::Utc::now().timestamp(),
+        exp: jwt::new_expiry(),
+        auth_version: Some(1),
+        jti: Some(Uuid::now_v7().to_string()),
+    };
+    let staff_token = jwt::sign(&staff_claims, &state.config.jwt_secret).unwrap();
 
     // 2. Admin MFA setup stores encrypted secret (`enc:v1:...`)
     let setup_resp = app
@@ -635,27 +645,32 @@ async fn test_staff_mfa_and_customer_encrypted_totp_secret() {
             .unwrap();
     assert_eq!(challenge_json["mfa_required"], true);
 
-    // 5. Staff login with valid TOTP code succeeds
-    let mfa_login_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({ "email": staff_email, "password": pw, "audience": "admin", "totp_code": code })
-                        .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
+    // 5. Staff login with valid TOTP code succeeds and updates last_login_ip
+    let mut mfa_login_req = Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({ "email": staff_email.to_lowercase(), "password": pw, "audience": "admin", "totp_code": code })
+                .to_string(),
+        ))
         .unwrap();
+    mfa_login_req
+        .extensions_mut()
+        .insert(ConnectInfo(staff_peer));
+    let mfa_login_resp = app.clone().oneshot(mfa_login_req).await.unwrap();
     assert_eq!(mfa_login_resp.status(), StatusCode::OK);
     let mfa_login_json: Value =
         serde_json::from_slice(&to_bytes(mfa_login_resp.into_body(), 1024 * 64).await.unwrap())
             .unwrap();
     assert!(mfa_login_json["token"].as_str().is_some());
+
+    let recorded_ip: String = sqlx::query_scalar("SELECT last_login_ip FROM staff WHERE id = $1")
+        .bind(staff_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(recorded_ip, "198.51.100.88");
 
     // 6. Customer MFA setup encrypts totp_secret (`enc:v1:...`) and login supports encrypted & legacy Base32
     let cust_id = Uuid::now_v7();

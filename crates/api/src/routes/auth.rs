@@ -337,114 +337,123 @@ pub(crate) async fn login(
             }
         }
 
-        if effective_mfa_enabled {
-            let candidate_secrets: Vec<(&str, &str)> = {
-                let mut v = Vec::new();
+        let candidate_secrets: Vec<(&str, &str)> = {
+            let mut v = Vec::new();
+            if let Some(ref c_sec) = customer_secret_clean {
+                if linked_customer_2fa {
+                    v.push((c_sec.as_str(), linked_customer_email.as_deref().unwrap_or(&email)));
+                }
+            }
+            if let Some(ref s_sec) = staff_secret_clean {
+                if v.iter().all(|(existing, _)| *existing != s_sec.as_str()) {
+                    v.push((s_sec.as_str(), email.as_str()));
+                }
+            }
+            if v.is_empty() {
                 if let Some(ref c_sec) = customer_secret_clean {
-                    if linked_customer_2fa {
-                        v.push((c_sec.as_str(), linked_customer_email.as_deref().unwrap_or(&email)));
-                    }
-                }
-                if let Some(ref s_sec) = staff_secret_clean {
-                    if v.iter().all(|(existing, _)| *existing != s_sec.as_str()) {
-                        v.push((s_sec.as_str(), email.as_str()));
-                    }
-                }
-                if v.is_empty() {
-                    if let Some(ref c_sec) = customer_secret_clean {
-                        v.push((c_sec.as_str(), linked_customer_email.as_deref().unwrap_or(&email)));
-                    }
-                }
-                v
-            };
-
-            if candidate_secrets.is_empty() {
-                tracing::error!(staff_id = %staff_id, "Admin MFA enabled without configured TOTP secret");
-                return Err(ApiError::Unauthorized);
-            }
-
-            let provided_code = payload
-                .totp_code
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-
-            let Some(raw_code) = provided_code else {
-                return Ok(Json(json!({
-                    "mfa_required": true,
-                    "email": email,
-                    "message": "Two-factor authentication code required"
-                })));
-            };
-
-            let mut mfa_ok = false;
-            for (secret_stored, acct_email) in candidate_secrets {
-                if let Ok(secret_base32) =
-                    decrypt_totp_secret(&state.config.encryption_key_bytes(), secret_stored)
-                {
-                    if let Ok(Some(clean_code)) = verify_totp_code(&secret_base32, acct_email, raw_code) {
-                        let staff_fresh = check_and_mark_totp_used(&state, staff_id, &clean_code).await;
-                        let cust_fresh = match linked_customer_id {
-                            Some(cid) => check_and_mark_totp_used(&state, cid, &clean_code).await,
-                            None => true,
-                        };
-                        if staff_fresh && cust_fresh {
-                            mfa_ok = true;
-                            break;
-                        }
-                    }
+                    v.push((c_sec.as_str(), linked_customer_email.as_deref().unwrap_or(&email)));
                 }
             }
+            v
+        };
 
-            // Also support single-use recovery codes from the linked VaultScope customer account
-            if !mfa_ok {
-                if let Some(cid) = linked_customer_id {
-                    let normalized = raw_code.replace(['-', ' '], "").to_uppercase();
-                    if !normalized.is_empty() {
-                        let mut hasher = Sha256::new();
-                        hasher.update(normalized.as_bytes());
-                        let code_hash = hex::encode(hasher.finalize());
+        if !effective_mfa_enabled || candidate_secrets.is_empty() {
+            let storefront_base = state.config.storefront_url.trim_end_matches('/');
+            let mfa_dashboard_url =
+                if storefront_base.is_empty() || storefront_base.contains("localhost") {
+                    "https://vaultscope.de/dashboard/profile/mfa".to_string()
+                } else {
+                    format!("{storefront_base}/dashboard/profile/mfa")
+                };
+            return Ok(Json(json!({
+                "mfa_enrollment_required": true,
+                "redirect_url": mfa_dashboard_url,
+                "email": email,
+                "message": "Two-factor authentication (2FA) is mandatory for CAMOS staff accounts. Redirecting to VaultScope MFA setup..."
+            })));
+        }
 
-                        let consumed: Option<Uuid> = sqlx::query_scalar(
-                            r#"WITH target AS (
-                                   SELECT id FROM customer_mfa_recovery_codes
-                                   WHERE customer_id = $1 AND code_hash = $2 AND used_at IS NULL
-                                   LIMIT 1
-                                   FOR UPDATE SKIP LOCKED
-                               )
-                               UPDATE customer_mfa_recovery_codes r
-                               SET used_at = now()
-                               FROM target
-                               WHERE r.id = target.id AND r.used_at IS NULL
-                               RETURNING r.id"#,
-                        )
-                        .bind(cid)
-                        .bind(&code_hash)
-                        .fetch_optional(&state.db)
-                        .await?;
+        let provided_code = payload
+            .totp_code
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
-                        if consumed.is_some() {
-                            mfa_ok = true;
-                            crate::activity::spawn_record(
-                                state.db.clone(),
-                                Some(staff_id),
-                                vaultscope_db::models::ActorType::Staff,
-                                email.clone(),
-                                "security".to_string(),
-                                "2fa_recovery_used".to_string(),
-                                "CAMOS Admin".to_string(),
-                                format!("Shared recovery code used during CAMOS admin login for {}", email),
-                            );
-                        }
+        let Some(raw_code) = provided_code else {
+            return Ok(Json(json!({
+                "mfa_required": true,
+                "email": email,
+                "message": "Two-factor authentication code required"
+            })));
+        };
+
+        let mut mfa_ok = false;
+        for (secret_stored, acct_email) in candidate_secrets {
+            if let Ok(secret_base32) =
+                decrypt_totp_secret(&state.config.encryption_key_bytes(), secret_stored)
+            {
+                if let Ok(Some(clean_code)) = verify_totp_code(&secret_base32, acct_email, raw_code) {
+                    let staff_fresh = check_and_mark_totp_used(&state, staff_id, &clean_code).await;
+                    let cust_fresh = match linked_customer_id {
+                        Some(cid) => check_and_mark_totp_used(&state, cid, &clean_code).await,
+                        None => true,
+                    };
+                    if staff_fresh && cust_fresh {
+                        mfa_ok = true;
+                        break;
                     }
                 }
             }
+        }
 
-            if !mfa_ok {
-                return Err(ApiError::BadRequest(
-                    "Invalid two-factor authentication code".into(),
-                ));
+        // Also support single-use recovery codes from the linked VaultScope customer account
+        if !mfa_ok {
+            if let Some(cid) = linked_customer_id {
+                let normalized = raw_code.replace(['-', ' '], "").to_uppercase();
+                if !normalized.is_empty() {
+                    let mut hasher = Sha256::new();
+                    hasher.update(normalized.as_bytes());
+                    let code_hash = hex::encode(hasher.finalize());
+
+                    let consumed: Option<Uuid> = sqlx::query_scalar(
+                        r#"WITH target AS (
+                               SELECT id FROM customer_mfa_recovery_codes
+                               WHERE customer_id = $1 AND code_hash = $2 AND used_at IS NULL
+                               LIMIT 1
+                               FOR UPDATE SKIP LOCKED
+                           )
+                           UPDATE customer_mfa_recovery_codes r
+                           SET used_at = now()
+                           FROM target
+                           WHERE r.id = target.id AND r.used_at IS NULL
+                           RETURNING r.id"#,
+                    )
+                    .bind(cid)
+                    .bind(&code_hash)
+                    .fetch_optional(&state.db)
+                    .await?;
+
+                    if consumed.is_some() {
+                        mfa_ok = true;
+                        crate::activity::spawn_record(
+                            state.db.clone(),
+                            Some(staff_id),
+                            vaultscope_db::models::ActorType::Staff,
+                            email.clone(),
+                            "security".to_string(),
+                            "2fa_recovery_used".to_string(),
+                            "CAMOS Admin".to_string(),
+                            format!("Shared recovery code used during CAMOS admin login for {}", email),
+                        );
+                    }
+                }
             }
+        }
+
+        if !mfa_ok {
+            return Err(ApiError::BadRequest(
+                "Invalid two-factor authentication code".into(),
+            ));
         }
 
         let client_ip = extract_trusted_client_ip(&headers, peer_ip).unwrap_or_default();
